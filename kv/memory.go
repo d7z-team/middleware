@@ -173,17 +173,17 @@ func (m *Memory) Get(_ context.Context, key string) (string, error) {
 		content, ok := value.(memoryContent)
 		if !ok {
 			m.data.Delete(key) // 清理无效数据
-			return "", os.ErrNotExist
+			return "", ErrKeyNotFound
 		}
 
 		now := time.Now()
 		if content.TTL != nil && now.After(*content.TTL) {
 			m.data.Delete(key) // 删除过期键
-			return "", os.ErrNotExist
+			return "", ErrKeyNotFound
 		}
 		return content.Data, nil
 	}
-	return "", os.ErrNotExist
+	return "", ErrKeyNotFound
 }
 
 // Delete 删除指定的键
@@ -234,7 +234,7 @@ func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.D
 func (m *Memory) CompareAndSwap(_ context.Context, key, oldValue, newValue string) (bool, error) {
 	val, exists := m.data.Load(key)
 	if !exists {
-		return false, os.ErrNotExist
+		return false, ErrKeyNotFound
 	}
 
 	content, ok := val.(memoryContent)
@@ -245,7 +245,7 @@ func (m *Memory) CompareAndSwap(_ context.Context, key, oldValue, newValue strin
 	// 检查是否过期
 	now := time.Now()
 	if content.TTL != nil && now.After(*content.TTL) {
-		return false, os.ErrNotExist
+		return false, ErrKeyNotFound
 	}
 
 	// 比较当前值与旧值

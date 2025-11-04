@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -97,7 +96,7 @@ func (e *Etcd) Get(ctx context.Context, key string) (string, error) {
 	}
 
 	if resp.Count == 0 {
-		return "", errors.Join(os.ErrNotExist, fmt.Errorf("key %s not found", key))
+		return "", errors.Join(ErrKeyNotFound, fmt.Errorf("key %s not found", key))
 	}
 
 	return string(resp.Kvs[0].Value), nil
