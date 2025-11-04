@@ -3,6 +3,7 @@ package connects
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -35,7 +36,7 @@ func NewEtcd(parse *url.URL) (*clientv3.Client, error) {
 
 		caCertPool := x509.NewCertPool()
 		if !caCertPool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to add ca certificate")
+			return nil, errors.New("failed to add ca certificate")
 		}
 
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -49,10 +50,10 @@ func NewEtcd(parse *url.URL) (*clientv3.Client, error) {
 		}
 	} else if caFile != "" || certFile != "" || keyFile != "" {
 		// 部分TLS参数被提供，视为错误
-		return nil, fmt.Errorf("incomplete tls configuration, need ca-file, cert-file and key-file")
+		return nil, errors.New("incomplete tls configuration, need ca-file, cert-file and key-file")
 	}
 	if len(endpoints) == 0 {
-		return nil, fmt.Errorf("no endpoints specified")
+		return nil, errors.New("no endpoints specified")
 	}
 	cfg := clientv3.Config{
 		Endpoints:   endpoints,

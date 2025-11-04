@@ -3,19 +3,20 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
-	kv2 "gopkg.d7z.net/middleware/kv"
+	"gopkg.d7z.net/middleware/kv"
 )
 
-type TypedConfig[Data any] struct {
+type TypedConfig[Data comparable] struct {
 	prefix string
-	kv     kv2.KV
+	kv     kv.KV
 }
 
-func NewTypedConfig[Data any](kv kv2.KV, prefix string) *TypedConfig[Data] {
+func NewTypedConfig[Data comparable](kv kv.KV, prefix string) *TypedConfig[Data] {
 	return &TypedConfig[Data]{
 		kv:     kv,
-		prefix: "typed::config::" + prefix + "::",
+		prefix: strings.ReplaceAll("typed::config::"+prefix+"::", "::", kv.Spliter()),
 	}
 }
 
@@ -41,7 +42,7 @@ func (c *TypedConfig[Data]) Store(key string, value Data) error {
 	}
 
 	fullKey := c.prefix + key
-	return c.kv.Put(context.Background(), fullKey, string(valBytes), kv2.TTLKeep)
+	return c.kv.Put(context.Background(), fullKey, string(valBytes), kv.TTLKeep)
 }
 
 func (c *TypedConfig[Data]) Delete(key string) {

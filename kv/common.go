@@ -13,6 +13,8 @@ import (
 const TTLKeep = -1
 
 type KV interface {
+	Spliter() string
+
 	List(ctx context.Context, prefix string) (map[string]string, error)
 	ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error)
 	Put(ctx context.Context, key, value string, ttl time.Duration) error

@@ -301,3 +301,7 @@ func (m *Memory) Close() error {
 	}
 	return nil
 }
+
+func (m *Memory) Spliter() string {
+	return "::"
+}

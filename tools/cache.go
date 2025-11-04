@@ -4,21 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"strings"
 	"time"
 
-	kv2 "gopkg.d7z.net/middleware/kv"
+	kv "gopkg.d7z.net/middleware/kv"
 )
 
 type Cache[Data any] struct {
 	prefix string
-	kv     kv2.KV
+	kv     kv.KV
 	ttl    time.Duration
 }
 
-func NewCache[Data any](kv kv2.KV, prefix string, ttl time.Duration) *Cache[Data] {
+func NewCache[Data any](kv kv.KV, prefix string, ttl time.Duration) *Cache[Data] {
 	return &Cache[Data]{
 		kv:     kv,
-		prefix: "cache::" + prefix + "::",
+		prefix: strings.ReplaceAll("cache::"+prefix+"::", "::", kv.Spliter()),
 		ttl:    ttl,
 	}
 }

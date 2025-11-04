@@ -190,6 +190,10 @@ func (e *Etcd) List(ctx context.Context, prefix string) (map[string]string, erro
 	return result, nil
 }
 
+func (e *Etcd) Spliter() string {
+	return "/"
+}
+
 // Close 关闭 etcd 客户端连接
 func (e *Etcd) Close() error {
 	return nil
