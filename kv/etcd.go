@@ -18,6 +18,11 @@ type Etcd struct {
 
 // NewEtcd 创建一个新的 etcd 配置存储实例
 func NewEtcd(client *clientv3.Client, prefix string) *Etcd {
+	if prefix == "" {
+		prefix = "/kv/"
+	} else if prefix[len(prefix)-1] != '/' {
+		prefix += "/"
+	}
 	return &Etcd{
 		client: client,
 		prefix: prefix,

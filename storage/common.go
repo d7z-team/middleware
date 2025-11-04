@@ -7,8 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	"gopkg.d7z.net/middleware/connects"
 )
 
 type Storage interface {
@@ -25,13 +24,6 @@ type Storage interface {
 // - 本地存储: file:///path/to/storage
 // - S3/MinIO: s3://accessKey:secretKey@endpoint:port/bucket?secure=true
 func NewStorageFromURL(u string) (Storage, error) {
-	if u == "" ||
-		strings.HasPrefix(u, "./") ||
-		strings.HasPrefix(u, "/") ||
-		strings.HasPrefix(u, "\\") ||
-		strings.HasPrefix(u, ".\\") {
-		return newLocalStorageFromURL(u)
-	}
 	// 解析URL
 	ur, err := url.Parse(u)
 	if err != nil {
@@ -39,12 +31,16 @@ func NewStorageFromURL(u string) (Storage, error) {
 	}
 	// 根据不同的协议方案创建对应的存储实例
 	switch ur.Scheme {
-	case "file":
+	case "file", "local":
 		// 本地文件存储
 		return newLocalStorageFromURL(ur.Path)
 	case "s3", "minio":
 		// S3或MinIO存储
-		return newS3StorageFromURL(ur)
+		s3, err := connects.NewS3(ur)
+		if err != nil {
+			return nil, err
+		}
+		return NewS3(s3.Client, s3.BucketName)
 	case "memory", "mem":
 		return NewMemory(), nil
 	default:
@@ -63,49 +59,4 @@ func newLocalStorageFromURL(path string) (Storage, error) {
 	}
 
 	return NewLocal(absPath)
-}
-
-// newS3StorageFromURL 从URL创建S3/MinIO存储实例
-func newS3StorageFromURL(ur *url.URL) (Storage, error) {
-	// 解析访问密钥和密钥
-	var accessKey, secretKey string
-	if ur.User != nil {
-		accessKey = ur.User.Username()
-		secretKey, _ = ur.User.Password()
-	}
-
-	if accessKey == "" || secretKey == "" {
-		return nil, errors.New("s3 URL必须包含访问密钥和密钥")
-	}
-
-	// 解析端点(包含主机和端口)
-	endpoint := ur.Host
-	if endpoint == "" {
-		return nil, errors.New("s3 URL必须包含端点")
-	}
-
-	// 解析存储桶名称(URL路径的第一部分)
-	bucketName := strings.TrimPrefix(ur.Path, "/")
-	if i := strings.Index(bucketName, "/"); i != -1 {
-		bucketName = bucketName[:i] // 只取路径的第一部分作为桶名
-	}
-
-	if bucketName == "" {
-		return nil, errors.New("s3 URL必须包含存储桶名称")
-	}
-
-	// 解析查询参数
-	secure := false
-	if sslStr := ur.Query().Get("secure"); sslStr == "false" {
-		secure = true
-	}
-
-	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
-		Secure: secure,
-	})
-	if err != nil {
-		return nil, err
-	}
-	return NewS3(client, bucketName)
 }
