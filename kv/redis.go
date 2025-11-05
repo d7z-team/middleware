@@ -9,13 +9,6 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-// 确保 KV 包中存在以下错误定义（已补充到 kv.go）
-var (
-	ErrKeyNotFound = errors.New("key not found")
-	ErrClosed      = errors.New("kv client closed")
-	ErrCASFailed   = errors.New("compare and swap failed")
-)
-
 // RedisKV Redis 实现的 KV 接口
 type RedisKV struct {
 	client  *redis.Client

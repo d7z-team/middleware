@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -50,3 +51,10 @@ func NewKVFromURL(s string) (KV, error) {
 		return nil, fmt.Errorf("unsupported scheme: %s", parse.Scheme)
 	}
 }
+
+// 确保 KV 包中存在以下错误定义（已补充到 kv.go）
+var (
+	ErrKeyNotFound = errors.New("key not found")
+	ErrClosed      = errors.New("kv client closed")
+	ErrCASFailed   = errors.New("compare and swap failed")
+)

@@ -20,34 +20,20 @@ type redisCacheMeta struct {
 
 // RedisCache Redis缓存实现
 type RedisCache struct {
-	client *redis.Client   // Redis客户端实例
-	prefix string          // 缓存键前缀（避免键冲突）
-	ctx    context.Context // 基础上下文
-}
-
-// RedisCacheOption Redis缓存配置选项
-type RedisCacheOption func(*RedisCache)
-
-// WithRedisPrefix 设置Redis键前缀
-func WithRedisPrefix(prefix string) RedisCacheOption {
-	return func(rc *RedisCache) {
-		rc.prefix = prefix
-	}
+	client *redis.Client // Redis客户端实例
+	prefix string        // 缓存键前缀（避免键冲突）
 }
 
 // NewRedisCache 创建Redis缓存实例
 // client: 已初始化的Redis客户端
 // options: 可选配置（如WithRedisPrefix）
-func NewRedisCache(client *redis.Client, options ...RedisCacheOption) *RedisCache {
+func NewRedisCache(client *redis.Client, prefix string) *RedisCache {
+	if prefix == "" {
+		prefix = "cache:"
+	}
 	rc := &RedisCache{
 		client: client,
-		ctx:    context.Background(),
-		prefix: "cache:", // 默认前缀
-	}
-
-	// 应用配置选项
-	for _, opt := range options {
-		opt(rc)
+		prefix: prefix, // 默认前缀
 	}
 
 	return rc
@@ -64,7 +50,7 @@ func (rc *RedisCache) metaKey(key string) string {
 }
 
 // Put 存入Redis缓存
-func (rc *RedisCache) Put(key string, value io.Reader, ttl time.Duration) error {
+func (rc *RedisCache) Put(ctx context.Context, key string, value io.Reader, ttl time.Duration) error {
 	// 读取全部数据
 	data, err := io.ReadAll(value)
 	if err != nil {
@@ -94,17 +80,17 @@ func (rc *RedisCache) Put(key string, value io.Reader, ttl time.Duration) error 
 	metaKey := rc.metaKey(key)
 
 	// 设置数据和元数据（永不过期，后续单独设置过期时间）
-	pipe.Set(rc.ctx, dataKey, data, 0)
-	pipe.Set(rc.ctx, metaKey, metaJSON, 0)
+	pipe.Set(ctx, dataKey, data, 0)
+	pipe.Set(ctx, metaKey, metaJSON, 0)
 
 	// 设置过期时间（TTLKeep表示永不过期）
 	if ttl != TTLKeep {
-		pipe.Expire(rc.ctx, dataKey, ttl)
-		pipe.Expire(rc.ctx, metaKey, ttl)
+		pipe.Expire(ctx, dataKey, ttl)
+		pipe.Expire(ctx, metaKey, ttl)
 	}
 
 	// 执行Pipeline命令
-	_, err = pipe.Exec(rc.ctx)
+	_, err = pipe.Exec(ctx)
 	if err != nil {
 		return wrapError("redis pipeline exec failed", err)
 	}
@@ -113,10 +99,10 @@ func (rc *RedisCache) Put(key string, value io.Reader, ttl time.Duration) error 
 }
 
 // Get 从Redis获取缓存
-func (rc *RedisCache) Get(key string) (*CacheContent, error) {
+func (rc *RedisCache) Get(ctx context.Context, key string) (*CacheContent, error) {
 	// 1. 获取元数据
 	metaKey := rc.metaKey(key)
-	metaJSON, err := rc.client.Get(rc.ctx, metaKey).Bytes()
+	metaJSON, err := rc.client.Get(ctx, metaKey).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, ErrCacheMiss
@@ -132,7 +118,7 @@ func (rc *RedisCache) Get(key string) (*CacheContent, error) {
 
 	// 2. 获取数据
 	dataKey := rc.dataKey(key)
-	data, err := rc.client.Get(rc.ctx, dataKey).Bytes()
+	data, err := rc.client.Get(ctx, dataKey).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, ErrCacheMiss
@@ -155,12 +141,12 @@ func (rc *RedisCache) Get(key string) (*CacheContent, error) {
 }
 
 // Delete 从Redis删除缓存
-func (rc *RedisCache) Delete(key string) error {
+func (rc *RedisCache) Delete(ctx context.Context, key string) error {
 	dataKey := rc.dataKey(key)
 	metaKey := rc.metaKey(key)
 
 	// 批量删除数据和元数据
-	_, err := rc.client.Del(rc.ctx, dataKey, metaKey).Result()
+	_, err := rc.client.Del(ctx, dataKey, metaKey).Result()
 	if err != nil {
 		return wrapError("redis delete failed", err)
 	}

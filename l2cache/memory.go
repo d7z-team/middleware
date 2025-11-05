@@ -2,6 +2,7 @@ package l2cache
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"sync"
 	"time"
@@ -91,7 +92,7 @@ func NewMemoryCache(options ...MemoryCacheOption) (*MemoryCache, error) {
 }
 
 // Put 存入缓存（支持 TTL 和 LRU 淘汰，与原接口一致）
-func (mc *MemoryCache) Put(key string, value io.Reader, ttl time.Duration) error {
+func (mc *MemoryCache) Put(_ context.Context, key string, value io.Reader, ttl time.Duration) error {
 	// 读取输入数据
 	data, err := io.ReadAll(value)
 	if err != nil {
@@ -125,7 +126,7 @@ func (mc *MemoryCache) Put(key string, value io.Reader, ttl time.Duration) error
 }
 
 // Get 获取缓存（命中更新 LRU 顺序，过期自动删除，与原接口一致）
-func (mc *MemoryCache) Get(key string) (*CacheContent, error) {
+func (mc *MemoryCache) Get(_ context.Context, key string) (*CacheContent, error) {
 	// 从 LRU 缓存获取（底层自动更新访问顺序）
 	internalVal, exists := mc.lruCache.Get(key)
 	if !exists {
@@ -150,7 +151,7 @@ func (mc *MemoryCache) Get(key string) (*CacheContent, error) {
 }
 
 // Delete 删除指定缓存键（与原接口一致）
-func (mc *MemoryCache) Delete(key string) error {
+func (mc *MemoryCache) Delete(_ context.Context, key string) error {
 	mc.lruCache.Remove(key)
 	return nil
 }
