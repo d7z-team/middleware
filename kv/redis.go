@@ -137,28 +137,26 @@ func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue st
 		currentVal, err := tx.Get(ctx, fullKey).Result()
 		if err != nil {
 			if errors.Is(err, redis.Nil) {
-				return ErrKeyNotFound // 键不存在，CAS 失败
+				return ErrKeyNotFound // 键不存在，返回特定错误
 			}
 			return err
 		}
 		if currentVal != oldValue {
-			return ErrCASFailed // 旧值不匹配，CAS 失败
+			return ErrCASFailed
 		}
-
-		// 3. 事务中设置新值
 		_, err = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.Set(ctx, fullKey, newValue, 0) // 继承原键的 TTL（Redis SET 不改变 TTL）
+			pipe.Set(ctx, fullKey, newValue, 0)
 			return nil
 		})
 		return err
 	}, fullKey); err != nil {
-		// 4. 处理错误：键不存在或旧值不匹配返回 false，其他错误返回异常
-		if errors.Is(err, ErrKeyNotFound) || errors.Is(err, ErrCASFailed) {
+		if errors.Is(err, ErrCASFailed) {
 			return false, nil
 		}
 		return false, err
 	}
 
+	// 5. 执行成功：返回 (true, nil)
 	return true, nil
 }
 

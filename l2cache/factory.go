@@ -46,7 +46,7 @@ func newMemoryCacheFromURL(ur *url.URL) (*MemoryCache, error) {
 	query := ur.Query()
 
 	// 1. 解析最大容量（必填）
-	var maxCap = 10 * 1024 * 1024
+	maxCap := 10 * 1024 * 1024
 	var err error
 	maxCapStr := query.Get("max_capacity")
 	if maxCapStr != "" {

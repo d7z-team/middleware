@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -15,15 +16,17 @@ import (
 
 // Memory 一个简单的内存配置存储，仅用于测试，实现了KV接口
 type Memory struct {
-	data  sync.Map
-	store string
+	data   sync.Map
+	store  string
+	closed *atomic.Bool
 }
 
 // NewMemory 创建一个新的内存存储实例
-func NewMemory(store string) (KV, error) {
+func NewMemory(store string) (*Memory, error) {
 	ret := &Memory{
-		store: store,
-		data:  sync.Map{},
+		store:  store,
+		data:   sync.Map{},
+		closed: new(atomic.Bool),
 	}
 	if store != "" {
 		zap.L().Info("parse config from store", zap.String("store", store))
@@ -65,6 +68,9 @@ type memoryKv struct {
 
 // ListPage 分页获取前缀匹配的键值对
 func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
+	if m.closed.Load() {
+		return nil, ErrClosed
+	}
 	internal, err := m.listInternal(ctx, prefix)
 	if err != nil {
 		return nil, err
@@ -98,6 +104,9 @@ func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, 
 }
 
 func (m *Memory) List(ctx context.Context, prefix string) (map[string]string, error) {
+	if m.closed.Load() {
+		return nil, ErrClosed
+	}
 	result := make(map[string]string)
 	internal, err := m.listInternal(ctx, prefix)
 	if err != nil {
@@ -152,6 +161,9 @@ func (m *Memory) listInternal(ctx context.Context, prefix string) (map[string]me
 
 // Put 存储键值对，可以设置过期时间
 func (m *Memory) Put(_ context.Context, key, value string, ttl time.Duration) error {
+	if m.closed.Load() {
+		return ErrClosed
+	}
 	now := time.Now()
 	var td *time.Time
 	if ttl != -1 {
@@ -169,6 +181,9 @@ func (m *Memory) Put(_ context.Context, key, value string, ttl time.Duration) er
 
 // Get 获取指定键的值，过期则删除并返回不存在
 func (m *Memory) Get(_ context.Context, key string) (string, error) {
+	if m.closed.Load() {
+		return "", ErrClosed
+	}
 	if value, ok := m.data.Load(key); ok {
 		content, ok := value.(memoryContent)
 		if !ok {
@@ -188,12 +203,18 @@ func (m *Memory) Get(_ context.Context, key string) (string, error) {
 
 // Delete 删除指定的键
 func (m *Memory) Delete(_ context.Context, key string) (bool, error) {
+	if m.closed.Load() {
+		return false, ErrClosed
+	}
 	_, loaded := m.data.LoadAndDelete(key)
 	return loaded, nil
 }
 
 // PutIfNotExists 仅在键不存在时设置值（原子操作）
 func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if m.closed.Load() {
+		return false, ErrClosed
+	}
 	now := time.Now()
 	var td *time.Time
 	if ttl != -1 {
@@ -232,11 +253,13 @@ func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.D
 
 // CompareAndSwap 当当前值等于oldValue时，将其更新为newValue（原子操作）
 func (m *Memory) CompareAndSwap(_ context.Context, key, oldValue, newValue string) (bool, error) {
+	if m.closed.Load() {
+		return false, ErrClosed
+	}
 	val, exists := m.data.Load(key)
 	if !exists {
 		return false, ErrKeyNotFound
 	}
-
 	content, ok := val.(memoryContent)
 	if !ok {
 		return false, nil
@@ -267,6 +290,9 @@ func (m *Memory) CompareAndSwap(_ context.Context, key, oldValue, newValue strin
 
 // Close 关闭内存存储，安全持久化数据到文件
 func (m *Memory) Close() error {
+	if m.closed.Swap(true) {
+		return ErrClosed
+	}
 	defer m.data.Clear()
 	if m.store == "" {
 		return nil
