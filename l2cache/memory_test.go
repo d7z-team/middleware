@@ -131,7 +131,7 @@ func TestMemoryCache_Put(t *testing.T) {
 
 	// 4. 无效TTL（<=0且非TTLKeep）
 	key3 := "put-key-3"
-	if err := mc.Put(key3, bytes.NewBuffer([]byte("value3")), -500*time.Millisecond); !errors.Is(err, ErrInvalidTTL) {
+	if err := mc.Put(key3, bytes.NewBufferString("value3"), -500*time.Millisecond); !errors.Is(err, ErrInvalidTTL) {
 		t.Errorf("无效TTL未报错：期望 ErrInvalidTTL，实际 %v", err)
 	}
 	// 验证未存入
@@ -260,7 +260,7 @@ func TestMemoryCache_LRUEviction(t *testing.T) {
 
 	// 1. 存入3个key（容量满）
 	for i := 0; i < maxCap; i++ {
-		if err := mc.Put(keys[i], bytes.NewBuffer([]byte(values[i])), TTLKeep); err != nil {
+		if err := mc.Put(keys[i], bytes.NewBufferString(values[i]), TTLKeep); err != nil {
 			t.Errorf("存入第%d个key失败：%v", i, err)
 		}
 	}
@@ -275,7 +275,7 @@ func TestMemoryCache_LRUEviction(t *testing.T) {
 	}
 
 	// 3. 存入第4个key（触发LRU淘汰，最少访问的key2被淘汰）
-	if err := mc.Put(keys[3], bytes.NewBuffer([]byte(values[3])), TTLKeep); err != nil {
+	if err := mc.Put(keys[3], bytes.NewBufferString(values[3]), TTLKeep); err != nil {
 		t.Fatalf("存入第4个key（触发淘汰）失败：%v", err)
 	}
 
@@ -298,7 +298,7 @@ func TestMemoryCache_LRUEviction(t *testing.T) {
 	}
 
 	// 5. 再次存入被淘汰的key2（触发新淘汰：最少访问的key3）
-	if err := mc.Put(keys[1], bytes.NewBuffer([]byte(values[1])), TTLKeep); err != nil {
+	if err := mc.Put(keys[1], bytes.NewBufferString(values[1]), TTLKeep); err != nil {
 		t.Fatalf("重新存入key2失败：%v", err)
 	}
 	// 验证key3被淘汰
@@ -345,7 +345,7 @@ func TestMemoryCache_Delete(t *testing.T) {
 	// 4. 批量删除测试
 	keys := []string{"delete-1", "delete-2", "delete-3"}
 	for _, key := range keys {
-		if err := mc.Put(key, bytes.NewBuffer([]byte(key)), TTLKeep); err != nil {
+		if err := mc.Put(key, bytes.NewBufferString(key), TTLKeep); err != nil {
 			t.Errorf("批量存入key %s 失败：%v", key, err)
 		}
 	}
@@ -390,7 +390,7 @@ func TestMemoryCache_CleanupTask(t *testing.T) {
 
 	// 存入所有测试key
 	for _, tc := range testCases {
-		if err := mc.Put(tc.key, bytes.NewBuffer([]byte(tc.value)), tc.ttl); err != nil {
+		if err := mc.Put(tc.key, bytes.NewBufferString(tc.value), tc.ttl); err != nil {
 			t.Errorf("存入测试key %s 失败：%v", tc.key, err)
 		}
 	}
@@ -533,7 +533,7 @@ func TestMemoryCache_Close(t *testing.T) {
 	// 存入过期key，等待清理间隔+TTL，验证未被清理（任务已停）
 	expKey := "close-exp-key"
 	ttl := 50 * time.Millisecond
-	if err := mc.Put(expKey, bytes.NewBuffer([]byte("exp-value")), ttl); err != nil {
+	if err := mc.Put(expKey, bytes.NewBufferString("exp-value"), ttl); err != nil {
 		t.Fatalf("关闭后存入过期key失败：%v", err)
 	}
 	// 等待足够时间（任务已停，不会清理）

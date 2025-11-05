@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	kv "gopkg.d7z.net/middleware/kv"
+	"gopkg.d7z.net/middleware/kv"
 )
 
 type Cache[Data any] struct {

@@ -97,11 +97,7 @@ func newRedisCacheFromURL(ur *url.URL) (*RedisCache, error) {
 	// 2. 解析密码（URL User 部分，格式为 :password 或 user:password）
 	var password string
 	if ur.User != nil {
-		password = ur.User.String()
-		// 如果是 ":password" 格式，去掉前缀的冒号
-		if strings.HasPrefix(password, ":") {
-			password = password[1:]
-		}
+		password = strings.TrimPrefix(ur.User.String(), ":")
 	}
 
 	// 3. 解析数据库编号（URL 路径，如 /0 -> db=0）
@@ -130,7 +126,7 @@ func newRedisCacheFromURL(ur *url.URL) (*RedisCache, error) {
 	}
 
 	// 6. rediss 协议启用 TLS
-	if strings.ToLower(ur.Scheme) == "rediss" {
+	if strings.EqualFold(ur.Scheme, "rediss") {
 		redisOpts.TLSConfig = &tls.Config{}
 		redisOpts.TLSConfig.InsecureSkipVerify = ur.Query().Get("insecure") == "true"
 	}

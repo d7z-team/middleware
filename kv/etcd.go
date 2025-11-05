@@ -49,11 +49,6 @@ func (e *Etcd) buildKey(key string) string {
 	return e.prefix + key
 }
 
-// 辅助函数：从完整键中剥离实例前缀，返回相对键
-func (e *Etcd) stripPrefix(fullKey string) string {
-	return strings.TrimPrefix(fullKey, e.prefix)
-}
-
 // Put 存储键值对（添加关闭检查）
 func (e *Etcd) Put(ctx context.Context, key, value string, ttl time.Duration) error {
 	if err := e.checkClosed(); err != nil {
