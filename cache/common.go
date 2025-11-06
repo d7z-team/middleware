@@ -1,13 +1,50 @@
-package l2cache
+package cache
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.d7z.net/middleware/connects"
+)
+
+const TTLKeep = -1
+
+type Cache interface {
+	Put(ctx context.Context, key string, value io.Reader, ttl time.Duration) error
+	Get(ctx context.Context, key string) (*CacheContent, error)
+	Delete(ctx context.Context, key string) error
+	io.Closer
+}
+
+type CacheContent struct {
+	io.ReadSeekCloser
+	Length       int
+	LastModified time.Time
+}
+
+func (c *CacheContent) ReadToString() (string, error) {
+	all, err := io.ReadAll(c)
+	if err != nil {
+		return "", err
+	}
+	_, _ = c.Seek(0, io.SeekStart)
+	return string(all), nil
+}
+
+// 通用缓存错误定义
+var (
+	// ErrCacheMiss 缓存未命中或已过期
+	ErrCacheMiss = errors.Join(os.ErrNotExist, errors.New("cache: key not found or expired"))
+	// ErrInvalidTTL 无效的TTL值（非TTLKeep且小于等于0）
+	ErrInvalidTTL = errors.New("cache: invalid ttl value (use TTLKeep for permanent cache)")
+	// ErrInvalidCapacity 无效的缓存容量（小于等于0）
+	ErrInvalidCapacity = errors.New("cache: invalid cache capacity (must be greater than 0)")
 )
 
 // NewCacheFromURL 通过 URL 配置创建缓存实例
@@ -39,11 +76,6 @@ func NewCacheFromURL(u string) (Cache, error) {
 	}
 }
 
-// newMemoryCacheFromURL 从 URL 解析配置创建内存缓存
-// URL 格式：memory://?max_capacity=1000&cleanup_interval=5m
-// 支持参数：
-// - max_capacity: 最大缓存容量（必填，正整数）
-// - cleanup_interval: 过期清理间隔（可选，默认5m，支持s/m/h单位）
 func newMemoryCacheFromURL(ur *url.URL) (*MemoryCache, error) {
 	query := ur.Query()
 
@@ -58,7 +90,6 @@ func newMemoryCacheFromURL(ur *url.URL) (*MemoryCache, error) {
 		}
 	}
 
-	// 2. 解析清理间隔（可选，默认5m）
 	cleanupIntervalStr := query.Get("cleanup_interval")
 	cleanupInterval := 5 * time.Minute
 	if cleanupIntervalStr != "" {
@@ -69,9 +100,10 @@ func newMemoryCacheFromURL(ur *url.URL) (*MemoryCache, error) {
 		cleanupInterval = dur
 	}
 
-	// 3. 创建内存缓存实例
 	return NewMemoryCache(
-		WithMaxCapacity(maxCap),
-		WithCleanupInterval(cleanupInterval),
+		MemoryCacheConfig{
+			MaxCapacity: maxCap,
+			CleanupInt:  cleanupInterval,
+		},
 	)
 }

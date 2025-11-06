@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
 	"time"
 
 	"gopkg.d7z.net/middleware/connects"
@@ -54,7 +55,7 @@ func NewKVFromURL(s string) (KV, error) {
 
 // 确保 KV 包中存在以下错误定义（已补充到 kv.go）
 var (
-	ErrKeyNotFound = errors.New("key not found")
+	ErrKeyNotFound = errors.Join(os.ErrNotExist, errors.New("key not found"))
 	ErrClosed      = errors.New("kv client closed")
 	ErrCASFailed   = errors.New("compare and swap failed")
 )

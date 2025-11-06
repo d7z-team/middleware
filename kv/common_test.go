@@ -289,7 +289,7 @@ func TestEtcdKV(t *testing.T) {
 
 	etcd, err := connects.NewEtcd(parse)
 	if err != nil {
-		t.Skip("如需测试 Redis 实现，请确保本地 Redis 运行")
+		t.Skip("如需测试 etcd 实现，请确保本地 etcd 运行")
 	}
 	defer etcd.Close()
 

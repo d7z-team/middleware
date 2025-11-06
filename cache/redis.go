@@ -1,4 +1,4 @@
-package l2cache
+package cache
 
 import (
 	"bytes"
@@ -7,131 +7,121 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
 )
 
-// redisCacheMeta Redis缓存元数据（存储长度和最后修改时间）
 type redisCacheMeta struct {
 	Length       int       `json:"length"`
 	LastModified time.Time `json:"last_modified"`
 }
 
-// RedisCache Redis缓存实现
 type RedisCache struct {
-	client *redis.Client // Redis客户端实例
-	prefix string        // 缓存键前缀（避免键冲突）
+	client *redis.Client
+	prefix string
+	closed atomic.Bool
 }
 
-// NewRedisCache 创建Redis缓存实例
-// client: 已初始化的Redis客户端
-// options: 可选配置（如WithRedisPrefix）
 func NewRedisCache(client *redis.Client, prefix string) *RedisCache {
 	if prefix == "" {
 		prefix = "cache:"
 	}
-	rc := &RedisCache{
+	return &RedisCache{
 		client: client,
-		prefix: prefix, // 默认前缀
+		prefix: prefix,
 	}
-
-	return rc
 }
 
-// dataKey 生成数据存储键（前缀+key+":data"）
+func (rc *RedisCache) isClosed() bool {
+	return rc.closed.Load()
+}
+
 func (rc *RedisCache) dataKey(key string) string {
 	return fmt.Sprintf("%s%s:data", rc.prefix, key)
 }
 
-// metaKey 生成元数据存储键（前缀+key+":meta"）
 func (rc *RedisCache) metaKey(key string) string {
 	return fmt.Sprintf("%s%s:meta", rc.prefix, key)
 }
 
-// Put 存入Redis缓存
 func (rc *RedisCache) Put(ctx context.Context, key string, value io.Reader, ttl time.Duration) error {
-	// 读取全部数据
-	data, err := io.ReadAll(value)
-	if err != nil {
-		return wrapError("read value failed", err)
+	if rc.isClosed() {
+		return errors.New("cache is closed")
 	}
 
-	// 验证TTL
+	data, err := io.ReadAll(value)
+	if err != nil {
+		return fmt.Errorf("read value: %w", err)
+	}
+
 	if ttl != TTLKeep && ttl <= 0 {
 		return ErrInvalidTTL
 	}
 
-	// 构造元数据
 	meta := redisCacheMeta{
 		Length:       len(data),
 		LastModified: time.Now(),
 	}
 
-	// 序列化元数据为JSON
 	metaJSON, err := json.Marshal(meta)
 	if err != nil {
-		return wrapError("marshal meta failed", err)
+		return fmt.Errorf("marshal meta: %w", err)
 	}
 
-	// 使用Pipeline保证原子性（同时写入数据和元数据）
 	pipe := rc.client.Pipeline()
 	dataKey := rc.dataKey(key)
 	metaKey := rc.metaKey(key)
 
-	// 设置数据和元数据（永不过期，后续单独设置过期时间）
 	pipe.Set(ctx, dataKey, data, 0)
 	pipe.Set(ctx, metaKey, metaJSON, 0)
 
-	// 设置过期时间（TTLKeep表示永不过期）
 	if ttl != TTLKeep {
 		pipe.Expire(ctx, dataKey, ttl)
 		pipe.Expire(ctx, metaKey, ttl)
 	}
 
-	// 执行Pipeline命令
 	_, err = pipe.Exec(ctx)
 	if err != nil {
-		return wrapError("redis pipeline exec failed", err)
+		return fmt.Errorf("redis pipeline: %w", err)
 	}
 
 	return nil
 }
 
-// Get 从Redis获取缓存
 func (rc *RedisCache) Get(ctx context.Context, key string) (*CacheContent, error) {
-	// 1. 获取元数据
+	if rc.isClosed() {
+		return nil, errors.New("cache is closed")
+	}
+
 	metaKey := rc.metaKey(key)
 	metaJSON, err := rc.client.Get(ctx, metaKey).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, ErrCacheMiss
 		}
-		return nil, wrapError("get meta from redis failed", err)
+		return nil, fmt.Errorf("get meta: %w", err)
 	}
 
-	// 反序列化元数据
 	var meta redisCacheMeta
 	if err := json.Unmarshal(metaJSON, &meta); err != nil {
-		return nil, wrapError("unmarshal meta failed", err)
+		return nil, fmt.Errorf("unmarshal meta: %w", err)
 	}
 
-	// 2. 获取数据
 	dataKey := rc.dataKey(key)
 	data, err := rc.client.Get(ctx, dataKey).Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, ErrCacheMiss
 		}
-		return nil, wrapError("get data from redis failed", err)
+		return nil, fmt.Errorf("get data: %w", err)
 	}
 
-	// 验证数据长度（防止数据损坏）
 	if len(data) != meta.Length {
-		return nil, fmt.Errorf("cache: data length mismatch (expected %d, got %d)", meta.Length, len(data))
+		return nil, fmt.Errorf("data length mismatch: expected %d, got %d", meta.Length, len(data))
 	}
 
-	// 构造可重复读取的CacheContent
 	reader := bytes.NewReader(data)
 	return &CacheContent{
 		ReadSeekCloser: NopCloser{reader},
@@ -140,20 +130,24 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*CacheContent, error
 	}, nil
 }
 
-// Delete 从Redis删除缓存
 func (rc *RedisCache) Delete(ctx context.Context, key string) error {
+	if rc.isClosed() {
+		return errors.New("cache is closed")
+	}
+
 	dataKey := rc.dataKey(key)
 	metaKey := rc.metaKey(key)
 
-	// 批量删除数据和元数据
 	_, err := rc.client.Del(ctx, dataKey, metaKey).Result()
 	if err != nil {
-		return wrapError("redis delete failed", err)
+		return fmt.Errorf("redis delete: %w", err)
 	}
 	return nil
 }
 
-// Close 关闭Redis缓存（关闭客户端连接池）
 func (rc *RedisCache) Close() error {
-	return rc.client.Close()
+	if rc.closed.CompareAndSwap(false, true) {
+		return rc.client.Close()
+	}
+	return nil
 }
