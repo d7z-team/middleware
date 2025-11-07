@@ -407,7 +407,7 @@ func TestCacheContent(t *testing.T) {
 	nopCloser := NopCloser{reader}
 	now := time.Now()
 
-	content := &CacheContent{
+	content := &Content{
 		ReadSeekCloser: nopCloser,
 		Length:         len(data),
 		LastModified:   now,

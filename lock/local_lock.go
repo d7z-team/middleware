@@ -3,6 +3,7 @@ package lock
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // LocalLocker 基于当前进程的本地锁实现
@@ -17,9 +18,9 @@ func NewLocalLocker() *LocalLocker {
 }
 
 // getLock 获取指定id的锁，如果不存在则创建
-func (l *LocalLocker) getLock(id string) *sync.Mutex {
-	lock, _ := l.locks.LoadOrStore(id, &sync.Mutex{})
-	return lock.(*sync.Mutex)
+func (l *LocalLocker) getLock(id string) *atomic.Bool {
+	lock, _ := l.locks.LoadOrStore(id, &atomic.Bool{})
+	return lock.(*atomic.Bool)
 }
 
 // TryLock 尝试获取锁，非阻塞
@@ -32,11 +33,13 @@ func (l *LocalLocker) TryLock(ctx context.Context, id string) func() {
 
 	lock := l.getLock(id)
 
-	// 尝试获取锁
-	if lock.TryLock() {
+	// 使用 CAS (CompareAndSwap) 尝试获取锁
+	if lock.CompareAndSwap(false, true) {
 		var once sync.Once
 		return func() {
-			once.Do(lock.Unlock)
+			once.Do(func() {
+				lock.Store(false)
+			})
 		}
 	}
 
@@ -46,34 +49,43 @@ func (l *LocalLocker) TryLock(ctx context.Context, id string) func() {
 // Lock 阻塞直到获取锁或上下文被取消
 // 如果成功获取锁，返回解锁函数；否则返回nil
 func (l *LocalLocker) Lock(ctx context.Context, id string) func() {
-	lock := l.getLock(id)
-	// 使用通道来协调锁获取和上下文取消
-	done := make(chan struct{})
-	defer close(done)
-
-	// 使用 sync.Once 确保解锁函数只能被调用一次
-	var once sync.Once
-	go func() {
-		select {
-		case <-ctx.Done():
-			// 上下文取消，尝试解锁（如果当前goroutine已经获取了锁）
-			lock.TryLock()       // 确保我们有锁的所有权
-			once.Do(lock.Unlock) // 然后立即释放
-		case <-done:
-			// 正常退出
-		}
-	}()
-
-	// 阻塞获取锁
-	lock.Lock()
-
-	// 检查上下文是否在获取锁的过程中被取消
 	if ctx.Err() != nil {
-		once.Do(lock.Unlock)
 		return nil
 	}
 
-	return func() {
-		once.Do(lock.Unlock)
+	lock := l.getLock(id)
+	// 使用 sync.Once 确保解锁函数只能被调用一次
+	var once sync.Once
+	unlockFunc := func() {
+		once.Do(func() {
+			lock.Store(false)
+		})
+	}
+
+	// 快速路径：先尝试一次获取锁
+	if lock.CompareAndSwap(false, true) {
+		return unlockFunc
+	}
+
+	// 慢速路径：循环尝试获取锁，同时监听上下文取消
+	for {
+		// 在每次尝试前检查上下文是否已取消
+		if ctx.Err() != nil {
+			return nil
+		}
+
+		// 尝试获取锁
+		if lock.CompareAndSwap(false, true) {
+			return unlockFunc
+		}
+
+		// 让出CPU时间片，避免忙等待
+		// 使用一个非常短暂的自旋等待，然后再次检查
+		for i := 0; i < 100; i++ {
+			if ctx.Err() != nil {
+				return nil
+			}
+			// 空循环，让出时间片
+		}
 	}
 }

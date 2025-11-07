@@ -90,7 +90,7 @@ func (mc *MemoryCache) Put(_ context.Context, key string, value io.Reader, ttl t
 	return nil
 }
 
-func (mc *MemoryCache) Get(_ context.Context, key string) (*CacheContent, error) {
+func (mc *MemoryCache) Get(_ context.Context, key string) (*Content, error) {
 	internalVal, exists := mc.lruCache.Get(key)
 	if !exists {
 		return nil, ErrCacheMiss
@@ -103,7 +103,7 @@ func (mc *MemoryCache) Get(_ context.Context, key string) (*CacheContent, error)
 	}
 
 	reader := bytes.NewReader(internalVal.data)
-	return &CacheContent{
+	return &Content{
 		ReadSeekCloser: NopCloser{reader},
 		Length:         internalVal.length,
 		LastModified:   internalVal.lastModify,

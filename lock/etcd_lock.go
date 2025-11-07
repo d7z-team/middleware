@@ -33,7 +33,7 @@ func NewEtcdLocker(client *clientv3.Client, prefix string) *EtcdLocker {
 
 // getLockPath 生成锁的完整路径
 func (e *EtcdLocker) getLockPath(id string) string {
-	return fmt.Sprintf("%s%s", e.prefix, id)
+	return fmt.Sprintf("%s/%s", e.prefix, id)
 }
 
 // TryLock 尝试获取分布式锁，非阻塞

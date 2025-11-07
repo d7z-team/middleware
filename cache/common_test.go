@@ -18,7 +18,7 @@ import (
 type CacheFactory func(t *testing.T) Cache
 
 // TestCache_Common 通用缓存接口测试套件
-func testCache_Common(t *testing.T, factory CacheFactory) {
+func testCacheCommon(t *testing.T, factory CacheFactory) {
 	t.Run("PutGet", func(t *testing.T) { testPutGet(t, factory) })
 	t.Run("PutInvalidTTL", func(t *testing.T) { testPutInvalidTTL(t, factory) })
 	t.Run("GetMiss", func(t *testing.T) { testGetMiss(t, factory) })
@@ -329,7 +329,7 @@ func testCacheErrorReader(t *testing.T, factory CacheFactory) {
 
 func TestMemory(t *testing.T) {
 	t.Run("Common", func(t *testing.T) {
-		testCache_Common(t, func(t *testing.T) Cache {
+		testCacheCommon(t, func(t *testing.T) Cache {
 			cache, err := NewMemoryCache(
 				MemoryCacheConfig{
 					100,
@@ -359,7 +359,7 @@ func TestMemory(t *testing.T) {
 
 func TestRedis(t *testing.T) {
 	t.Run("Common", func(t *testing.T) {
-		testCache_Common(t, func(t *testing.T) Cache {
+		testCacheCommon(t, func(t *testing.T) Cache {
 			parse, _ := url.Parse("redis://127.0.0.1:6379")
 			redis, err := connects.NewRedis(parse)
 			if err != nil {

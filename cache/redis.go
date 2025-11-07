@@ -90,7 +90,7 @@ func (rc *RedisCache) Put(ctx context.Context, key string, value io.Reader, ttl 
 	return nil
 }
 
-func (rc *RedisCache) Get(ctx context.Context, key string) (*CacheContent, error) {
+func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 	if rc.isClosed() {
 		return nil, errors.New("cache is closed")
 	}
@@ -123,7 +123,7 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*CacheContent, error
 	}
 
 	reader := bytes.NewReader(data)
-	return &CacheContent{
+	return &Content{
 		ReadSeekCloser: NopCloser{reader},
 		Length:         meta.Length,
 		LastModified:   meta.LastModified,

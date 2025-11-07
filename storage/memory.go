@@ -24,16 +24,20 @@ func NewMemory() Storage {
 
 // normalizePath 规范化路径，统一使用"/"作为分隔符，移除冗余斜杠
 func normalizePath(path string) string {
-	// 清理路径（处理.和..）
-	cleaned := filepath.Clean(path)
-	// 统一替换为正斜杠（跨平台兼容）
-	return strings.ReplaceAll(cleaned, "\\", "/")
+	if path == "" {
+		return ""
+	}
+	return strings.TrimPrefix(strings.ReplaceAll(filepath.Clean(path), "\\", "/"), "./")
 }
 
 // Exists 检查指定路径的文件是否存在
 func (m *Memory) Exists(name string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if name == "" {
+		return false
+	}
 
 	normalized := normalizePath(name)
 	_, exists := m.files[normalized]
@@ -45,10 +49,14 @@ func (m *Memory) Pull(path string) (io.ReadCloser, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if path == "" {
+		return nil, errors.New("path cannot be empty")
+	}
+
 	normalized := normalizePath(path)
 	data, exists := m.files[normalized]
 	if !exists {
-		return nil, errors.New("file not found")
+		return nil, errors.New("file not found: " + path)
 	}
 
 	// 使用NopCloser包装字节读取器，实现ReadCloser接口
@@ -59,6 +67,10 @@ func (m *Memory) Pull(path string) (io.ReadCloser, error) {
 func (m *Memory) Push(path string, r io.Reader) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	if path == "" {
+		return errors.New("path cannot be empty")
+	}
 
 	normalized := normalizePath(path)
 	// 读取所有内容
@@ -77,10 +89,13 @@ func (m *Memory) List(path string) ([]string, error) {
 	defer m.mu.Unlock()
 
 	normalizedPath := normalizePath(path)
-	prefix := normalizedPath
-	// 处理根目录情况（path为空时前缀为空）
-	if prefix != "" {
-		prefix += "/"
+
+	// 处理根目录情况
+	var prefix string
+	if normalizedPath == "" {
+		prefix = ""
+	} else {
+		prefix = normalizedPath + "/"
 	}
 
 	seen := make(map[string]struct{}) // 用于去重
@@ -88,7 +103,16 @@ func (m *Memory) List(path string) ([]string, error) {
 
 	for file := range m.files {
 		// 检查是否为当前路径的子条目
-		if !strings.HasPrefix(file, prefix) {
+		if prefix != "" && !strings.HasPrefix(file, prefix) {
+			continue
+		}
+		if prefix == "" && strings.Contains(file, "/") {
+			// 对于根目录，只显示第一级目录
+			firstPart := strings.SplitN(file, "/", 2)[0]
+			if _, ok := seen[firstPart]; !ok {
+				seen[firstPart] = struct{}{}
+				entries = append(entries, firstPart)
+			}
 			continue
 		}
 
@@ -116,15 +140,25 @@ func (m *Memory) Remove(path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if path == "" {
+		return errors.New("path cannot be empty")
+	}
+
 	normalized := normalizePath(path)
 	if _, exists := m.files[normalized]; !exists {
-		return errors.New("file not found")
+		return errors.New("file not found: " + path)
 	}
 
 	delete(m.files, normalized)
 	return nil
 }
 
+// Close 关闭存储并清理资源
 func (m *Memory) Close() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 清空所有文件
+	m.files = make(map[string][]byte)
 	return nil
 }

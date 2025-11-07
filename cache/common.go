@@ -17,18 +17,18 @@ const TTLKeep = -1
 
 type Cache interface {
 	Put(ctx context.Context, key string, value io.Reader, ttl time.Duration) error
-	Get(ctx context.Context, key string) (*CacheContent, error)
+	Get(ctx context.Context, key string) (*Content, error)
 	Delete(ctx context.Context, key string) error
 	io.Closer
 }
 
-type CacheContent struct {
+type Content struct {
 	io.ReadSeekCloser
 	Length       int
 	LastModified time.Time
 }
 
-func (c *CacheContent) ReadToString() (string, error) {
+func (c *Content) ReadToString() (string, error) {
 	all, err := io.ReadAll(c)
 	if err != nil {
 		return "", err
