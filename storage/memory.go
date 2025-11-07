@@ -135,7 +135,7 @@ func (m *Memory) List(path string) ([]string, error) {
 	return entries, nil
 }
 
-// Remove 删除指定路径的文件
+// Remove 删除指定路径的文件或目录（包括所有子文件）
 func (m *Memory) Remove(path string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -145,11 +145,28 @@ func (m *Memory) Remove(path string) error {
 	}
 
 	normalized := normalizePath(path)
-	if _, exists := m.files[normalized]; !exists {
-		return errors.New("file not found: " + path)
+
+	// 检查是否是文件路径
+	if _, exists := m.files[normalized]; exists {
+		// 如果是文件，直接删除
+		delete(m.files, normalized)
+		return nil
 	}
 
-	delete(m.files, normalized)
+	// 如果是目录路径，删除所有以该路径开头的文件
+	prefix := normalized + "/"
+	var found bool
+	for file := range m.files {
+		if strings.HasPrefix(file, prefix) {
+			delete(m.files, file)
+			found = true
+		}
+	}
+
+	if !found {
+		return errors.New("path not found: " + path)
+	}
+
 	return nil
 }
 

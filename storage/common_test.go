@@ -4,6 +4,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestStorageInterface(t *testing.T) {
@@ -163,6 +165,21 @@ func runStorageTests(t *testing.T, storage Storage) {
 			t.Fatalf("删除嵌套文件失败: %v", err)
 		}
 	})
+	t.Run("Nested_Directory_Delete", func(t *testing.T) {
+		err := storage.Push("nested/delete/a.txt", strings.NewReader(testContent))
+		assert.NoError(t, err)
+		err = storage.Push("nested/delete/b.txt", strings.NewReader(testContent))
+		assert.NoError(t, err)
+		err = storage.Push("nested/c.txt", strings.NewReader(testContent))
+		assert.NoError(t, err)
+		err = storage.Remove("nested/delete")
+		assert.NoError(t, err)
+		assert.False(t, storage.Exists("nested/delete/a.txt"))
+		assert.False(t, storage.Exists("nested/delete/b.txt"))
+		assert.True(t, storage.Exists("nested/c.txt"))
+		err = storage.Remove("nested/c.txt")
+		assert.NoError(t, err)
+	})
 }
 
 // 专门测试 S3 存储（需要 MinIO 服务运行）
@@ -230,33 +247,4 @@ func TestStorageErrorCases(t *testing.T) {
 			}
 		})
 	}
-}
-
-// 基准测试
-func BenchmarkStorageOperations(b *testing.B) {
-	storage, err := NewStorageFromURL("memory://")
-	if err != nil {
-		b.Fatalf("创建存储失败: %v", err)
-	}
-	defer storage.Close()
-
-	testContent := "Benchmark test content"
-
-	b.Run("Push", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			path := string(rune(i)) // 简单的路径生成
-			reader := strings.NewReader(testContent)
-			err := storage.Push(path, reader)
-			if err != nil {
-				b.Fatalf("推送失败: %v", err)
-			}
-		}
-	})
-
-	b.Run("Exists", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			path := string(rune(i % 100)) // 限制路径数量
-			_ = storage.Exists(path)
-		}
-	})
 }
