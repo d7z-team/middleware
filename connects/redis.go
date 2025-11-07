@@ -21,7 +21,6 @@ import (
 // - db: 数据库编号（默认0，URL路径中指定，如 /0）
 // - rediss 协议自动启用 TLS
 func NewRedis(ur *url.URL) (*redis.Client, error) {
-	// 1. 解析地址（host:port）
 	addr := ur.Host
 	if addr == "" {
 		addr = "localhost:6379"
@@ -30,7 +29,6 @@ func NewRedis(ur *url.URL) (*redis.Client, error) {
 		addr += ":6379"
 	}
 
-	// 2. 解析密码（URL User 部分，格式为 :password 或 user:password）
 	var user, password string
 	if ur.User != nil {
 		user = ur.User.Username()
@@ -55,15 +53,12 @@ func NewRedis(ur *url.URL) (*redis.Client, error) {
 		DB:       db,
 	}
 
-	// 6. rediss 协议启用 TLS
 	if strings.EqualFold(ur.Scheme, "rediss") {
 		redisOpts.TLSConfig = &tls.Config{}
 		redisOpts.TLSConfig.InsecureSkipVerify = ur.Query().Get("insecure") == "true"
 	}
 
-	// 7. 创建 Redis 客户端和缓存实例
 	client := redis.NewClient(redisOpts)
-	// 验证连接（可选，提前检测连接问题）
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		return nil, errors.New("Redis 连接失败: " + err.Error())
 	}
