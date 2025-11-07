@@ -170,12 +170,10 @@ func (m *Memory) Remove(path string) error {
 	return nil
 }
 
-// Close 关闭存储并清理资源
 func (m *Memory) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// 清空所有文件
 	m.files = make(map[string][]byte)
 	return nil
 }

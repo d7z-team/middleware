@@ -34,6 +34,8 @@ jobs:
         run: make test
 
       - uses: codecov/codecov-action@v5
+        name: Upload coverage reports to Codecov
         with:
-          files: ./coverage.txt
           token: ${{ secrets.CODECOV_TOKEN }}
+          slug: d7z-team/middleware
+          files: ./coverage.txt
