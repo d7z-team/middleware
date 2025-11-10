@@ -66,6 +66,10 @@ type memoryKv struct {
 	Val memoryContent
 }
 
+func (m *Memory) WithKey(keys ...string) string {
+	return strings.Join(keys, m.Spliter())
+}
+
 // ListPage 分页获取前缀匹配的键值对
 func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
 	if m.closed.Load() {

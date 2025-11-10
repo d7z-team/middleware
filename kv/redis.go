@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -30,6 +31,10 @@ func NewRedis(client *redis.Client, prefix string) (KV, error) {
 
 func (r *RedisKV) Spliter() string {
 	return r.spliter
+}
+
+func (r *RedisKV) WithKey(keys ...string) string {
+	return strings.Join(keys, r.Spliter())
 }
 
 func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration) error {

@@ -16,6 +16,7 @@ const TTLKeep = -1
 
 type KV interface {
 	Spliter() string
+	WithKey(keys ...string) string
 
 	Put(ctx context.Context, key, value string, ttl time.Duration) error
 	Get(ctx context.Context, key string) (string, error)

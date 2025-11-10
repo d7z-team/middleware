@@ -19,15 +19,15 @@ type Cache[Data any] struct {
 func NewCache[Data any](kv kv.KV, prefix string, ttl time.Duration) *Cache[Data] {
 	return &Cache[Data]{
 		kv:     kv,
-		prefix: strings.ReplaceAll("cache::"+prefix+"::", "::", kv.Spliter()),
+		prefix: strings.Trim(prefix, kv.Spliter()),
 		ttl:    ttl,
 	}
 }
 
-func (c *Cache[Data]) Load(key string) (Data, bool) {
+func (c *Cache[Data]) Load(ctx context.Context, key string) (Data, bool) {
 	var zero Data
-	fullKey := c.prefix + key
-	valStr, err := c.kv.Get(context.Background(), fullKey)
+	fullKey := c.kv.WithKey(c.prefix, key)
+	valStr, err := c.kv.Get(ctx, fullKey)
 	if err != nil {
 		return zero, false
 	}
@@ -45,18 +45,18 @@ func (c *Cache[Data]) Load(key string) (Data, bool) {
 	return data, true
 }
 
-func (c *Cache[Data]) Store(key string, value Data) error {
+func (c *Cache[Data]) Store(ctx context.Context, key string, value Data) error {
 	valBytes, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
 
-	fullKey := c.prefix + key
-	return c.kv.Put(context.Background(), fullKey, string(valBytes), c.ttl)
+	fullKey := c.kv.WithKey(c.prefix, key)
+	return c.kv.Put(ctx, fullKey, string(valBytes), c.ttl)
 }
 
 // Delete 从缓存中删除指定键
-func (c *Cache[Data]) Delete(key string) {
-	fullKey := c.prefix + key
-	_, _ = c.kv.Delete(context.Background(), fullKey)
+func (c *Cache[Data]) Delete(ctx context.Context, key string) {
+	fullKey := c.kv.WithKey(c.prefix, key)
+	_, _ = c.kv.Delete(ctx, fullKey)
 }

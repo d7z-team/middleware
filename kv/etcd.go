@@ -49,6 +49,10 @@ func (e *Etcd) buildKey(key string) string {
 	return e.prefix + key
 }
 
+func (e *Etcd) WithKey(keys ...string) string {
+	return strings.Join(keys, e.Spliter())
+}
+
 // Put 存储键值对（添加关闭检查）
 func (e *Etcd) Put(ctx context.Context, key, value string, ttl time.Duration) error {
 	if err := e.checkClosed(); err != nil {
