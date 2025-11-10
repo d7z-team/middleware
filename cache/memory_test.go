@@ -103,7 +103,7 @@ func TestMemoryCache_PutAndGet(t *testing.T) {
 		t.Fatalf("Get failed: %v", err)
 	}
 
-	if content.Length != len(data) {
+	if content.Length != uint64(len(data)) {
 		t.Errorf("expected length %d, got %d", len(data), content.Length)
 	}
 
@@ -409,11 +409,11 @@ func TestCacheContent(t *testing.T) {
 
 	content := &Content{
 		ReadSeekCloser: nopCloser,
-		Length:         len(data),
+		Length:         uint64(len(data)),
 		LastModified:   now,
 	}
 
-	if content.Length != len(data) {
+	if content.Length != uint64(len(data)) {
 		t.Errorf("expected length %d, got %d", len(data), content.Length)
 	}
 

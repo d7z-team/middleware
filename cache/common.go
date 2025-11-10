@@ -24,7 +24,7 @@ type Cache interface {
 
 type Content struct {
 	io.ReadSeekCloser
-	Length       int
+	Length       uint64
 	LastModified time.Time
 }
 

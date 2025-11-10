@@ -14,7 +14,7 @@ import (
 )
 
 type redisCacheMeta struct {
-	Length       int       `json:"length"`
+	Length       uint64    `json:"length"`
 	LastModified time.Time `json:"last_modified"`
 }
 
@@ -61,7 +61,7 @@ func (rc *RedisCache) Put(ctx context.Context, key string, value io.Reader, ttl 
 	}
 
 	meta := redisCacheMeta{
-		Length:       len(data),
+		Length:       uint64(len(data)),
 		LastModified: time.Now(),
 	}
 
@@ -118,7 +118,7 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 		return nil, fmt.Errorf("get data: %w", err)
 	}
 
-	if len(data) != meta.Length {
+	if uint64(len(data)) != meta.Length {
 		return nil, fmt.Errorf("data length mismatch: expected %d, got %d", meta.Length, len(data))
 	}
 

@@ -18,7 +18,7 @@ func (NopCloser) Close() error { return nil }
 
 type internalValue struct {
 	data       []byte
-	length     int
+	length     uint64
 	lastModify time.Time
 	expiresAt  time.Time
 }
@@ -80,7 +80,7 @@ func (mc *MemoryCache) Put(_ context.Context, key string, value io.Reader, ttl t
 
 	internalVal := &internalValue{
 		data:       data,
-		length:     len(data),
+		length:     uint64(len(data)),
 		lastModify: now,
 		expiresAt:  expiresAt,
 	}

@@ -61,7 +61,7 @@ func testPutGet(t *testing.T, factory CacheFactory) {
 	}
 
 	// 验证元数据
-	if content.Length != len(value) {
+	if content.Length != uint64(len(value)) {
 		t.Errorf("Length mismatch: expected %d, got %d", len(value), content.Length)
 	}
 
