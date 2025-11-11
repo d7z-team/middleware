@@ -93,7 +93,7 @@ func TestMemoryCache_PutAndGet(t *testing.T) {
 	key := "test-key"
 	data := "test data"
 
-	err = cache.Put(ctx, key, strings.NewReader(data), TTLKeep)
+	err = cache.Put(ctx, key, map[string]string{}, strings.NewReader(data), TTLKeep)
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
@@ -101,10 +101,6 @@ func TestMemoryCache_PutAndGet(t *testing.T) {
 	content, err := cache.Get(ctx, key)
 	if err != nil {
 		t.Fatalf("Get failed: %v", err)
-	}
-
-	if content.Length != uint64(len(data)) {
-		t.Errorf("expected length %d, got %d", len(data), content.Length)
 	}
 
 	// Read and verify data
@@ -159,7 +155,7 @@ func TestMemoryCache_Put_InvalidTTL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := cache.Put(ctx, "key", strings.NewReader("data"), tt.ttl)
+			err := cache.Put(ctx, "key", map[string]string{}, strings.NewReader("data"), tt.ttl)
 			if !errors.Is(err, ErrInvalidTTL) {
 				t.Errorf("expected ErrInvalidTTL, got %v", err)
 			}
@@ -183,7 +179,7 @@ func TestMemoryCache_Put_ReadError(t *testing.T) {
 	// Create a reader that will return an error
 	errorReader := &errorReader{err: errors.New("read error")}
 
-	err = cache.Put(ctx, "key", errorReader, TTLKeep)
+	err = cache.Put(ctx, "key", map[string]string{}, errorReader, TTLKeep)
 	if err == nil {
 		t.Error("expected error but got none")
 	}
@@ -212,7 +208,7 @@ func TestMemoryCache_Delete(t *testing.T) {
 	key := "test-key"
 
 	// Put then delete
-	err = cache.Put(ctx, key, strings.NewReader("data"), TTLKeep)
+	err = cache.Put(ctx, key, map[string]string{}, strings.NewReader("data"), TTLKeep)
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
@@ -244,7 +240,7 @@ func TestMemoryCache_Expiration(t *testing.T) {
 	key := "expiring-key"
 
 	// Put with very short TTL
-	err = cache.Put(ctx, key, strings.NewReader("data"), 50*time.Millisecond)
+	err = cache.Put(ctx, key, map[string]string{}, strings.NewReader("data"), 50*time.Millisecond)
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
@@ -279,18 +275,18 @@ func TestMemoryCache_LRU_Eviction(t *testing.T) {
 	ctx := context.Background()
 
 	// Fill cache to capacity
-	err = cache.Put(ctx, "key1", strings.NewReader("data1"), TTLKeep)
+	err = cache.Put(ctx, "key1", map[string]string{}, strings.NewReader("data1"), TTLKeep)
 	if err != nil {
 		t.Fatalf("Put key1 failed: %v", err)
 	}
 
-	err = cache.Put(ctx, "key2", strings.NewReader("data2"), TTLKeep)
+	err = cache.Put(ctx, "key2", map[string]string{}, strings.NewReader("data2"), TTLKeep)
 	if err != nil {
 		t.Fatalf("Put key2 failed: %v", err)
 	}
 
 	// Add third item, should trigger eviction
-	err = cache.Put(ctx, "key3", strings.NewReader("data3"), TTLKeep)
+	err = cache.Put(ctx, "key3", map[string]string{}, strings.NewReader("data3"), TTLKeep)
 	if err != nil {
 		t.Fatalf("Put key3 failed: %v", err)
 	}
@@ -360,7 +356,7 @@ func TestMemoryCache_ConcurrentAccess(t *testing.T) {
 				key := string(rune('A' + id))
 				data := string(rune('a' + j))
 
-				_ = cache.Put(ctx, key, strings.NewReader(data), TTLKeep)
+				_ = cache.Put(ctx, key, map[string]string{}, strings.NewReader(data), TTLKeep)
 				_, _ = cache.Get(ctx, key)
 				_ = cache.Delete(ctx, key)
 			}
@@ -405,20 +401,10 @@ func TestCacheContent(t *testing.T) {
 	data := []byte("test data")
 	reader := bytes.NewReader(data)
 	nopCloser := NopCloser{reader}
-	now := time.Now()
 
 	content := &Content{
 		ReadSeekCloser: nopCloser,
-		Length:         uint64(len(data)),
-		LastModified:   now,
-	}
-
-	if content.Length != uint64(len(data)) {
-		t.Errorf("expected length %d, got %d", len(data), content.Length)
-	}
-
-	if !content.LastModified.Equal(now) {
-		t.Error("LastModified time mismatch")
+		Metadata:       map[string]string{},
 	}
 
 	// Test that the content can be read

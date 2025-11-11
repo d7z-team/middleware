@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"gopkg.d7z.net/middleware/connects"
 )
 
@@ -39,7 +40,10 @@ func testPutGet(t *testing.T, factory CacheFactory) {
 	value := []byte("test-value")
 
 	// 测试正常存入和读取
-	err := cache.Put(ctx, key, bytes.NewReader(value), TTLKeep)
+	metadata := map[string]string{
+		"key": "value",
+	}
+	err := cache.Put(ctx, key, metadata, bytes.NewReader(value), TTLKeep)
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
@@ -59,15 +63,7 @@ func testPutGet(t *testing.T, factory CacheFactory) {
 	if !bytes.Equal(data, value) {
 		t.Errorf("Content mismatch: expected %q, got %q", value, data)
 	}
-
-	// 验证元数据
-	if content.Length != uint64(len(value)) {
-		t.Errorf("Length mismatch: expected %d, got %d", len(value), content.Length)
-	}
-
-	if content.LastModified.IsZero() {
-		t.Error("LastModified should not be zero")
-	}
+	assert.Equal(t, metadata, content.Metadata)
 }
 
 // testPutInvalidTTL 测试无效 TTL 的处理
@@ -80,13 +76,13 @@ func testPutInvalidTTL(t *testing.T, factory CacheFactory) {
 	value := []byte("test-value")
 
 	// 测试负 TTL
-	err := cache.Put(ctx, key, bytes.NewReader(value), -time.Second)
+	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), -time.Second)
 	if !errors.Is(err, ErrInvalidTTL) {
 		t.Errorf("Expected ErrInvalidTTL for negative TTL, got: %v", err)
 	}
 
 	// 测试零 TTL
-	err = cache.Put(ctx, key, bytes.NewReader(value), 0)
+	err = cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), 0)
 	if !errors.Is(err, ErrInvalidTTL) {
 		t.Errorf("Expected ErrInvalidTTL for zero TTL, got: %v", err)
 	}
@@ -116,7 +112,7 @@ func testDelete(t *testing.T, factory CacheFactory) {
 	value := []byte("delete-value")
 
 	// 先存入
-	err := cache.Put(ctx, key, bytes.NewReader(value), TTLKeep)
+	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), TTLKeep)
 	if err != nil {
 		t.Fatalf("Put failed: %v", err)
 	}
@@ -157,13 +153,13 @@ func testUpdate(t *testing.T, factory CacheFactory) {
 	value2 := []byte("value2-updated")
 
 	// 第一次存入
-	err := cache.Put(ctx, key, bytes.NewReader(value1), TTLKeep)
+	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value1), TTLKeep)
 	if err != nil {
 		t.Fatalf("First Put failed: %v", err)
 	}
 
 	// 更新
-	err = cache.Put(ctx, key, bytes.NewReader(value2), TTLKeep)
+	err = cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value2), TTLKeep)
 	if err != nil {
 		t.Fatalf("Second Put failed: %v", err)
 	}
@@ -196,7 +192,7 @@ func testTTL(t *testing.T, factory CacheFactory) {
 	ttl := 1 * time.Second
 
 	// 存入带 TTL 的缓存
-	err := cache.Put(ctx, key, bytes.NewReader(value), ttl)
+	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), ttl)
 	if err != nil {
 		t.Fatalf("Put with TTL failed: %v", err)
 	}
@@ -241,7 +237,7 @@ func testConcurrency(t *testing.T, factory CacheFactory) {
 				// 随机执行操作
 				switch j % 3 {
 				case 0: // Put
-					err := cache.Put(ctx, key, bytes.NewReader(value), TTLKeep)
+					err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), TTLKeep)
 					if err != nil {
 						t.Logf("Concurrent Put error: %v", err)
 					}
@@ -269,7 +265,7 @@ func testConcurrency(t *testing.T, factory CacheFactory) {
 	// 验证缓存仍然可用
 	key := "final-check"
 	value := []byte("final-value")
-	err := cache.Put(ctx, key, bytes.NewReader(value), TTLKeep)
+	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), TTLKeep)
 	if err != nil {
 		t.Errorf("Put after concurrency test failed: %v", err)
 	}
@@ -299,7 +295,7 @@ func testClose(t *testing.T, factory CacheFactory) {
 
 	// 关闭后尝试操作（具体行为取决于实现，这里只测试不会 panic）
 	ctx := context.Background()
-	_ = cache.Put(ctx, "closed-key", bytes.NewReader([]byte("value")), TTLKeep)
+	_ = cache.Put(ctx, "closed-key", map[string]string{}, bytes.NewReader([]byte("value")), TTLKeep)
 	_, _ = cache.Get(ctx, "closed-key")
 	_ = cache.Delete(ctx, "closed-key")
 }
@@ -315,7 +311,7 @@ func testCacheErrorReader(t *testing.T, factory CacheFactory) {
 	// 创建会返回错误的 Reader
 	errorReader := &errorReader{err: errors.New("mock read error")}
 
-	err := cache.Put(ctx, key, errorReader, TTLKeep)
+	err := cache.Put(ctx, key, map[string]string{}, errorReader, TTLKeep)
 	if err == nil {
 		t.Error("Expected error from faulty reader, but got none")
 	}

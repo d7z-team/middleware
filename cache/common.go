@@ -16,7 +16,7 @@ import (
 const TTLKeep = -1
 
 type Cache interface {
-	Put(ctx context.Context, key string, value io.Reader, ttl time.Duration) error
+	Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error
 	Get(ctx context.Context, key string) (*Content, error)
 	Delete(ctx context.Context, key string) error
 	io.Closer
@@ -24,8 +24,7 @@ type Cache interface {
 
 type Content struct {
 	io.ReadSeekCloser
-	Length       uint64
-	LastModified time.Time
+	Metadata map[string]string
 }
 
 func (c *Content) ReadToString() (string, error) {

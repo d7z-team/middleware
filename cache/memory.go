@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"sync"
 	"time"
@@ -17,10 +18,10 @@ type NopCloser struct {
 func (NopCloser) Close() error { return nil }
 
 type internalValue struct {
-	data       []byte
-	length     uint64
-	lastModify time.Time
-	expiresAt  time.Time
+	data      []byte
+	length    uint64
+	metadata  []byte
+	expiresAt time.Time
 }
 
 type MemoryCache struct {
@@ -62,7 +63,7 @@ func NewMemoryCache(config MemoryCacheConfig) (*MemoryCache, error) {
 	return mc, nil
 }
 
-func (mc *MemoryCache) Put(_ context.Context, key string, value io.Reader, ttl time.Duration) error {
+func (mc *MemoryCache) Put(_ context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error {
 	data, err := io.ReadAll(value)
 	if err != nil {
 		return wrapError("read value failed", err)
@@ -77,12 +78,15 @@ func (mc *MemoryCache) Put(_ context.Context, key string, value io.Reader, ttl t
 	if ttl != TTLKeep {
 		expiresAt = now.Add(ttl)
 	}
-
+	metaRaw, err := json.Marshal(metadata)
+	if err != nil {
+		return wrapError("marshal metadata failed", err)
+	}
 	internalVal := &internalValue{
-		data:       data,
-		length:     uint64(len(data)),
-		lastModify: now,
-		expiresAt:  expiresAt,
+		data:      data,
+		length:    uint64(len(data)),
+		metadata:  metaRaw,
+		expiresAt: expiresAt,
 	}
 
 	mc.lruCache.Add(key, internalVal)
@@ -103,10 +107,14 @@ func (mc *MemoryCache) Get(_ context.Context, key string) (*Content, error) {
 	}
 
 	reader := bytes.NewReader(internalVal.data)
+	meta := make(map[string]string)
+	err := json.Unmarshal(internalVal.metadata, &meta)
+	if err != nil {
+		return nil, wrapError("unmarshal metadata failed", err)
+	}
 	return &Content{
 		ReadSeekCloser: NopCloser{reader},
-		Length:         internalVal.length,
-		LastModified:   internalVal.lastModify,
+		Metadata:       meta,
 	}, nil
 }
 

@@ -13,11 +13,6 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-type redisCacheMeta struct {
-	Length       uint64    `json:"length"`
-	LastModified time.Time `json:"last_modified"`
-}
-
 type RedisCache struct {
 	client *redis.Client
 	prefix string
@@ -46,7 +41,7 @@ func (rc *RedisCache) metaKey(key string) string {
 	return fmt.Sprintf("%s%s:meta", rc.prefix, key)
 }
 
-func (rc *RedisCache) Put(ctx context.Context, key string, value io.Reader, ttl time.Duration) error {
+func (rc *RedisCache) Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error {
 	if rc.isClosed() {
 		return errors.New("cache is closed")
 	}
@@ -60,12 +55,7 @@ func (rc *RedisCache) Put(ctx context.Context, key string, value io.Reader, ttl 
 		return ErrInvalidTTL
 	}
 
-	meta := redisCacheMeta{
-		Length:       uint64(len(data)),
-		LastModified: time.Now(),
-	}
-
-	metaJSON, err := json.Marshal(meta)
+	metaJSON, err := json.Marshal(metadata)
 	if err != nil {
 		return fmt.Errorf("marshal meta: %w", err)
 	}
@@ -104,7 +94,7 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 		return nil, fmt.Errorf("get meta: %w", err)
 	}
 
-	var meta redisCacheMeta
+	var meta map[string]string
 	if err := json.Unmarshal(metaJSON, &meta); err != nil {
 		return nil, fmt.Errorf("unmarshal meta: %w", err)
 	}
@@ -118,15 +108,10 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 		return nil, fmt.Errorf("get data: %w", err)
 	}
 
-	if uint64(len(data)) != meta.Length {
-		return nil, fmt.Errorf("data length mismatch: expected %d, got %d", meta.Length, len(data))
-	}
-
 	reader := bytes.NewReader(data)
 	return &Content{
 		ReadSeekCloser: NopCloser{reader},
-		Length:         meta.Length,
-		LastModified:   meta.LastModified,
+		Metadata:       meta,
 	}, nil
 }
 
