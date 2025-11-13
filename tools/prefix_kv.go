@@ -38,12 +38,12 @@ func (p *PrefixKV) Put(ctx context.Context, key, value string, ttl time.Duration
 
 func (p *PrefixKV) Get(ctx context.Context, key string) (string, error) {
 	key = p.prefix + strings.TrimPrefix(key, p.kv.Splitter())
-	return p.kv.Get(ctx, p.prefix+strings.TrimPrefix(key, p.kv.Splitter()))
+	return p.kv.Get(ctx, key)
 }
 
 func (p *PrefixKV) Delete(ctx context.Context, key string) (bool, error) {
 	key = p.prefix + strings.TrimPrefix(key, p.kv.Splitter())
-	return p.kv.Delete(ctx, p.prefix+strings.TrimPrefix(key, p.kv.Splitter()))
+	return p.kv.Delete(ctx, key)
 }
 
 func (p *PrefixKV) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
