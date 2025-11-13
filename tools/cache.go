@@ -17,9 +17,10 @@ type Cache[Data any] struct {
 }
 
 func NewCache[Data any](kv kv.KV, prefix string, ttl time.Duration) *Cache[Data] {
+	prefix = strings.ReplaceAll(prefix, kv.Splitter(), "")
 	return &Cache[Data]{
 		kv:     kv,
-		prefix: strings.Trim(prefix, kv.Spliter()),
+		prefix: kv.WithKey("typed", "cache", prefix),
 		ttl:    ttl,
 	}
 }

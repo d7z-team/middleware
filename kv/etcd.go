@@ -20,12 +20,9 @@ type Etcd struct {
 
 // NewEtcd 创建一个新的 etcd 配置存储实例
 func NewEtcd(client *clientv3.Client, prefix string) *Etcd {
-	if prefix == "" {
-		prefix = "/kv/"
-	} else if prefix[len(prefix)-1] != '/' {
+	if !strings.HasSuffix(prefix, "/") {
 		prefix += "/"
 	}
-
 	etcd := &Etcd{
 		client: client,
 		prefix: prefix,
@@ -50,7 +47,7 @@ func (e *Etcd) buildKey(key string) string {
 }
 
 func (e *Etcd) WithKey(keys ...string) string {
-	return strings.Join(keys, e.Spliter())
+	return strings.Join(keys, e.Splitter())
 }
 
 // Put 存储键值对（添加关闭检查）
@@ -185,7 +182,7 @@ func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue strin
 	return false, nil
 }
 
-func (e *Etcd) Spliter() string {
+func (e *Etcd) Splitter() string {
 	return "/"
 }
 

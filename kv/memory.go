@@ -67,7 +67,7 @@ type memoryKv struct {
 }
 
 func (m *Memory) WithKey(keys ...string) string {
-	return strings.Join(keys, m.Spliter())
+	return strings.Join(keys, m.Splitter())
 }
 
 // ListPage 分页获取前缀匹配的键值对
@@ -332,6 +332,6 @@ func (m *Memory) Close() error {
 	return nil
 }
 
-func (m *Memory) Spliter() string {
+func (m *Memory) Splitter() string {
 	return "::"
 }

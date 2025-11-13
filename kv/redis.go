@@ -29,12 +29,12 @@ func NewRedis(client *redis.Client, prefix string) (KV, error) {
 	}, nil
 }
 
-func (r *RedisKV) Spliter() string {
+func (r *RedisKV) Splitter() string {
 	return r.spliter
 }
 
 func (r *RedisKV) WithKey(keys ...string) string {
-	return strings.Join(keys, r.Spliter())
+	return strings.Join(keys, r.Splitter())
 }
 
 func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration) error {

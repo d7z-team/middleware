@@ -15,7 +15,7 @@ import (
 const TTLKeep = -1
 
 type KV interface {
-	Spliter() string
+	Splitter() string
 	WithKey(keys ...string) string
 
 	Put(ctx context.Context, key, value string, ttl time.Duration) error

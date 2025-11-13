@@ -14,9 +14,10 @@ type TypedConfig[Data comparable] struct {
 }
 
 func NewTypedConfig[Data comparable](kv kv.KV, prefix string) *TypedConfig[Data] {
+	prefix = strings.ReplaceAll(prefix, kv.Splitter(), "")
 	return &TypedConfig[Data]{
 		kv:     kv,
-		prefix: strings.ReplaceAll("typed::config::"+prefix+"::", "::", kv.Spliter()),
+		prefix: kv.WithKey("typed", "config", prefix),
 	}
 }
 

@@ -20,7 +20,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 	ctx := context.Background()
 	// 唯一前缀：避免测试污染（每次运行生成不同前缀）
 	uniquePrefix := "kv_test_" + time.Now().Format("20060102150405.999") + "/"
-	spliter := kvClient.Spliter()
+	spliter := kvClient.Splitter()
 	withKey := kvClient.WithKey("a", "b", "c")
 
 	// 测试后清理数据 + 关闭客户端
@@ -39,12 +39,12 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 	}()
 
 	// ########################### 测试用例 ###########################
-	// 1. 测试 Spliter（分隔符非空）
+	// 1. 测试 Splitter（分隔符非空）
 	t.Run("SpliterAndWithKey", func(t *testing.T) {
-		assert.NotEmpty(t, spliter, "Spliter 不应为空")
+		assert.NotEmpty(t, spliter, "Splitter 不应为空")
 		assert.NotEmpty(t, withKey, "withKey 不应为空")
 		// 若所有实现强制使用统一分隔符（如 "/"），可添加：
-		// assert.Equal(t, "/", spliter, "Spliter 必须为 '/'")
+		// assert.Equal(t, "/", spliter, "Splitter 必须为 '/'")
 	})
 
 	// 2. 测试 Put + Get（正常存入/获取、不存在键获取）
