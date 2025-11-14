@@ -5,107 +5,102 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// Etcd 是 etcd 配置存储的实现，适配KV接口
 type Etcd struct {
 	client *clientv3.Client
-	prefix string // 已确保以"/"结尾
-	closed atomic.Bool
+	prefix string
 }
 
-// NewEtcd 创建一个新的 etcd 配置存储实例
 func NewEtcd(client *clientv3.Client, prefix string) *Etcd {
-	if !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-	etcd := &Etcd{
+	return &Etcd{
 		client: client,
-		prefix: prefix,
+		prefix: strings.TrimPrefix(prefix, "/") + "/",
 	}
-	etcd.closed.Store(false)
-	return etcd
 }
 
-// 检查客户端是否已关闭
-func (e *Etcd) checkClosed() error {
-	if e.closed.Load() {
-		return ErrClosed
+func (e *Etcd) Child(path string) KV {
+	return NewEtcd(e.client, e.prefix+strings.TrimPrefix(path, "/"))
+}
+
+func (e *Etcd) validateKey(key string) error {
+	if strings.Contains(key, "/") {
+		return fmt.Errorf("key cannot contain '/': %s", key)
 	}
 	return nil
 }
 
-// 辅助函数：拼接键（避免双斜杠）
-func (e *Etcd) buildKey(key string) string {
-	// 移除key开头可能的"/"，避免拼接后多斜杠
+func (e *Etcd) buildKey(key string) (string, error) {
+	if err := e.validateKey(key); err != nil {
+		return "", err
+	}
 	key = strings.TrimPrefix(key, "/")
-	return e.prefix + key
+	return e.prefix + key, nil
 }
 
-func (e *Etcd) WithKey(keys ...string) string {
-	return strings.Join(keys, e.Splitter())
+func (e *Etcd) extractKey(fullKey string) string {
+	return strings.TrimPrefix(fullKey, e.prefix)
 }
 
-// Put 存储键值对（添加关闭检查）
 func (e *Etcd) Put(ctx context.Context, key, value string, ttl time.Duration) error {
-	if err := e.checkClosed(); err != nil {
+	fullKey, err := e.buildKey(key)
+	if err != nil {
 		return err
 	}
 
-	fullKey := e.buildKey(key)
 	var opts []clientv3.OpOption
 
 	if ttl != TTLKeep {
-		// 精确处理TTL，支持毫秒级，但etcd最小TTL为1秒
 		ttlSeconds := int64(ttl / time.Second)
 		if ttlSeconds < 1 {
-			ttlSeconds = 1 // etcd 最小TTL为1秒
+			ttlSeconds = 1
 		}
 		resp, err := e.client.Grant(ctx, ttlSeconds)
 		if err != nil {
 			return fmt.Errorf("create lease failed: %w", err)
 		}
+		defer func() {
+			if err != nil {
+				_, _ = e.client.Revoke(context.Background(), resp.ID)
+			}
+		}()
 		opts = append(opts, clientv3.WithLease(resp.ID))
 	}
 
-	_, err := e.client.Put(ctx, fullKey, value, opts...)
+	_, err = e.client.Put(ctx, fullKey, value, opts...)
 	if err != nil {
 		return fmt.Errorf("put key %s failed: %w", fullKey, err)
 	}
 	return nil
 }
 
-// Get 获取指定键的值（添加关闭检查）
 func (e *Etcd) Get(ctx context.Context, key string) (string, error) {
-	if err := e.checkClosed(); err != nil {
+	fullKey, err := e.buildKey(key)
+	if err != nil {
 		return "", err
 	}
 
-	fullKey := e.buildKey(key)
 	resp, err := e.client.Get(ctx, fullKey, clientv3.WithLimit(1))
 	if err != nil {
 		return "", fmt.Errorf("get key %s failed: %w", fullKey, err)
 	}
 
 	if resp.Count == 0 {
-		// 使用 errors.Join 保持错误链，让测试用例能通过 ErrorIs 判断
 		return "", errors.Join(ErrKeyNotFound, fmt.Errorf("key %s not found", key))
 	}
 
 	return string(resp.Kvs[0].Value), nil
 }
 
-// Delete 删除指定的键（添加关闭检查）
 func (e *Etcd) Delete(ctx context.Context, key string) (bool, error) {
-	if err := e.checkClosed(); err != nil {
+	fullKey, err := e.buildKey(key)
+	if err != nil {
 		return false, err
 	}
 
-	fullKey := e.buildKey(key)
 	r, err := e.client.Delete(ctx, fullKey)
 	if err != nil {
 		return false, fmt.Errorf("delete key %s failed: %w", fullKey, err)
@@ -113,13 +108,12 @@ func (e *Etcd) Delete(ctx context.Context, key string) (bool, error) {
 	return r.Deleted > 0, nil
 }
 
-// PutIfNotExists 仅在键不存在时设置值（添加关闭检查）
 func (e *Etcd) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
-	if err := e.checkClosed(); err != nil {
+	fullKey, err := e.buildKey(key)
+	if err != nil {
 		return false, err
 	}
 
-	fullKey := e.buildKey(key)
 	cmp := clientv3.Compare(clientv3.Version(fullKey), "=", 0)
 
 	var putOp clientv3.Op
@@ -145,15 +139,12 @@ func (e *Etcd) PutIfNotExists(ctx context.Context, key, value string, ttl time.D
 	return txnResp.Succeeded, nil
 }
 
-// CompareAndSwap 原子CAS操作（添加关闭检查）
 func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
-	if err := e.checkClosed(); err != nil {
+	fullKey, err := e.buildKey(key)
+	if err != nil {
 		return false, err
 	}
 
-	fullKey := e.buildKey(key)
-
-	// 使用单次事务避免竞争条件
 	cmp := clientv3.Compare(clientv3.Value(fullKey), "=", oldValue)
 	putOp := clientv3.OpPut(fullKey, newValue)
 	getOp := clientv3.OpGet(fullKey)
@@ -171,7 +162,6 @@ func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue strin
 		return true, nil
 	}
 
-	// 如果事务失败，检查键是否存在
 	if len(txnResp.Responses) > 0 {
 		getResp := txnResp.Responses[0].GetResponseRange()
 		if getResp != nil && getResp.Count == 0 {
@@ -182,22 +172,53 @@ func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue strin
 	return false, nil
 }
 
-func (e *Etcd) Splitter() string {
-	return "/"
-}
-
-// Close 关闭Etcd客户端（添加原子性关闭检查）
-func (e *Etcd) Close() error {
-	// 使用 CAS 操作确保只关闭一次
-	if e.closed.CompareAndSwap(false, true) {
-		if e.client != nil {
-			return e.client.Close()
-		}
+func (e *Etcd) CursorList(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+	opts := &ListOptions{}
+	if options != nil {
+		opts = options
 	}
-	return nil
-}
+	if opts.Limit == 0 {
+		opts.Limit = 1000
+	}
 
-// IsClosed 检查客户端是否已关闭（用于测试或外部检查）
-func (e *Etcd) IsClosed() bool {
-	return e.closed.Load()
+	etcdOpts := []clientv3.OpOption{
+		clientv3.WithKeysOnly(),
+		clientv3.WithLimit(opts.Limit + 1),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+	}
+
+	key := e.prefix
+	if opts.Cursor != "" {
+		etcdOpts = append(etcdOpts, clientv3.WithFromKey())
+		key += opts.Cursor
+	} else {
+		etcdOpts = append(etcdOpts, clientv3.WithPrefix())
+	}
+
+	resp, err := e.client.Get(ctx, key, etcdOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("list keys failed: %w", err)
+	}
+
+	result := &ListResponse{
+		Keys: make([]string, 0, len(resp.Kvs)),
+	}
+
+	count := int64(0)
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		if !strings.HasPrefix(key, e.prefix) {
+			break
+		}
+
+		if count >= opts.Limit {
+			result.HasMore = true
+			result.Cursor = e.extractKey(key)
+			break
+		}
+		result.Keys = append(result.Keys, e.extractKey(key))
+		count++
+	}
+
+	return result, nil
 }

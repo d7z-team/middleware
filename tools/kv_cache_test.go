@@ -13,7 +13,7 @@ type testStruct struct {
 	V string `json:"v"`
 }
 
-func TestCache_StoreAndLoad(t *testing.T) {
+func TestKVCache_StoreAndLoad(t *testing.T) {
 	memory, err := kv.NewMemory("")
 	assert.NoError(t, err)
 
@@ -32,7 +32,7 @@ func TestCache_StoreAndLoad(t *testing.T) {
 	assert.Equal(t, value, load)
 }
 
-func TestCache_LoadNonExistentKey(t *testing.T) {
+func TestKVCache_LoadNonExistentKey(t *testing.T) {
 	memory, err := kv.NewMemory("")
 	assert.NoError(t, err)
 
@@ -43,7 +43,7 @@ func TestCache_LoadNonExistentKey(t *testing.T) {
 	assert.False(t, found)
 }
 
-func TestCache_Expiration(t *testing.T) {
+func TestKVCache_Expiration(t *testing.T) {
 	memory, err := kv.NewMemory("")
 	assert.NoError(t, err)
 
@@ -69,7 +69,7 @@ func TestCache_Expiration(t *testing.T) {
 	assert.False(t, found)
 }
 
-func TestCache_Delete(t *testing.T) {
+func TestKVCache_Delete(t *testing.T) {
 	memory, err := kv.NewMemory("")
 	assert.NoError(t, err)
 

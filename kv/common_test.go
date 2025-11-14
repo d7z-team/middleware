@@ -14,38 +14,50 @@ import (
 	"gopkg.d7z.net/middleware/connects"
 )
 
+func assertNoDuplicates(t *testing.T, items []string) {
+	t.Helper()
+	seen := make(map[string]bool)
+	for _, item := range items {
+		if seen[item] {
+			t.Errorf("发现重复项: %s", item)
+		}
+		seen[item] = true
+	}
+}
+
 // 通用测试套件：所有 KV 实现必须通过此测试
 func testKVConsistency(t *testing.T, kvClient KV) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	// 唯一前缀：避免测试污染（每次运行生成不同前缀）
-	uniquePrefix := "kv_test_" + time.Now().Format("20060102150405.999") + "/"
-	spliter := kvClient.Splitter()
-	withKey := kvClient.WithKey("a", "b", "c")
-
-	// 测试后清理数据 + 关闭客户端
-	defer func() {
-		// 关闭客户端
-		err := kvClient.Close()
-		assert.NoError(t, err)
-
-		// 关闭后操作应返回错误
-		key := uniquePrefix + "close_key"
-		err = kvClient.Put(ctx, key, "close_val", TTLKeep)
-		assert.ErrorIs(t, err, ErrClosed, "关闭后 Put 应返回 ErrClosed")
-
-		_, err = kvClient.Get(ctx, key)
-		assert.ErrorIs(t, err, ErrClosed, "关闭后 Get 应返回 ErrClosed")
-	}()
+	uniquePrefix := "kv_test_" + time.Now().Format("20060102150405.999") + "_"
 
 	// ########################### 测试用例 ###########################
-	// 1. 测试 Splitter（分隔符非空）
-	t.Run("SpliterAndWithKey", func(t *testing.T) {
-		assert.NotEmpty(t, spliter, "Splitter 不应为空")
-		assert.NotEmpty(t, withKey, "withKey 不应为空")
-		// 若所有实现强制使用统一分隔符（如 "/"），可添加：
-		// assert.Equal(t, "/", spliter, "Splitter 必须为 '/'")
-	})
+	if kvClient, ok := kvClient.(PagedKV); ok {
+		// 6. 测试 List（按前缀列出所有键值对）
+		t.Run("List", func(t *testing.T) {
+			prefix := uniquePrefix + "list_"
+
+			// 存入 3 个带前缀的键 + 1 个不带前缀的键
+			testKeys := map[string]string{
+				prefix + "a":               "a_val",
+				prefix + "b":               "b_val",
+				prefix + "sub" + "|" + "c": "c_val",  // 子层级键
+				uniquePrefix + "no_list":   "no_val", // 无前缀键
+			}
+			for k, v := range testKeys {
+				_ = kvClient.Put(ctx, k, v, TTLKeep)
+			}
+
+			// 列出前缀下的键
+			result, err := kvClient.List(ctx, prefix)
+			assert.NoError(t, err)
+			assert.Len(t, result, 3, "应返回 3 个带前缀的键")
+			assert.Equal(t, "a_val", result[prefix+"a"])
+			assert.Equal(t, "c_val", result[prefix+"sub"+"|"+"c"])
+			assert.NotContains(t, result, uniquePrefix+"no_list", "不应包含无前缀键")
+		})
+	}
 
 	// 2. 测试 Put + Get（正常存入/获取、不存在键获取）
 	t.Run("PutAndGet", func(t *testing.T) {
@@ -137,34 +149,10 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.False(t, ok)
 	})
 
-	if kvClient, ok := kvClient.(PagedKV); ok {
-		// 6. 测试 List（按前缀列出所有键值对）
-		t.Run("List", func(t *testing.T) {
-			prefix := uniquePrefix + "list/"
-			// 存入 3 个带前缀的键 + 1 个不带前缀的键
-			testKeys := map[string]string{
-				prefix + "a":                   "a_val",
-				prefix + "b":                   "b_val",
-				prefix + "sub" + spliter + "c": "c_val",  // 子层级键
-				uniquePrefix + "no_list":       "no_val", // 无前缀键
-			}
-			for k, v := range testKeys {
-				_ = kvClient.Put(ctx, k, v, TTLKeep)
-			}
-
-			// 列出前缀下的键
-			result, err := kvClient.List(ctx, prefix)
-			assert.NoError(t, err)
-			assert.Len(t, result, 3, "应返回 3 个带前缀的键")
-			assert.Equal(t, "a_val", result[prefix+"a"])
-			assert.Equal(t, "c_val", result[prefix+"sub"+spliter+"c"])
-			assert.NotContains(t, result, uniquePrefix+"no_list", "不应包含无前缀键")
-		})
-	}
 	// 7. 测试 ListPage（分页查询）
 	if kvClient, ok := kvClient.(PagedKV); ok {
 		t.Run("ListPage", func(t *testing.T) {
-			prefix := uniquePrefix + "page/"
+			prefix := uniquePrefix + "page_"
 			pageSize := uint(2)
 			// 存入 4 个有序键（假设实现按字典序排序）
 			keys := []struct {
@@ -258,6 +246,13 @@ func TestMemoryKV(t *testing.T) {
 		require.NoError(t, err, "创建本地存储 KV 失败")
 		testKVConsistency(t, storageKV)
 	})
+	// 测试 storage scheme（持久化到本地文件）
+	t.Run("storage-scheme-child", func(t *testing.T) {
+		tempDir := t.TempDir() // 临时目录，测试后自动清理
+		storageKV, err := NewMemory(filepath.Join(tempDir, "1.json"))
+		require.NoError(t, err, "创建本地存储 KV 失败")
+		testKVConsistency(t, storageKV.Child("child/v1/data"))
+	})
 }
 
 // TestRedisKV 测试 Redis 实现（需本地 Redis 服务）
@@ -278,8 +273,7 @@ func TestRedisKV(t *testing.T) {
 	defer redisClient.Close()
 
 	// 2. 创建 Redis KV 实例（需实现 NewRedis 函数）
-	redisKV, err := NewRedis(redisClient, "kv_test/")
-	require.NoError(t, err, "创建 Redis KV 失败")
+	redisKV := NewRedis(redisClient, "kv_test_")
 
 	// 3. 运行一致性测试
 	testKVConsistency(t, redisKV)
@@ -299,4 +293,15 @@ func TestEtcdKV(t *testing.T) {
 	require.NoError(t, err, "创建 ETCD KV 失败")
 
 	testKVConsistency(t, etcdKv)
+	t.Run("TestEtcdKVChild", func(t *testing.T) {
+		parse, _ := url.Parse("etcd://127.0.0.1:2379")
+
+		etcd, err := connects.NewEtcd(parse)
+		if err != nil {
+			t.Skip("如需测试 etcd 实现，请确保本地 etcd 运行")
+		}
+		etcdKv := NewEtcd(etcd, "kv_test/")
+		child := etcdKv.Child("test/child/data")
+		testKVConsistency(t, child)
+	})
 }

@@ -11,39 +11,29 @@ import (
 )
 
 type RedisKV struct {
-	client  *redis.Client
-	prefix  string
-	spliter string
-	closed  chan struct{}
+	client *redis.Client
+	prefix string
 }
 
-func NewRedis(client *redis.Client, prefix string) (KV, error) {
-	if client == nil {
-		return nil, errors.New("redis client is nil")
+func NewRedis(client *redis.Client, prefix string) *RedisKV {
+	return &RedisKV{
+		client: client,
+		prefix: prefix,
+	}
+}
+
+func (r *RedisKV) Child(path string) KV {
+	path = strings.Trim(path, "/") + "/"
+	if path == "" {
+		return r
 	}
 	return &RedisKV{
-		client:  client,
-		prefix:  prefix,
-		spliter: "/",
-		closed:  make(chan struct{}),
-	}, nil
-}
-
-func (r *RedisKV) Splitter() string {
-	return r.spliter
-}
-
-func (r *RedisKV) WithKey(keys ...string) string {
-	return strings.Join(keys, r.Splitter())
+		client: r.client,
+		prefix: r.prefix + path,
+	}
 }
 
 func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration) error {
-	select {
-	case <-r.closed:
-		return ErrClosed
-	default:
-	}
-
 	fullKey := r.prefix + key
 	if ttl == TTLKeep {
 		return r.client.Set(ctx, fullKey, value, 0).Err()
@@ -52,12 +42,6 @@ func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration)
 }
 
 func (r *RedisKV) Get(ctx context.Context, key string) (string, error) {
-	select {
-	case <-r.closed:
-		return "", ErrClosed
-	default:
-	}
-
 	fullKey := r.prefix + key
 	val, err := r.client.Get(ctx, fullKey).Result()
 	if err != nil {
@@ -70,12 +54,6 @@ func (r *RedisKV) Get(ctx context.Context, key string) (string, error) {
 }
 
 func (r *RedisKV) Delete(ctx context.Context, key string) (bool, error) {
-	select {
-	case <-r.closed:
-		return false, ErrClosed
-	default:
-	}
-
 	fullKey := r.prefix + key
 	delCount, err := r.client.Del(ctx, fullKey).Result()
 	if err != nil {
@@ -85,12 +63,6 @@ func (r *RedisKV) Delete(ctx context.Context, key string) (bool, error) {
 }
 
 func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
-	select {
-	case <-r.closed:
-		return false, ErrClosed
-	default:
-	}
-
 	fullKey := r.prefix + key
 	var cmd *redis.BoolCmd
 
@@ -112,12 +84,6 @@ func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl tim
 }
 
 func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
-	select {
-	case <-r.closed:
-		return false, ErrClosed
-	default:
-	}
-
 	fullKey := r.prefix + key
 
 	if err := r.client.Watch(ctx, func(tx *redis.Tx) error {
@@ -147,12 +113,6 @@ func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue st
 }
 
 func (r *RedisKV) List(ctx context.Context, prefix string) (map[string]string, error) {
-	select {
-	case <-r.closed:
-		return nil, ErrClosed
-	default:
-	}
-
 	fullPrefix := r.prefix + prefix
 	keys := make([]string, 0)
 	cursor := uint64(0)
@@ -212,16 +172,5 @@ func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64,
 	for _, k := range pageKeys {
 		pageResult[k] = fullList[k]
 	}
-
 	return pageResult, nil
-}
-
-func (r *RedisKV) Close() error {
-	select {
-	case <-r.closed:
-		return nil
-	default:
-		close(r.closed)
-		return r.client.Close()
-	}
 }

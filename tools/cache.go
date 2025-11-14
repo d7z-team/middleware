@@ -2,62 +2,61 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
-	"reflect"
+	"io"
 	"strings"
 	"time"
 
-	"gopkg.d7z.net/middleware/kv"
+	"gopkg.d7z.net/middleware/cache"
 )
 
-type Cache[Data any] struct {
+type TTLCache struct {
+	cache cache.Cache
+	ttl   time.Duration
+}
+
+func NewTTLCache(cache cache.Cache, ttl time.Duration) *TTLCache {
+	return &TTLCache{
+		cache: cache,
+		ttl:   ttl,
+	}
+}
+
+func (c *TTLCache) Put(ctx context.Context, key string, metadata map[string]string, value io.Reader) error {
+	return c.cache.Put(ctx, key, metadata, value, c.ttl)
+}
+
+func (c *TTLCache) Get(ctx context.Context, key string) (*cache.Content, error) {
+	return c.cache.Get(ctx, key)
+}
+
+func (c *TTLCache) Delete(ctx context.Context, key string) error {
+	return c.cache.Delete(ctx, key)
+}
+
+type PrefixCache struct {
 	prefix string
-	kv     kv.KV
-	ttl    time.Duration
+	cache  cache.Cache
 }
 
-func NewCache[Data any](kv kv.KV, prefix string, ttl time.Duration) *Cache[Data] {
-	prefix = strings.ReplaceAll(prefix, kv.Splitter(), "")
-	return &Cache[Data]{
-		kv:     kv,
-		prefix: kv.WithKey("typed", "cache", prefix),
-		ttl:    ttl,
+func NewPrefixCache(prefix string, cache cache.Cache) *PrefixCache {
+	return &PrefixCache{
+		prefix: strings.TrimRight(prefix, "/") + "/",
+		cache:  cache,
 	}
 }
 
-func (c *Cache[Data]) Load(ctx context.Context, key string) (Data, bool) {
-	var zero Data
-	fullKey := c.kv.WithKey(c.prefix, key)
-	valStr, err := c.kv.Get(ctx, fullKey)
-	if err != nil {
-		return zero, false
-	}
-	var data Data
-	if reflect.TypeOf(data).Kind() == reflect.Ptr {
-		if err := json.Unmarshal([]byte(valStr), data); err != nil {
-			return zero, false
-		}
-	} else {
-		if err := json.Unmarshal([]byte(valStr), &data); err != nil {
-			return zero, false
-		}
-	}
-
-	return data, true
+func (p *PrefixCache) Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error {
+	return p.cache.Put(ctx, p.prefix+key, metadata, value, ttl)
 }
 
-func (c *Cache[Data]) Store(ctx context.Context, key string, value Data) error {
-	valBytes, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-
-	fullKey := c.kv.WithKey(c.prefix, key)
-	return c.kv.Put(ctx, fullKey, string(valBytes), c.ttl)
+func (p *PrefixCache) Get(ctx context.Context, key string) (*cache.Content, error) {
+	return p.cache.Get(ctx, p.prefix+key)
 }
 
-// Delete 从缓存中删除指定键
-func (c *Cache[Data]) Delete(ctx context.Context, key string) {
-	fullKey := c.kv.WithKey(c.prefix, key)
-	_, _ = c.kv.Delete(ctx, fullKey)
+func (p *PrefixCache) Delete(ctx context.Context, key string) error {
+	return p.cache.Delete(ctx, p.prefix+key)
+}
+
+func (p *PrefixCache) Close() error {
+	return p.cache.Close()
 }

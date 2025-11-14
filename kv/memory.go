@@ -8,28 +8,24 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-
-	"go.uber.org/zap"
 )
 
 // Memory 一个简单的内存配置存储，仅用于测试，实现了KV接口
 type Memory struct {
-	data   sync.Map
+	data   *sync.Map
 	store  string
-	closed *atomic.Bool
+	prefix string // 添加 prefix 字段，默认为空字符串
 }
 
 // NewMemory 创建一个新的内存存储实例
 func NewMemory(store string) (*Memory, error) {
 	ret := &Memory{
 		store:  store,
-		data:   sync.Map{},
-		closed: new(atomic.Bool),
+		data:   &sync.Map{},
+		prefix: "", // 默认空字符串
 	}
 	if store != "" {
-		zap.L().Info("parse config from store", zap.String("store", store))
 		if err := os.MkdirAll(filepath.Dir(store), 0o755); err != nil && !os.IsExist(err) {
 			return nil, err
 		}
@@ -66,15 +62,148 @@ type memoryKv struct {
 	Val memoryContent
 }
 
-func (m *Memory) WithKey(keys ...string) string {
-	return strings.Join(keys, m.Splitter())
+func (m *Memory) Child(path string) KV {
+	path = strings.Trim(path, "/") + "/"
+	if path == "" {
+		return m
+	}
+	return &Memory{
+		data:   m.data,
+		store:  "",
+		prefix: path,
+	}
+}
+
+// Sync 将内存中的数据同步到文件
+func (m *Memory) Sync() error {
+	if m.store == "" {
+		return nil
+	}
+
+	// 收集未过期的数据
+	item := make(map[string]memoryContent)
+	now := time.Now()
+	m.data.Range(func(key, value interface{}) bool {
+		content, ok := value.(memoryContent)
+		if ok && (content.TTL == nil || now.Before(*content.TTL)) {
+			// 只存储带有正确 prefix 的键
+			k, ok := key.(string)
+			if ok && strings.HasPrefix(k, m.prefix) {
+				item[k] = content
+			}
+		}
+		return true
+	})
+
+	saved, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+
+	// 先写入临时文件，成功后原子性重命名，避免文件损坏
+	tempFile := m.store + ".tmp"
+	if err := os.WriteFile(tempFile, saved, 0o600); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tempFile, m.store); err != nil {
+		_ = os.Remove(tempFile) // 清理临时文件
+		return err
+	}
+	return nil
+}
+
+// CursorList 实现游标分页查询
+func (m *Memory) CursorList(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
+	// 获取所有键并按字典序排序
+	allKeys := make([]string, 0)
+	now := time.Now()
+
+	m.data.Range(func(key, value interface{}) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		k, ok := key.(string)
+		if !ok {
+			return true // 跳过非字符串键
+		}
+
+		// 添加 prefix 过滤
+		if !strings.HasPrefix(k, m.prefix) {
+			return true
+		}
+
+		content, ok := value.(memoryContent)
+		if !ok {
+			return true // 跳过类型错误的value
+		}
+
+		// 检查是否过期
+		if content.TTL != nil && now.After(*content.TTL) {
+			return true
+		}
+		allKeys = append(allKeys, k)
+		return true
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// 按键排序
+	sort.Strings(allKeys)
+
+	// 处理游标
+	startIndex := 0
+	if opts.Cursor != "" {
+		if m.prefix != "" {
+			opts.Cursor = m.prefix + opts.Cursor
+		}
+		for i, key := range allKeys {
+			if key > opts.Cursor {
+				startIndex = i
+				break
+			}
+		}
+	}
+
+	// 计算分页
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = int64(len(allKeys)) // 默认返回所有
+	}
+
+	endIndex := startIndex + int(limit)
+	if endIndex > len(allKeys) {
+		endIndex = len(allKeys)
+	}
+	if m.prefix != "" {
+		for i := range allKeys {
+			allKeys[i] = allKeys[i][len(m.prefix):]
+		}
+	}
+	// 构建响应
+	keys := allKeys[startIndex:endIndex]
+	hasMore := endIndex < len(allKeys)
+	var nextCursor string
+	if hasMore {
+		nextCursor = keys[len(keys)-1]
+	}
+
+	return &ListResponse{
+		Keys:    keys,
+		Cursor:  nextCursor,
+		HasMore: hasMore,
+	}, nil
 }
 
 // ListPage 分页获取前缀匹配的键值对
 func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
-	if m.closed.Load() {
-		return nil, ErrClosed
-	}
 	internal, err := m.listInternal(ctx, prefix)
 	if err != nil {
 		return nil, err
@@ -102,21 +231,24 @@ func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, 
 	}
 
 	for _, item := range temp[start:end] {
+		if m.prefix != "" {
+			item.Key = item.Key[len(m.prefix):]
+		}
 		result[item.Key] = item.Val.Data
 	}
 	return result, nil
 }
 
 func (m *Memory) List(ctx context.Context, prefix string) (map[string]string, error) {
-	if m.closed.Load() {
-		return nil, ErrClosed
-	}
 	result := make(map[string]string)
 	internal, err := m.listInternal(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
 	for k, v := range internal {
+		if m.prefix != "" {
+			k = k[len(m.prefix):]
+		}
 		result[k] = v.Data
 	}
 	return result, nil
@@ -135,17 +267,15 @@ func (m *Memory) listInternal(ctx context.Context, prefix string) (map[string]me
 
 		k, ok := key.(string)
 		if !ok {
-			zap.L().Warn("invalid key type in Memory", zap.Any("key", key))
 			return true // 跳过非字符串键
 		}
 
-		if !strings.HasPrefix(k, prefix) {
+		if !strings.HasPrefix(k, m.prefix+prefix) {
 			return true
 		}
 
 		content, ok := value.(memoryContent)
 		if !ok {
-			zap.L().Warn("invalid value type in Memory", zap.String("key", k), zap.Any("value", value))
 			return true // 跳过类型错误的value
 		}
 
@@ -165,9 +295,6 @@ func (m *Memory) listInternal(ctx context.Context, prefix string) (map[string]me
 
 // Put 存储键值对，可以设置过期时间
 func (m *Memory) Put(_ context.Context, key, value string, ttl time.Duration) error {
-	if m.closed.Load() {
-		return ErrClosed
-	}
 	now := time.Now()
 	var td *time.Time
 	if ttl != -1 {
@@ -175,7 +302,9 @@ func (m *Memory) Put(_ context.Context, key, value string, ttl time.Duration) er
 		td = &d
 	}
 
-	m.data.Store(key, memoryContent{
+	// 添加 prefix 到 key
+	fullKey := m.prefix + key
+	m.data.Store(fullKey, memoryContent{
 		Data:     value,
 		TTL:      td,
 		CreateAt: now,
@@ -185,19 +314,18 @@ func (m *Memory) Put(_ context.Context, key, value string, ttl time.Duration) er
 
 // Get 获取指定键的值，过期则删除并返回不存在
 func (m *Memory) Get(_ context.Context, key string) (string, error) {
-	if m.closed.Load() {
-		return "", ErrClosed
-	}
-	if value, ok := m.data.Load(key); ok {
+	// 添加 prefix 到 key
+	fullKey := m.prefix + key
+	if value, ok := m.data.Load(fullKey); ok {
 		content, ok := value.(memoryContent)
 		if !ok {
-			m.data.Delete(key) // 清理无效数据
+			m.data.Delete(fullKey) // 清理无效数据
 			return "", ErrKeyNotFound
 		}
 
 		now := time.Now()
 		if content.TTL != nil && now.After(*content.TTL) {
-			m.data.Delete(key) // 删除过期键
+			m.data.Delete(fullKey) // 删除过期键
 			return "", ErrKeyNotFound
 		}
 		return content.Data, nil
@@ -207,18 +335,14 @@ func (m *Memory) Get(_ context.Context, key string) (string, error) {
 
 // Delete 删除指定的键
 func (m *Memory) Delete(_ context.Context, key string) (bool, error) {
-	if m.closed.Load() {
-		return false, ErrClosed
-	}
-	_, loaded := m.data.LoadAndDelete(key)
+	// 添加 prefix 到 key
+	fullKey := m.prefix + key
+	_, loaded := m.data.LoadAndDelete(fullKey)
 	return loaded, nil
 }
 
 // PutIfNotExists 仅在键不存在时设置值（原子操作）
 func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
-	if m.closed.Load() {
-		return false, ErrClosed
-	}
 	now := time.Now()
 	var td *time.Time
 	if ttl != -1 {
@@ -226,6 +350,8 @@ func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.D
 		td = &d
 	}
 
+	// 添加 prefix 到 key
+	fullKey := m.prefix + key
 	newValue := memoryContent{
 		Data:     value,
 		TTL:      td,
@@ -233,19 +359,19 @@ func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.D
 	}
 
 	// 使用LoadOrStore确保原子性：不存在则存储，返回true；存在则返回false
-	actual, loaded := m.data.LoadOrStore(key, newValue)
+	actual, loaded := m.data.LoadOrStore(fullKey, newValue)
 	if loaded {
 		// 检查已存在的值是否过期
 		content, ok := actual.(memoryContent)
 		if !ok {
 			// 类型错误，替换为新值
-			m.data.Store(key, newValue)
+			m.data.Store(fullKey, newValue)
 			return true, nil
 		}
 
 		if content.TTL != nil && now.After(*content.TTL) {
 			// 已过期，替换为新值（使用CAS确保原子性）
-			swapped := m.data.CompareAndSwap(key, content, newValue)
+			swapped := m.data.CompareAndSwap(fullKey, content, newValue)
 			return swapped, nil
 		}
 		// 键有效存在，返回false
@@ -257,10 +383,9 @@ func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.D
 
 // CompareAndSwap 当当前值等于oldValue时，将其更新为newValue（原子操作）
 func (m *Memory) CompareAndSwap(_ context.Context, key, oldValue, newValue string) (bool, error) {
-	if m.closed.Load() {
-		return false, ErrClosed
-	}
-	val, exists := m.data.Load(key)
+	// 添加 prefix 到 key
+	fullKey := m.prefix + key
+	val, exists := m.data.Load(fullKey)
 	if !exists {
 		return false, ErrKeyNotFound
 	}
@@ -288,50 +413,6 @@ func (m *Memory) CompareAndSwap(_ context.Context, key, oldValue, newValue strin
 	}
 
 	// 使用CAS原子操作替换
-	swapped := m.data.CompareAndSwap(key, content, newContent)
+	swapped := m.data.CompareAndSwap(fullKey, content, newContent)
 	return swapped, nil
-}
-
-// Close 关闭内存存储，安全持久化数据到文件
-func (m *Memory) Close() error {
-	if m.closed.Swap(true) {
-		return ErrClosed
-	}
-	defer m.data.Clear()
-	if m.store == "" {
-		return nil
-	}
-
-	// 收集未过期的数据
-	item := make(map[string]memoryContent)
-	now := time.Now()
-	m.data.Range(func(key, value interface{}) bool {
-		content, ok := value.(memoryContent)
-		if ok && (content.TTL == nil || now.Before(*content.TTL)) {
-			item[key.(string)] = content
-		}
-		return true
-	})
-
-	zap.L().Debug("回写内容到本地存储", zap.String("store", m.store), zap.Int("length", len(item)))
-	saved, err := json.Marshal(item)
-	if err != nil {
-		return err
-	}
-
-	// 先写入临时文件，成功后原子性重命名，避免文件损坏
-	tempFile := m.store + ".tmp"
-	if err := os.WriteFile(tempFile, saved, 0o600); err != nil {
-		return err
-	}
-
-	if err := os.Rename(tempFile, m.store); err != nil {
-		_ = os.Remove(tempFile) // 清理临时文件
-		return err
-	}
-	return nil
-}
-
-func (m *Memory) Splitter() string {
-	return "::"
 }

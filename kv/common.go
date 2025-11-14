@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
 	"os"
 	"time"
@@ -15,16 +14,13 @@ import (
 const TTLKeep = -1
 
 type KV interface {
-	Splitter() string
-	WithKey(keys ...string) string
-
+	Child(path string) KV
 	Put(ctx context.Context, key, value string, ttl time.Duration) error
 	Get(ctx context.Context, key string) (string, error)
 	Delete(ctx context.Context, key string) (bool, error)
 
 	PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error)
-	io.Closer
 }
 
 type PagedKV interface {
@@ -33,24 +29,62 @@ type PagedKV interface {
 	ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error)
 }
 
-func NewKVFromURL(s string) (KV, error) {
+type ListOptions struct {
+	Limit  int64  // 最大返回数量
+	Cursor string // 分页游标（上一页最后一个键）
+}
+
+type ListResponse struct {
+	Keys    []string // 匹配的键（相对前缀，不含根前缀）
+	Cursor  string   // 下一页游标（为空表示没有更多数据）
+	HasMore bool     // 是否还有更多数据
+}
+
+type CursorPagedKV interface {
+	KV
+	CursorList(ctx context.Context, opts *ListOptions) (*ListResponse, error)
+}
+
+func NewKVFromURL(s string) (KV, func() error, error) {
 	parse, err := url.Parse(s)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	switch parse.Scheme {
 	case "memory", "mem":
-		return NewMemory("")
+		memory, err := NewMemory("")
+		if err != nil {
+			return nil, nil, err
+		}
+		return memory, func() error {
+			return memory.Sync()
+		}, nil
 	case "storage", "local":
-		return NewMemory(parse.Path)
+		memory, err := NewMemory(parse.Path)
+		if err != nil {
+			return nil, nil, err
+		}
+		return memory, func() error {
+			return memory.Sync()
+		}, nil
 	case "etcd":
 		etcd, err := connects.NewEtcd(parse)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return NewEtcd(etcd, parse.Query().Get("prefix")), nil
+		return NewEtcd(etcd, parse.Query().Get("prefix")), func() error {
+			return etcd.Close()
+		}, nil
+	case "redis":
+		redis, err := connects.NewRedis(parse)
+		if err != nil {
+			return nil, nil, err
+		}
+		return NewRedis(redis, parse.Query().Get("prefix")), func() error {
+			return redis.Close()
+		}, nil
 	default:
-		return nil, fmt.Errorf("unsupported scheme: %s", parse.Scheme)
+		return nil, nil, fmt.Errorf("unsupported scheme: %s", parse.Scheme)
 	}
 }
 
