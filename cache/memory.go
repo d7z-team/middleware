@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/pkg/errors"
 )
 
 type NopCloser struct {
@@ -26,10 +29,13 @@ type internalValue struct {
 
 type MemoryCache struct {
 	lruCache   *lru.Cache[string, *internalValue]
-	maxCap     int
 	cleanupInt time.Duration
-	stopChan   chan struct{}
-	once       sync.Once
+
+	mu     sync.RWMutex
+	closed *atomic.Bool
+	stopWG sync.WaitGroup
+
+	prefix string
 }
 
 type MemoryCacheConfig struct {
@@ -48,25 +54,43 @@ func NewMemoryCache(config MemoryCacheConfig) (*MemoryCache, error) {
 
 	lruCache, err := lru.New[string, *internalValue](config.MaxCapacity)
 	if err != nil {
-		return nil, wrapError("create lru cache failed", err)
+		return nil, errors.Wrap(err, "create lru cache failed")
 	}
 
 	mc := &MemoryCache{
 		lruCache:   lruCache,
-		maxCap:     config.MaxCapacity,
 		cleanupInt: config.CleanupInt,
-		stopChan:   make(chan struct{}),
+		closed:     new(atomic.Bool),
+		prefix:     "/",
 	}
 
+	mc.stopWG.Add(1)
 	go mc.startCleanupTask()
 
 	return mc, nil
 }
 
+func (mc *MemoryCache) Child(path string) Cache {
+	if path == "" {
+		return mc
+	}
+
+	path = mc.prefix + strings.Trim(path, "/") + "/"
+	return &MemoryCache{
+		lruCache: mc.lruCache,
+		closed:   mc.closed,
+		prefix:   path,
+	}
+}
+
 func (mc *MemoryCache) Put(_ context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error {
+	if mc.closed.Load() {
+		return ErrCacheClosed
+	}
+	key = mc.prefix + key
 	data, err := io.ReadAll(value)
 	if err != nil {
-		return wrapError("read value failed", err)
+		return errors.Wrap(err, "read value failed")
 	}
 
 	if ttl != TTLKeep && ttl <= 0 {
@@ -80,7 +104,7 @@ func (mc *MemoryCache) Put(_ context.Context, key string, metadata map[string]st
 	}
 	metaRaw, err := json.Marshal(metadata)
 	if err != nil {
-		return wrapError("marshal metadata failed", err)
+		return errors.Wrap(err, "marshal metadata failed")
 	}
 	internalVal := &internalValue{
 		data:      data,
@@ -89,12 +113,22 @@ func (mc *MemoryCache) Put(_ context.Context, key string, metadata map[string]st
 		expiresAt: expiresAt,
 	}
 
+	mc.mu.Lock()
 	mc.lruCache.Add(key, internalVal)
+	mc.mu.Unlock()
 
 	return nil
 }
 
 func (mc *MemoryCache) Get(_ context.Context, key string) (*Content, error) {
+	if mc.closed.Load() {
+		return nil, ErrCacheClosed
+	}
+
+	key = mc.prefix + key
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+
 	internalVal, exists := mc.lruCache.Get(key)
 	if !exists {
 		return nil, ErrCacheMiss
@@ -102,7 +136,6 @@ func (mc *MemoryCache) Get(_ context.Context, key string) (*Content, error) {
 
 	now := time.Now()
 	if !internalVal.expiresAt.IsZero() && now.After(internalVal.expiresAt) {
-		mc.lruCache.Remove(key)
 		return nil, ErrCacheMiss
 	}
 
@@ -110,7 +143,7 @@ func (mc *MemoryCache) Get(_ context.Context, key string) (*Content, error) {
 	meta := make(map[string]string)
 	err := json.Unmarshal(internalVal.metadata, &meta)
 	if err != nil {
-		return nil, wrapError("unmarshal metadata failed", err)
+		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
 	return &Content{
 		ReadSeekCloser: NopCloser{reader},
@@ -119,18 +152,27 @@ func (mc *MemoryCache) Get(_ context.Context, key string) (*Content, error) {
 }
 
 func (mc *MemoryCache) Delete(_ context.Context, key string) error {
+	if mc.closed.Load() {
+		return ErrCacheClosed
+	}
+	key = mc.prefix + key
+	mc.mu.Lock()
 	mc.lruCache.Remove(key)
+	mc.mu.Unlock()
+
 	return nil
 }
 
 func (mc *MemoryCache) Close() error {
-	mc.once.Do(func() {
-		close(mc.stopChan)
-	})
+	if mc.closed.CompareAndSwap(false, true) {
+		mc.stopWG.Wait()
+	}
 	return nil
 }
 
 func (mc *MemoryCache) startCleanupTask() {
+	defer mc.stopWG.Done()
+
 	ticker := time.NewTicker(mc.cleanupInt)
 	defer ticker.Stop()
 
@@ -138,13 +180,23 @@ func (mc *MemoryCache) startCleanupTask() {
 		select {
 		case <-ticker.C:
 			mc.cleanupExpired()
-		case <-mc.stopChan:
-			return
+		default:
+			if mc.closed.Load() {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
 }
 
 func (mc *MemoryCache) cleanupExpired() {
+	if mc.closed.Load() {
+		return
+	}
+
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
+
 	now := time.Now()
 	for _, key := range mc.lruCache.Keys() {
 		internalVal, exists := mc.lruCache.Get(key)
@@ -155,22 +207,4 @@ func (mc *MemoryCache) cleanupExpired() {
 			mc.lruCache.Remove(key)
 		}
 	}
-}
-
-type cacheError struct {
-	msg string
-	err error
-}
-
-func (e *cacheError) Error() string {
-	if e.err != nil {
-		return e.msg + ": " + e.err.Error()
-	}
-	return e.msg
-}
-
-func (e *cacheError) Unwrap() error { return e.err }
-
-func wrapError(msg string, err error) error {
-	return &cacheError{msg: msg, err: err}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"time"
@@ -21,6 +22,20 @@ type KV interface {
 
 	PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error)
+}
+
+type CloserKV interface {
+	KV
+	io.Closer
+}
+
+type closerKV struct {
+	KV
+	closer func() error
+}
+
+func (receiver closerKV) Close() error {
+	return receiver.closer()
 }
 
 type PagedKV interface {
@@ -45,52 +60,55 @@ type CursorPagedKV interface {
 	CursorList(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 }
 
-func NewKVFromURL(s string) (KV, func() error, error) {
+func NewKVFromURL(s string) (CloserKV, error) {
 	parse, err := url.Parse(s)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	switch parse.Scheme {
 	case "memory", "mem":
 		memory, err := NewMemory("")
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return memory, func() error {
-			return memory.Sync()
+		return closerKV{
+			KV:     memory,
+			closer: memory.Sync,
 		}, nil
 	case "storage", "local":
 		memory, err := NewMemory(parse.Path)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return memory, func() error {
-			return memory.Sync()
+		return closerKV{
+			KV:     memory,
+			closer: memory.Sync,
 		}, nil
 	case "etcd":
 		etcd, err := connects.NewEtcd(parse)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return NewEtcd(etcd, parse.Query().Get("prefix")), func() error {
-			return etcd.Close()
+		return closerKV{
+			KV:     NewEtcd(etcd, parse.Query().Get("prefix")),
+			closer: etcd.Close,
 		}, nil
 	case "redis":
 		redis, err := connects.NewRedis(parse)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
-		return NewRedis(redis, parse.Query().Get("prefix")), func() error {
-			return redis.Close()
+		return closerKV{
+			KV:     NewRedis(redis, parse.Query().Get("prefix")),
+			closer: redis.Close,
 		}, nil
 	default:
-		return nil, nil, fmt.Errorf("unsupported scheme: %s", parse.Scheme)
+		return nil, fmt.Errorf("unsupported scheme: %s", parse.Scheme)
 	}
 }
 
 // 确保 KV 包中存在以下错误定义（已补充到 kv.go）
 var (
 	ErrKeyNotFound = errors.Join(os.ErrNotExist, errors.New("key not found"))
-	ErrClosed      = errors.New("kv client closed")
 	ErrCASFailed   = errors.New("compare and swap failed")
 )

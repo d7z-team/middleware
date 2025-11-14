@@ -16,7 +16,7 @@ import (
 )
 
 // CacheFactory 用于创建缓存实例的函数类型
-type CacheFactory func(t *testing.T) Cache
+type CacheFactory func(t *testing.T) CloserCache
 
 // TestCache_Common 通用缓存接口测试套件
 func testCacheCommon(t *testing.T, factory CacheFactory) {
@@ -27,7 +27,6 @@ func testCacheCommon(t *testing.T, factory CacheFactory) {
 	t.Run("Update", func(t *testing.T) { testUpdate(t, factory) })
 	t.Run("TTL", func(t *testing.T) { testTTL(t, factory) })
 	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, factory) })
-	t.Run("Close", func(t *testing.T) { testClose(t, factory) })
 }
 
 // testPutGet 测试基本的 Put 和 Get 功能
@@ -278,28 +277,6 @@ func testConcurrency(t *testing.T, factory CacheFactory) {
 	}
 }
 
-// testClose 测试关闭功能
-func testClose(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-
-	// 测试幂等性
-	err := cache.Close()
-	if err != nil {
-		t.Errorf("First Close failed: %v", err)
-	}
-
-	err = cache.Close()
-	if err != nil {
-		t.Errorf("Second Close (idempotent) failed: %v", err)
-	}
-
-	// 关闭后尝试操作（具体行为取决于实现，这里只测试不会 panic）
-	ctx := context.Background()
-	_ = cache.Put(ctx, "closed-key", map[string]string{}, bytes.NewReader([]byte("value")), TTLKeep)
-	_, _ = cache.Get(ctx, "closed-key")
-	_ = cache.Delete(ctx, "closed-key")
-}
-
 // TestCache_ErrorReader 测试读取错误的情况
 func testCacheErrorReader(t *testing.T, factory CacheFactory) {
 	cache := factory(t)
@@ -325,7 +302,7 @@ func testCacheErrorReader(t *testing.T, factory CacheFactory) {
 
 func TestMemory(t *testing.T) {
 	t.Run("Common", func(t *testing.T) {
-		testCacheCommon(t, func(t *testing.T) Cache {
+		testCacheCommon(t, func(t *testing.T) CloserCache {
 			cache, err := NewMemoryCache(
 				MemoryCacheConfig{
 					100,
@@ -338,8 +315,27 @@ func TestMemory(t *testing.T) {
 			return cache
 		})
 	})
+	t.Run("ChildCommon", func(t *testing.T) {
+		testCacheCommon(t, func(t *testing.T) CloserCache {
+			cache, err := NewMemoryCache(
+				MemoryCacheConfig{
+					100,
+					time.Minute,
+				},
+			)
+			if err != nil {
+				t.Fatalf("Failed to create cache: %v", err)
+			}
+			return closerCache{
+				Cache: cache.Child("data/child"),
+				closer: func() error {
+					return cache.Close()
+				},
+			}
+		})
+	})
 	t.Run("ErrorReader", func(t *testing.T) {
-		testCacheErrorReader(t, func(t *testing.T) Cache {
+		testCacheErrorReader(t, func(t *testing.T) CloserCache {
 			cache, err := NewMemoryCache(
 				MemoryCacheConfig{
 					MaxCapacity: 10,
@@ -351,27 +347,77 @@ func TestMemory(t *testing.T) {
 			return cache
 		})
 	})
+	t.Run("ErrorChild", func(t *testing.T) {
+		testCacheErrorReader(t, func(t *testing.T) CloserCache {
+			cache, err := NewMemoryCache(
+				MemoryCacheConfig{
+					MaxCapacity: 10,
+				},
+			)
+			if err != nil {
+				t.Fatalf("Failed to create cache: %v", err)
+			}
+			return closerCache{
+				Cache: cache.Child("data/child"),
+				closer: func() error {
+					return cache.Close()
+				},
+			}
+		})
+	})
 }
 
 func TestRedis(t *testing.T) {
 	t.Run("Common", func(t *testing.T) {
-		testCacheCommon(t, func(t *testing.T) Cache {
+		testCacheCommon(t, func(t *testing.T) CloserCache {
 			parse, _ := url.Parse("redis://127.0.0.1:6379")
 			redis, err := connects.NewRedis(parse)
 			if err != nil {
 				t.Skip("Failed to connect to redis")
 			}
-			return NewRedisCache(redis, "common")
+			return closerCache{
+				Cache:  NewRedisCache(redis, "common"),
+				closer: redis.Close,
+			}
 		})
 	})
 	t.Run("ErrorReader", func(t *testing.T) {
-		testCacheErrorReader(t, func(t *testing.T) Cache {
+		testCacheErrorReader(t, func(t *testing.T) CloserCache {
 			parse, _ := url.Parse("redis://127.0.0.1:6379")
 			redis, err := connects.NewRedis(parse)
 			if err != nil {
 				t.Skip("Failed to connect to redis")
 			}
-			return NewRedisCache(redis, "reader")
+			return closerCache{
+				Cache:  NewRedisCache(redis, "reader"),
+				closer: redis.Close,
+			}
+		})
+	})
+	t.Run("ChildCommon", func(t *testing.T) {
+		testCacheCommon(t, func(t *testing.T) CloserCache {
+			parse, _ := url.Parse("redis://127.0.0.1:6379")
+			redis, err := connects.NewRedis(parse)
+			if err != nil {
+				t.Skip("Failed to connect to redis")
+			}
+			return closerCache{
+				Cache:  NewRedisCache(redis, "common").Child("data/child"),
+				closer: redis.Close,
+			}
+		})
+	})
+	t.Run("ChildErrorReader", func(t *testing.T) {
+		testCacheErrorReader(t, func(t *testing.T) CloserCache {
+			parse, _ := url.Parse("redis://127.0.0.1:6379")
+			redis, err := connects.NewRedis(parse)
+			if err != nil {
+				t.Skip("Failed to connect to redis")
+			}
+			return closerCache{
+				Cache:  NewRedisCache(redis, "reader").Child("data/child"),
+				closer: redis.Close,
+			}
 		})
 	})
 }

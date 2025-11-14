@@ -16,10 +16,24 @@ import (
 const TTLKeep = -1
 
 type Cache interface {
+	Child(path string) Cache
 	Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error
 	Get(ctx context.Context, key string) (*Content, error)
 	Delete(ctx context.Context, key string) error
+}
+
+type CloserCache interface {
+	Cache
 	io.Closer
+}
+
+type closerCache struct {
+	Cache
+	closer func() error
+}
+
+func (c closerCache) Close() error {
+	return c.closer()
 }
 
 type Content struct {
@@ -38,12 +52,10 @@ func (c *Content) ReadToString() (string, error) {
 
 // 通用缓存错误定义
 var (
-	// ErrCacheMiss 缓存未命中或已过期
-	ErrCacheMiss = errors.Join(os.ErrNotExist, errors.New("cache: key not found or expired"))
-	// ErrInvalidTTL 无效的TTL值（非TTLKeep且小于等于0）
-	ErrInvalidTTL = errors.New("cache: invalid ttl value (use TTLKeep for permanent cache)")
-	// ErrInvalidCapacity 无效的缓存容量（小于等于0）
+	ErrCacheMiss       = errors.Join(os.ErrNotExist, errors.New("cache: key not found or expired"))
+	ErrInvalidTTL      = errors.New("cache: invalid ttl value (use TTLKeep for permanent cache)")
 	ErrInvalidCapacity = errors.New("cache: invalid cache capacity (must be greater than 0)")
+	ErrCacheClosed     = errors.New("cache is closed")
 )
 
 // NewCacheFromURL 通过 URL 配置创建缓存实例
@@ -51,7 +63,7 @@ var (
 // - memory/mem: 内存缓存（带LRU），示例：memory://?max_capacity=1000&cleanup_interval=5m
 // - redis: Redis 缓存（非TLS），示例：redis://:password@localhost:6379/0?prefix=app:cache:
 // - rediss: Redis 缓存（TLS），示例：rediss://user:password@host:6380/1?prefix=cache:
-func NewCacheFromURL(u string) (Cache, error) {
+func NewCacheFromURL(u string) (CloserCache, error) {
 	// 解析 URL
 	ur, err := url.Parse(u)
 	if err != nil {
@@ -68,7 +80,12 @@ func NewCacheFromURL(u string) (Cache, error) {
 		if err != nil {
 			return nil, err
 		}
-		return NewRedisCache(client, ur.Query().Get("prefix")), nil
+		return closerCache{
+			Cache: NewRedisCache(client, ur.Query().Get("prefix")),
+			closer: func() error {
+				return client.Close()
+			},
+		}, nil
 
 	default:
 		return nil, errors.New("不支持的缓存协议: " + ur.Scheme)

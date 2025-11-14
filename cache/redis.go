@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync/atomic"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -16,12 +16,11 @@ import (
 type RedisCache struct {
 	client *redis.Client
 	prefix string
-	closed atomic.Bool
 }
 
 func NewRedisCache(client *redis.Client, prefix string) *RedisCache {
-	if prefix == "" {
-		prefix = "cache:"
+	if prefix != "" {
+		prefix = strings.Trim(prefix, "/") + "/"
 	}
 	return &RedisCache{
 		client: client,
@@ -29,8 +28,15 @@ func NewRedisCache(client *redis.Client, prefix string) *RedisCache {
 	}
 }
 
-func (rc *RedisCache) isClosed() bool {
-	return rc.closed.Load()
+func (rc *RedisCache) Child(path string) Cache {
+	if path == "" {
+		return rc
+	}
+	path = rc.prefix + strings.Trim(path, "/") + "/"
+	return &RedisCache{
+		client: rc.client,
+		prefix: path,
+	}
 }
 
 func (rc *RedisCache) dataKey(key string) string {
@@ -42,10 +48,6 @@ func (rc *RedisCache) metaKey(key string) string {
 }
 
 func (rc *RedisCache) Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error {
-	if rc.isClosed() {
-		return errors.New("cache is closed")
-	}
-
 	data, err := io.ReadAll(value)
 	if err != nil {
 		return fmt.Errorf("read value: %w", err)
@@ -60,33 +62,48 @@ func (rc *RedisCache) Put(ctx context.Context, key string, metadata map[string]s
 		return fmt.Errorf("marshal meta: %w", err)
 	}
 
-	pipe := rc.client.Pipeline()
+	// 使用事务管道保证原子性
+	pipe := rc.client.TxPipeline()
 	dataKey := rc.dataKey(key)
 	metaKey := rc.metaKey(key)
 
-	pipe.Set(ctx, dataKey, data, 0)
-	pipe.Set(ctx, metaKey, metaJSON, 0)
-
-	if ttl != TTLKeep {
-		pipe.Expire(ctx, dataKey, ttl)
-		pipe.Expire(ctx, metaKey, ttl)
+	if ttl == TTLKeep {
+		// 保持原有TTL - 只设置值，不设置过期时间
+		pipe.Set(ctx, dataKey, data, 0)
+		pipe.Set(ctx, metaKey, metaJSON, 0)
+	} else {
+		// 设置新的TTL - 直接在Set命令中设置过期时间
+		pipe.Set(ctx, dataKey, data, ttl)
+		pipe.Set(ctx, metaKey, metaJSON, ttl)
 	}
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
-		return fmt.Errorf("redis pipeline: %w", err)
+		return fmt.Errorf("redis transaction: %w", err)
 	}
 
 	return nil
 }
 
 func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
-	if rc.isClosed() {
-		return nil, errors.New("cache is closed")
+	metaKey := rc.metaKey(key)
+	dataKey := rc.dataKey(key)
+
+	// 使用事务同时获取元数据和数据，确保一致性
+	pipe := rc.client.TxPipeline()
+	metaCmd := pipe.Get(ctx, metaKey)
+	dataCmd := pipe.Get(ctx, dataKey)
+
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, ErrCacheMiss
+		}
+		return nil, fmt.Errorf("redis get: %w", err)
 	}
 
-	metaKey := rc.metaKey(key)
-	metaJSON, err := rc.client.Get(ctx, metaKey).Bytes()
+	// 处理元数据
+	metaJSON, err := metaCmd.Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
 			return nil, ErrCacheMiss
@@ -96,13 +113,17 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 
 	var meta map[string]string
 	if err := json.Unmarshal(metaJSON, &meta); err != nil {
+		// 元数据损坏，删除对应的数据键以保持一致性
+		go rc.cleanupCorruptedData(context.Background(), dataKey, metaKey)
 		return nil, fmt.Errorf("unmarshal meta: %w", err)
 	}
 
-	dataKey := rc.dataKey(key)
-	data, err := rc.client.Get(ctx, dataKey).Bytes()
+	// 处理数据
+	data, err := dataCmd.Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
+			// 数据不存在但元数据存在，删除元数据以保持一致性
+			go rc.cleanupCorruptedData(context.Background(), dataKey, metaKey)
 			return nil, ErrCacheMiss
 		}
 		return nil, fmt.Errorf("get data: %w", err)
@@ -115,11 +136,12 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 	}, nil
 }
 
-func (rc *RedisCache) Delete(ctx context.Context, key string) error {
-	if rc.isClosed() {
-		return errors.New("cache is closed")
-	}
+// cleanupCorruptedData 清理损坏的数据，用于后台修复数据不一致
+func (rc *RedisCache) cleanupCorruptedData(ctx context.Context, dataKey, metaKey string) {
+	_, _ = rc.client.Del(ctx, dataKey, metaKey).Result()
+}
 
+func (rc *RedisCache) Delete(ctx context.Context, key string) error {
 	dataKey := rc.dataKey(key)
 	metaKey := rc.metaKey(key)
 
@@ -130,9 +152,20 @@ func (rc *RedisCache) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-func (rc *RedisCache) Close() error {
-	if rc.closed.CompareAndSwap(false, true) {
-		return rc.client.Close()
+func (rc *RedisCache) Exists(ctx context.Context, key string) (bool, error) {
+	metaKey := rc.metaKey(key)
+	exists, err := rc.client.Exists(ctx, metaKey).Result()
+	if err != nil {
+		return false, fmt.Errorf("redis exists: %w", err)
 	}
-	return nil
+	return exists > 0, nil
+}
+
+func (rc *RedisCache) TTL(ctx context.Context, key string) (time.Duration, error) {
+	dataKey := rc.dataKey(key)
+	ttl, err := rc.client.TTL(ctx, dataKey).Result()
+	if err != nil {
+		return 0, fmt.Errorf("redis ttl: %w", err)
+	}
+	return ttl, nil
 }
