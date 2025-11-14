@@ -41,7 +41,7 @@ func (receiver closerKV) Close() error {
 	return receiver.closer()
 }
 
-func (receiver closerKV) RAW() KV {
+func (receiver closerKV) Raw() KV {
 	return receiver.KV
 }
 

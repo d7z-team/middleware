@@ -21,7 +21,8 @@ type Cache interface {
 	Get(ctx context.Context, key string) (*Content, error)
 	Delete(ctx context.Context, key string) error
 }
-type RawCache interface {
+
+type RAWCache interface {
 	Raw() Cache
 }
 
@@ -81,7 +82,14 @@ func NewCacheFromURL(u string) (CloserCache, error) {
 	switch strings.ToLower(ur.Scheme) {
 	case "memory", "mem":
 		// 内存缓存：解析查询参数配置
-		return newMemoryCacheFromURL(ur)
+		mem, err := newMemoryCacheFromURL(ur)
+		if err != nil {
+			return nil, err
+		}
+		return closerCache{
+			Cache:  mem,
+			closer: mem.Close,
+		}, nil
 	case "redis", "rediss":
 		client, err := connects.NewRedis(ur)
 		if err != nil {
