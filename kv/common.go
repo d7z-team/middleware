@@ -24,6 +24,9 @@ type KV interface {
 	CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error)
 }
 
+type RawKV interface {
+	Raw() KV
+}
 type CloserKV interface {
 	KV
 	io.Closer
@@ -36,6 +39,10 @@ type closerKV struct {
 
 func (receiver closerKV) Close() error {
 	return receiver.closer()
+}
+
+func (receiver closerKV) RAW() KV {
+	return receiver.KV
 }
 
 type PagedKV interface {

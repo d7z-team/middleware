@@ -21,6 +21,9 @@ type Cache interface {
 	Get(ctx context.Context, key string) (*Content, error)
 	Delete(ctx context.Context, key string) error
 }
+type RawCache interface {
+	Raw() Cache
+}
 
 type CloserCache interface {
 	Cache
@@ -30,6 +33,10 @@ type CloserCache interface {
 type closerCache struct {
 	Cache
 	closer func() error
+}
+
+func (c closerCache) Raw() Cache {
+	return c.Cache
 }
 
 func (c closerCache) Close() error {
