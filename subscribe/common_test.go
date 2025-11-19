@@ -696,3 +696,49 @@ func TestConcurrentSafety(t *testing.T) {
 		})
 	}
 }
+
+// TestCloseBehavior 测试关闭后的基本行为
+func TestCloseBehavior(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{
+			name: "memory close behavior",
+			url:  "memory://",
+		},
+		{
+			name: "etcd close behavior",
+			url:  "etcd://127.0.0.1:2379?prefix=test-close",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			subscriber, err := NewSubscriberFromURL(tt.url)
+			if err != nil {
+				t.Skipf("skipping %s: %v", tt.name, err)
+			}
+
+			if strings.Contains(tt.name, "etcd") {
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			// 测试1: 关闭后发布消息应该失败或静默处理
+			t.Run("publish after close", func(t *testing.T) {
+				err := subscriber.Close()
+				require.NoError(t, err)
+
+				ctx := context.Background()
+				err = subscriber.Publish(ctx, "test-topic", "message after close")
+
+				// 关闭后发布应该返回错误或静默处理（取决于实现）
+				if err != nil {
+					t.Logf("publish after close returned error (expected): %v", err)
+				} else {
+					t.Log("publish after close succeeded (implementation dependent)")
+				}
+			})
+		})
+	}
+}
