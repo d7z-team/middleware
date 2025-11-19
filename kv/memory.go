@@ -63,7 +63,7 @@ type memoryKv struct {
 }
 
 func (m *Memory) Child(path string) KV {
-	path = strings.Trim(path, "/") + "/"
+	path = m.prefix + strings.Trim(path, "/") + "/"
 	if path == "" {
 		return m
 	}
