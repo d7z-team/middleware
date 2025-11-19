@@ -11,16 +11,20 @@ import (
 
 type Subscriber interface {
 	Child(prefix string) Subscriber
-	Publish(ctx context.Context, key string, data string) error
+	Publish(ctx context.Context, key, data string) error
 	Subscribe(ctx context.Context, key string) (<-chan string, error)
 }
 
-type CloserSubscriber struct {
+type CloserSubscriber interface {
+	Subscriber
+	io.Closer
+}
+type closerSubscriber struct {
 	Subscriber
 	io.Closer
 }
 
-func NewSubscriberFromURL(u string) (*CloserSubscriber, error) {
+func NewSubscriberFromURL(u string) (CloserSubscriber, error) {
 	parse, err := url.Parse(u)
 	if err != nil {
 		return nil, err
@@ -28,7 +32,7 @@ func NewSubscriberFromURL(u string) (*CloserSubscriber, error) {
 	switch parse.Scheme {
 	case "memory", "mem":
 		memory := NewMemorySubscriber()
-		return &CloserSubscriber{
+		return &closerSubscriber{
 			Subscriber: memory,
 			Closer:     memory,
 		}, nil
@@ -37,7 +41,7 @@ func NewSubscriberFromURL(u string) (*CloserSubscriber, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &CloserSubscriber{
+		return &closerSubscriber{
 			Subscriber: NewEtcdSubscriber(etcd, parse.Query().Get("prefix")),
 			Closer:     etcd,
 		}, nil
