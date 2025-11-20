@@ -70,16 +70,26 @@ func NewMemoryCache(config MemoryCacheConfig) (*MemoryCache, error) {
 	return mc, nil
 }
 
-func (mc *MemoryCache) Child(path string) Cache {
-	if path == "" {
+func (mc *MemoryCache) Child(paths ...string) Cache {
+	if len(paths) == 0 {
+		return mc
+	}
+	keys := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.Trim(path, "/")
+		if path == "" {
+			continue
+		}
+		keys = append(keys, path)
+	}
+	if len(keys) == 0 {
 		return mc
 	}
 
-	path = mc.prefix + strings.Trim(path, "/") + "/"
 	return &MemoryCache{
 		lruCache: mc.lruCache,
 		closed:   mc.closed,
-		prefix:   path,
+		prefix:   mc.prefix + strings.Join(keys, "/") + "/",
 	}
 }
 

@@ -18,12 +18,26 @@ type Etcd struct {
 func NewEtcd(client *clientv3.Client, prefix string) *Etcd {
 	return &Etcd{
 		client: client,
-		prefix: strings.TrimPrefix(prefix, "/") + "/",
+		prefix: strings.Trim(prefix, "/") + "/",
 	}
 }
 
-func (e *Etcd) Child(path string) KV {
-	return NewEtcd(e.client, e.prefix+strings.TrimPrefix(path, "/"))
+func (e *Etcd) Child(paths ...string) KV {
+	if len(paths) == 0 {
+		return e
+	}
+	keys := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.Trim(path, "/")
+		if path == "" {
+			continue
+		}
+		keys = append(keys, path)
+	}
+	if len(keys) == 0 {
+		return e
+	}
+	return NewEtcd(e.client, e.prefix+strings.Join(keys, "/")+"/")
 }
 
 func (e *Etcd) validateKey(key string) error {

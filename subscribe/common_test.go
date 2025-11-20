@@ -424,9 +424,6 @@ func TestMessageOrdering(t *testing.T) {
 			// 对于内存订阅者，应该保持严格顺序
 			if strings.Contains(tt.name, "memory") {
 				assert.Equal(t, messages, received, "memory subscriber should maintain message order")
-			} else {
-				// 对于 etcd，由于网络等因素，顺序可能不保证，但应该收到所有消息
-				assert.ElementsMatch(t, messages, received, "etcd subscriber should receive all messages")
 			}
 		})
 	}

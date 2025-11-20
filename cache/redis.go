@@ -28,14 +28,24 @@ func NewRedisCache(client *redis.Client, prefix string) *RedisCache {
 	}
 }
 
-func (rc *RedisCache) Child(path string) Cache {
-	if path == "" {
+func (rc *RedisCache) Child(paths ...string) Cache {
+	if len(paths) == 0 {
 		return rc
 	}
-	path = rc.prefix + strings.Trim(path, "/") + "/"
+	keys := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.Trim(path, "/")
+		if path == "" {
+			continue
+		}
+		keys = append(keys, path)
+	}
+	if len(keys) == 0 {
+		return rc
+	}
 	return &RedisCache{
 		client: rc.client,
-		prefix: path,
+		prefix: rc.prefix + strings.Join(keys, "/") + "/",
 	}
 }
 

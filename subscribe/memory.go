@@ -25,17 +25,27 @@ func NewMemorySubscriber() *MemorySubscriber {
 	}
 }
 
-func (m *MemorySubscriber) Child(prefix string) Subscriber {
-	if prefix == "" {
+func (m *MemorySubscriber) Child(paths ...string) Subscriber {
+	if len(paths) == 0 {
 		return m
 	}
-
+	keys := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.Trim(path, "/")
+		if path == "" {
+			continue
+		}
+		keys = append(keys, path)
+	}
+	if len(keys) == 0 {
+		return m
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	if m.closed {
 		return &MemorySubscriber{
-			prefix:   m.buildFullKey(prefix),
+			prefix:   m.prefix + strings.Join(keys, "/") + "/",
 			mu:       m.mu,
 			channels: m.channels,
 			closed:   true,
@@ -44,7 +54,7 @@ func (m *MemorySubscriber) Child(prefix string) Subscriber {
 	}
 
 	return &MemorySubscriber{
-		prefix:   m.buildFullKey(prefix),
+		prefix:   m.prefix + strings.Join(keys, "/") + "/",
 		mu:       m.mu,
 		channels: m.channels,
 		closed:   false,

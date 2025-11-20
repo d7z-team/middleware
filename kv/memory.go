@@ -62,15 +62,25 @@ type memoryKv struct {
 	Val memoryContent
 }
 
-func (m *Memory) Child(path string) KV {
-	path = m.prefix + strings.Trim(path, "/") + "/"
-	if path == "" {
+func (m *Memory) Child(paths ...string) KV {
+	if len(paths) == 0 {
+		return m
+	}
+	keys := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.Trim(path, "/")
+		if path == "" {
+			continue
+		}
+		keys = append(keys, path)
+	}
+	if len(keys) == 0 {
 		return m
 	}
 	return &Memory{
 		data:   m.data,
 		store:  "",
-		prefix: path,
+		prefix: m.prefix + strings.Join(keys, "/") + "/",
 	}
 }
 

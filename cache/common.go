@@ -16,7 +16,7 @@ import (
 const TTLKeep = -1
 
 type Cache interface {
-	Child(path string) Cache
+	Child(paths ...string) Cache
 	Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error
 	Get(ctx context.Context, key string) (*Content, error)
 	Delete(ctx context.Context, key string) error

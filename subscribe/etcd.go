@@ -34,13 +34,26 @@ func NewEtcdSubscriber(client *clientv3.Client, prefix string) *EtcdSubscriber {
 }
 
 // Child 创建子订阅者
-func (e *EtcdSubscriber) Child(prefix string) Subscriber {
+func (e *EtcdSubscriber) Child(paths ...string) Subscriber {
+	if len(paths) == 0 {
+		return e
+	}
+	keys := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.Trim(path, "/")
+		if path == "" {
+			continue
+		}
+		keys = append(keys, path)
+	}
+	if len(keys) == 0 {
+		return e
+	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-
 	if e.closed {
 		child := &EtcdSubscriber{
-			prefix:   e.buildFullKey(prefix),
+			prefix:   e.prefix + strings.Join(keys, "/") + "/",
 			client:   e.client,
 			watchers: make(map[string][]*etcdWatcher),
 			closed:   true,
@@ -49,7 +62,7 @@ func (e *EtcdSubscriber) Child(prefix string) Subscriber {
 	}
 
 	return &EtcdSubscriber{
-		prefix:   e.buildFullKey(prefix),
+		prefix:   e.prefix + strings.Join(keys, "/") + "/",
 		client:   e.client,
 		watchers: make(map[string][]*etcdWatcher),
 		closed:   false,
@@ -70,8 +83,7 @@ func (e *EtcdSubscriber) Publish(ctx context.Context, key, data string) error {
 	return err
 }
 
-// Subscribe 订阅etcd key的变化 - 修复：每个订阅者创建独立的watcher
-func (e *EtcdSubscriber) Subscribe(ctx context.Context, key string) (<-chan string, error) {
+func (e *EtcdSubscriber) Subscribe(_ context.Context, key string) (<-chan string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 

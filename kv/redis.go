@@ -22,14 +22,24 @@ func NewRedis(client *redis.Client, prefix string) *RedisKV {
 	}
 }
 
-func (r *RedisKV) Child(path string) KV {
-	path = strings.Trim(path, "/") + "/"
-	if path == "" {
+func (r *RedisKV) Child(paths ...string) KV {
+	if len(paths) == 0 {
+		return r
+	}
+	keys := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.Trim(path, "/")
+		if path == "" {
+			continue
+		}
+		keys = append(keys, path)
+	}
+	if len(keys) == 0 {
 		return r
 	}
 	return &RedisKV{
 		client: r.client,
-		prefix: r.prefix + path,
+		prefix: r.prefix + strings.Join(keys, "/") + "/",
 	}
 }
 

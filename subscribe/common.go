@@ -10,7 +10,7 @@ import (
 )
 
 type Subscriber interface {
-	Child(prefix string) Subscriber
+	Child(paths ...string) Subscriber
 	Publish(ctx context.Context, key, data string) error
 	Subscribe(ctx context.Context, key string) (<-chan string, error)
 }
