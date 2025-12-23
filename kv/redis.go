@@ -15,6 +15,32 @@ type RedisKV struct {
 	prefix string
 }
 
+func (r *RedisKV) Count(ctx context.Context) (int64, error) {
+	var count int64
+	fullPattern := r.prefix + "*"
+	cursor := uint64(0)
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = r.client.Scan(ctx, cursor, fullPattern, 1000).Result()
+		if err != nil {
+			return 0, err
+		}
+
+		count += int64(len(keys))
+		if cursor == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return count, ctx.Err()
+		default:
+		}
+	}
+
+	return count, nil
+}
+
 func NewRedis(client *redis.Client, prefix string) *RedisKV {
 	return &RedisKV{
 		client: client,

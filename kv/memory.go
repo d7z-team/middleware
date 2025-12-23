@@ -18,6 +18,45 @@ type Memory struct {
 	prefix string // 添加 prefix 字段，默认为空字符串
 }
 
+// Count 统计指定前缀下的有效键数量（排除过期键）
+func (m *Memory) Count(ctx context.Context) (int64, error) {
+	var count int64
+	now := time.Now()
+
+	m.data.Range(func(key, value interface{}) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		k, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if !strings.HasPrefix(k, m.prefix) {
+			return true
+		}
+
+		// 检查值类型和过期时间
+		content, ok := value.(memoryContent)
+		if !ok {
+			return true
+		}
+		if content.TTL != nil && now.After(*content.TTL) {
+			return true
+		}
+
+		count++
+		return true
+	})
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	default:
+	}
+	return count, nil
+}
+
 // NewMemory 创建一个新的内存存储实例
 func NewMemory(store string) (*Memory, error) {
 	ret := &Memory{

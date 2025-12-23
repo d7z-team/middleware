@@ -226,6 +226,48 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.NoError(t, err)
 		assert.Equal(t, "keep_val", getVal)
 	})
+	// 9. 测试 Count 方法
+	t.Run("Count", func(t *testing.T) {
+		prefix := uniquePrefix + "count_"
+		childKV := kvClient.Child(prefix)
+
+		// 初始数量应为 0
+		count, err := childKV.Count(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(0), count)
+
+		// 添加 3 个键
+		testKeys := []string{"key1", "key2", "key3"}
+		for i, key := range testKeys {
+			err = childKV.Put(ctx, key, "value"+string(rune('a'+i)), TTLKeep)
+			assert.NoError(t, err)
+
+			// 每次添加后验证数量
+			count, err = childKV.Count(ctx)
+			assert.NoError(t, err)
+			assert.Equal(t, int64(i+1), count)
+		}
+
+		// 最终应该是 3 个键
+		count, err = childKV.Count(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(3), count)
+
+		// 删除一个键，数量应该减少
+		deleted, err := childKV.Delete(ctx, "key2")
+		assert.NoError(t, err)
+		assert.True(t, deleted)
+
+		count, err = childKV.Count(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(2), count)
+
+		// 测试不存在的键的 Count
+		emptyKV := kvClient.Child("nonexistent")
+		emptyCount, err := emptyKV.Count(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(0), emptyCount)
+	})
 }
 
 // ########################### 具体实现测试 ###########################

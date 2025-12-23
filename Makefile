@@ -6,18 +6,18 @@ deps: minio etcd redis
 
 .PHONY: minio
 minio:
-	@docker kill sync-minio ||: && docker run -d --rm --name sync-minio --network host \
+	@docker kill sync-minio ||: && sleep 1&& docker run -d --rm --name sync-minio --network host \
 	--env MINIO_ROOT_USER="minio_admin" \
   --env MINIO_ROOT_PASSWORD="minio_admin" \
 	quay.io/minio/minio server /data --console-address ":9001"
 
 .PHONY: redis
 redis:
-	@docker kill sync-redis ||: && docker run -d --rm --name sync-redis --network host docker.io/library/redis:alpine
+	@docker kill sync-redis ||:  && sleep 1&& docker run -d --rm --name sync-redis --network host docker.io/library/redis:alpine
 
 .PHONY: etcd
 etcd:
-	@docker kill sync-etcd ||: && docker run -d --rm --name sync-etcd --network host docker.io/rancher/etcd:v3.4.13-k3s1 etcd
+	@docker kill sync-etcd ||:  && sleep 1 && docker run -d --rm --name sync-etcd --network host docker.io/rancher/etcd:v3.4.13-k3s1 etcd
 
 .PHONY: fmt
 fmt:

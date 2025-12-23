@@ -40,6 +40,26 @@ func (e *Etcd) Child(paths ...string) KV {
 	return NewEtcd(e.client, e.prefix+strings.Join(keys, "/")+"/")
 }
 
+func (e *Etcd) Count(ctx context.Context) (int64, error) {
+	resp, err := e.client.Get(ctx, e.prefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	if err != nil {
+		return 0, fmt.Errorf("count keys failed: %w", err)
+	}
+	count := int64(0)
+	prefixLen := len(e.prefix)
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		if !strings.HasPrefix(key, e.prefix) {
+			continue
+		}
+		relativeKey := key[prefixLen:]
+		if !strings.Contains(relativeKey, "/") {
+			count++
+		}
+	}
+	return count, nil
+}
+
 func (e *Etcd) validateKey(key string) error {
 	if strings.Contains(key, "/") {
 		return fmt.Errorf("key cannot contain '/': %s", key)
