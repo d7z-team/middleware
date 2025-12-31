@@ -275,10 +275,15 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 // TestMemoryKV 测试内存实现（两种 Scheme：memory / storage）
 func TestMemoryKV(t *testing.T) {
 	// 测试 memory scheme（纯内存，不持久化）
-	t.Run("memory-scheme", func(t *testing.T) {
+	t.Run("memory-scheme-1", func(t *testing.T) {
 		memKV, err := NewMemory("")
 		require.NoError(t, err, "创建内存 KV 失败")
 		testKVConsistency(t, memKV)
+	})
+	t.Run("memory-scheme-2", func(t *testing.T) {
+		fromURL, err := NewKVFromURL("memory://")
+		require.NoError(t, err, "创建内存 KV 失败")
+		testKVConsistency(t, fromURL)
 	})
 
 	// 测试 storage scheme（持久化到本地文件）
