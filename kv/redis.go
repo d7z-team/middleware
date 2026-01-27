@@ -10,11 +10,14 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
+// RedisKV is a Redis-based KV storage implementation.
 type RedisKV struct {
 	client *redis.Client
-	prefix string
+	prefix string // key prefix
 }
 
+// Count counts the number of keys matching the prefix.
+// Note: This operation uses SCAN and can be slow for large datasets.
 func (r *RedisKV) Count(ctx context.Context) (int64, error) {
 	var count int64
 	fullPattern := r.prefix + "*"
@@ -41,6 +44,7 @@ func (r *RedisKV) Count(ctx context.Context) (int64, error) {
 	return count, nil
 }
 
+// NewRedis creates a new Redis KV instance.
 func NewRedis(client *redis.Client, prefix string) *RedisKV {
 	return &RedisKV{
 		client: client,
@@ -48,6 +52,7 @@ func NewRedis(client *redis.Client, prefix string) *RedisKV {
 	}
 }
 
+// Child creates a child KV with appended path.
 func (r *RedisKV) Child(paths ...string) KV {
 	if len(paths) == 0 {
 		return r
@@ -69,6 +74,7 @@ func (r *RedisKV) Child(paths ...string) KV {
 	}
 }
 
+// Put stores a key-value pair.
 func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration) error {
 	fullKey := r.prefix + key
 	if ttl == TTLKeep {
@@ -77,6 +83,7 @@ func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration)
 	return r.client.Set(ctx, fullKey, value, ttl).Err()
 }
 
+// Get retrieves the value for a key. Returns ErrKeyNotFound if not found.
 func (r *RedisKV) Get(ctx context.Context, key string) (string, error) {
 	fullKey := r.prefix + key
 	val, err := r.client.Get(ctx, fullKey).Result()
@@ -89,6 +96,7 @@ func (r *RedisKV) Get(ctx context.Context, key string) (string, error) {
 	return val, nil
 }
 
+// Delete removes a key.
 func (r *RedisKV) Delete(ctx context.Context, key string) (bool, error) {
 	fullKey := r.prefix + key
 	delCount, err := r.client.Del(ctx, fullKey).Result()
@@ -98,6 +106,7 @@ func (r *RedisKV) Delete(ctx context.Context, key string) (bool, error) {
 	return delCount > 0, nil
 }
 
+// PutIfNotExists sets the value only if the key does not exist.
 func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
 	fullKey := r.prefix + key
 	var cmd *redis.BoolCmd
@@ -119,6 +128,7 @@ func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl tim
 	return cmd.Val(), nil
 }
 
+// CompareAndSwap updates the value if it matches the old value.
 func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
 	fullKey := r.prefix + key
 
@@ -148,6 +158,7 @@ func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue st
 	return true, nil
 }
 
+// List retrieves all key-value pairs matching the prefix.
 func (r *RedisKV) List(ctx context.Context, prefix string) (map[string]string, error) {
 	fullPrefix := r.prefix + prefix
 	keys := make([]string, 0)
@@ -182,6 +193,7 @@ func (r *RedisKV) List(ctx context.Context, prefix string) (map[string]string, e
 	return result, nil
 }
 
+// ListPage retrieves paginated key-value pairs matching the prefix.
 func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
 	fullList, err := r.List(ctx, prefix)
 	if err != nil {

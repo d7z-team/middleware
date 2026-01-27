@@ -2,28 +2,32 @@ package subscribe
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"sync"
 
 	"go.etcd.io/etcd/client/v3"
 )
 
-// EtcdSubscriber 修复后的etcd订阅者实现
+// EtcdSubscriber 是基于etcd的订阅者实现
+// EtcdSubscriber is an etcd-based subscriber implementation.
 type EtcdSubscriber struct {
 	prefix   string
 	client   *clientv3.Client
 	mu       sync.RWMutex
-	watchers map[string][]*etcdWatcher // 改为切片，支持多个watcher
+	watchers map[string][]*etcdWatcher // active watchers, supporting multiple watchers per key
 	closed   bool
 }
 
+// etcdWatcher represents a single subscription watcher.
 type etcdWatcher struct {
 	cancel context.CancelFunc
 	ch     chan string
-	id     string // 唯一标识符
+	id     string // unique identifier for the watcher
 }
 
 // NewEtcdSubscriber 创建etcd订阅者
+// NewEtcdSubscriber creates a new etcd subscriber.
 func NewEtcdSubscriber(client *clientv3.Client, prefix string) *EtcdSubscriber {
 	return &EtcdSubscriber{
 		prefix:   strings.TrimSuffix(prefix, "/"),
@@ -34,6 +38,7 @@ func NewEtcdSubscriber(client *clientv3.Client, prefix string) *EtcdSubscriber {
 }
 
 // Child 创建子订阅者
+// Child creates a child subscriber with appended path.
 func (e *EtcdSubscriber) Child(paths ...string) Subscriber {
 	if len(paths) == 0 {
 		return e
@@ -70,6 +75,7 @@ func (e *EtcdSubscriber) Child(paths ...string) Subscriber {
 }
 
 // Publish 发布消息到etcd
+// Publish publishes a message to the specified key in etcd.
 func (e *EtcdSubscriber) Publish(ctx context.Context, key, data string) error {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
@@ -83,7 +89,9 @@ func (e *EtcdSubscriber) Publish(ctx context.Context, key, data string) error {
 	return err
 }
 
-func (e *EtcdSubscriber) Subscribe(_ context.Context, key string) (<-chan string, error) {
+// Subscribe subscribes to updates for the given key.
+// Returns a channel that receives value updates.
+func (e *EtcdSubscriber) Subscribe(ctx context.Context, key string) (<-chan string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -95,38 +103,41 @@ func (e *EtcdSubscriber) Subscribe(_ context.Context, key string) (<-chan string
 
 	fullKey := e.buildFullKey(key)
 
-	// 为每个订阅创建独立的watcher
+	// Create a buffered channel for the watcher
 	watchCh := make(chan string, 1000)
-	watchCtx, cancel := context.WithCancel(context.Background())
+	// Use the passed context as parent to allow external cancellation
+	watchCtx, cancel := context.WithCancel(ctx)
 
 	watcher := &etcdWatcher{
 		cancel: cancel,
 		ch:     watchCh,
-		id:     generateWatcherID(), // 生成唯一ID
+		id:     generateWatcherID(),
 	}
 
-	// 添加到watchers列表
+	// Append to the list of watchers for this key
 	e.watchers[fullKey] = append(e.watchers[fullKey], watcher)
 
-	// 启动etcd watch
+	// Start the watcher goroutine
 	go e.watchKey(watchCtx, fullKey, watchCh, watcher.id)
 
 	return watchCh, nil
 }
 
-// watchKey 监听单个etcd key的变化 - 修复：支持多个watcher
+// watchKey monitors a single etcd key for updates.
 func (e *EtcdSubscriber) watchKey(ctx context.Context, key string, outputCh chan<- string, watcherID string) {
+	// Ensure the output channel is closed when the watcher exits
+	defer close(outputCh)
+	// Ensure the watcher is removed from the map when it exits
+	defer e.cleanupWatcher(key, watcherID)
+
 	watchChan := e.client.Watch(ctx, key)
 
 	for {
 		select {
 		case <-ctx.Done():
-			// watcher被取消，清理资源
-			e.cleanupWatcher(key, watcherID)
 			return
 		case watchResp, ok := <-watchChan:
 			if !ok {
-				e.cleanupWatcher(key, watcherID)
 				return
 			}
 			if err := watchResp.Err(); err != nil {
@@ -137,12 +148,11 @@ func (e *EtcdSubscriber) watchKey(ctx context.Context, key string, outputCh chan
 				if event.Type == clientv3.EventTypePut {
 					select {
 					case outputCh <- string(event.Kv.Value):
-						// 成功发送消息
+						// Successfully sent
 					case <-ctx.Done():
-						e.cleanupWatcher(key, watcherID)
 						return
 					default:
-						// channel已满，丢弃消息
+						// Drop message if channel is full
 					}
 				}
 			}
@@ -150,7 +160,7 @@ func (e *EtcdSubscriber) watchKey(ctx context.Context, key string, outputCh chan
 	}
 }
 
-// cleanupWatcher 清理watcher资源
+// cleanupWatcher removes the watcher from the internal map.
 func (e *EtcdSubscriber) cleanupWatcher(key, watcherID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -158,10 +168,10 @@ func (e *EtcdSubscriber) cleanupWatcher(key, watcherID string) {
 	if watchers, exists := e.watchers[key]; exists {
 		for i, watcher := range watchers {
 			if watcher.id == watcherID {
-				// 从切片中移除
+				// Remove from slice
 				e.watchers[key] = append(watchers[:i], watchers[i+1:]...)
-				close(watcher.ch)
-				// 如果该key没有watcher了，删除key
+				// Channel is closed by watchKey, so we don't need to close it here
+				// If no more watchers for this key, remove the key entry
 				if len(e.watchers[key]) == 0 {
 					delete(e.watchers, key)
 				}
@@ -171,7 +181,7 @@ func (e *EtcdSubscriber) cleanupWatcher(key, watcherID string) {
 	}
 }
 
-// buildFullKey 构建完整的key
+// buildFullKey constructs the full key path.
 func (e *EtcdSubscriber) buildFullKey(key string) string {
 	key = strings.TrimPrefix(key, "/")
 	if e.prefix == "" {
@@ -181,6 +191,7 @@ func (e *EtcdSubscriber) buildFullKey(key string) string {
 }
 
 // Close 关闭etcd订阅者
+// Close closes the subscriber and cancels all active watchers.
 func (e *EtcdSubscriber) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -191,11 +202,10 @@ func (e *EtcdSubscriber) Close() error {
 
 	e.closed = true
 
-	// 关闭所有watchers
+	// Cancel all watchers
 	for key, watchers := range e.watchers {
 		for _, watcher := range watchers {
 			watcher.cancel()
-			close(watcher.ch)
 		}
 		delete(e.watchers, key)
 	}
@@ -203,7 +213,7 @@ func (e *EtcdSubscriber) Close() error {
 	return nil
 }
 
-// 生成唯一watcher ID的辅助函数
+// Helper variables for generating unique watcher IDs
 var (
 	watcherCounter uint64
 	watcherMutex   sync.Mutex
@@ -213,5 +223,5 @@ func generateWatcherID() string {
 	watcherMutex.Lock()
 	defer watcherMutex.Unlock()
 	watcherCounter++
-	return string(rune(watcherCounter))
+	return strconv.FormatUint(watcherCounter, 10)
 }

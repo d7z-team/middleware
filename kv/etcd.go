@@ -10,11 +10,13 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
+// Etcd is an etcd-based KV storage implementation.
 type Etcd struct {
 	client *clientv3.Client
-	prefix string
+	prefix string // key prefix
 }
 
+// NewEtcd creates a new etcd KV instance.
 func NewEtcd(client *clientv3.Client, prefix string) *Etcd {
 	return &Etcd{
 		client: client,
@@ -22,6 +24,7 @@ func NewEtcd(client *clientv3.Client, prefix string) *Etcd {
 	}
 }
 
+// Child creates a child KV with appended path.
 func (e *Etcd) Child(paths ...string) KV {
 	if len(paths) == 0 {
 		return e
@@ -40,6 +43,7 @@ func (e *Etcd) Child(paths ...string) KV {
 	return NewEtcd(e.client, e.prefix+strings.Join(keys, "/")+"/")
 }
 
+// Count counts the number of keys matching the prefix.
 func (e *Etcd) Count(ctx context.Context) (int64, error) {
 	resp, err := e.client.Get(ctx, e.prefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
 	if err != nil {
@@ -79,6 +83,7 @@ func (e *Etcd) extractKey(fullKey string) string {
 	return strings.TrimPrefix(fullKey, e.prefix)
 }
 
+// Put stores a key-value pair. If ttl is not TTLKeep, it sets a lease.
 func (e *Etcd) Put(ctx context.Context, key, value string, ttl time.Duration) error {
 	fullKey, err := e.buildKey(key)
 	if err != nil {
@@ -111,6 +116,7 @@ func (e *Etcd) Put(ctx context.Context, key, value string, ttl time.Duration) er
 	return nil
 }
 
+// Get retrieves the value for a key. Returns ErrKeyNotFound if not found.
 func (e *Etcd) Get(ctx context.Context, key string) (string, error) {
 	fullKey, err := e.buildKey(key)
 	if err != nil {
@@ -129,6 +135,7 @@ func (e *Etcd) Get(ctx context.Context, key string) (string, error) {
 	return string(resp.Kvs[0].Value), nil
 }
 
+// Delete removes a key.
 func (e *Etcd) Delete(ctx context.Context, key string) (bool, error) {
 	fullKey, err := e.buildKey(key)
 	if err != nil {
@@ -142,6 +149,7 @@ func (e *Etcd) Delete(ctx context.Context, key string) (bool, error) {
 	return r.Deleted > 0, nil
 }
 
+// PutIfNotExists sets the value only if the key does not exist.
 func (e *Etcd) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
 	fullKey, err := e.buildKey(key)
 	if err != nil {
@@ -173,6 +181,7 @@ func (e *Etcd) PutIfNotExists(ctx context.Context, key, value string, ttl time.D
 	return txnResp.Succeeded, nil
 }
 
+// CompareAndSwap updates the value if it matches the old value.
 func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
 	fullKey, err := e.buildKey(key)
 	if err != nil {
@@ -206,6 +215,7 @@ func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue strin
 	return false, nil
 }
 
+// CursorList implements cursor-based pagination.
 func (e *Etcd) CursorList(ctx context.Context, options *ListOptions) (*ListResponse, error) {
 	opts := &ListOptions{}
 	if options != nil {
