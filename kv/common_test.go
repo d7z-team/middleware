@@ -3,7 +3,9 @@ package kv
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,341 +16,545 @@ import (
 	"gopkg.d7z.net/middleware/connects"
 )
 
-func assertNoDuplicates(t *testing.T, items []string) {
-	t.Helper()
-	seen := make(map[string]bool)
-	for _, item := range items {
-		if seen[item] {
-			t.Errorf("发现重复项: %s", item)
-		}
-		seen[item] = true
-	}
-}
-
-// 通用测试套件：所有 KV 实现必须通过此测试
+// testKVConsistency is the abstract test suite that all KV implementations must pass.
 func testKVConsistency(t *testing.T, kvClient KV) {
 	t.Helper()
 	ctx := t.Context()
-	// 唯一前缀：避免测试污染（每次运行生成不同前缀）
-	uniquePrefix := "kv_test_" + time.Now().Format("20060102150405.999") + "_"
+	// Unique prefix to avoid collisions between test runs
+	uniquePrefix := "kv_test_" + time.Now().Format("20060102150405.000") + "_"
 
-	// ########################### 测试用例 ###########################
-	if kvClient, ok := kvClient.(PagedKV); ok {
-		// 6. 测试 List（按前缀列出所有键值对）
-		t.Run("List", func(t *testing.T) {
-			prefix := uniquePrefix + "list_"
+	// Basic Operations
+	t.Run("Basic_Operations", func(t *testing.T) {
+		key := uniquePrefix + "basic"
+		val := "value_basic"
 
-			// 存入 3 个带前缀的键 + 1 个不带前缀的键
-			testKeys := map[string]string{
-				prefix + "a":               "a_val",
-				prefix + "b":               "b_val",
-				prefix + "sub" + "|" + "c": "c_val",  // 子层级键
-				uniquePrefix + "no_list":   "no_val", // 无前缀键
-			}
-			for k, v := range testKeys {
-				_ = kvClient.Put(ctx, k, v, TTLKeep)
-			}
+		// Put
+		err := kvClient.Put(ctx, key, val, TTLKeep)
+		assert.NoError(t, err)
 
-			// 列出前缀下的键
-			result, err := kvClient.List(ctx, prefix)
-			assert.NoError(t, err)
-			assert.Len(t, result, 3, "应返回 3 个带前缀的键")
-			assert.Equal(t, "a_val", result[prefix+"a"])
-			assert.Equal(t, "c_val", result[prefix+"sub"+"|"+"c"])
-			assert.NotContains(t, result, uniquePrefix+"no_list", "不应包含无前缀键")
-		})
-	}
+		// Get
+		got, err := kvClient.Get(ctx, key)
+		assert.NoError(t, err)
+		assert.Equal(t, val, got)
 
-	// 2. 测试 Put + Get（正常存入/获取、不存在键获取）
-	t.Run("PutAndGet", func(t *testing.T) {
-		key := uniquePrefix + "put_get_key"
-		value := "test_value_123"
-
-		// 存入键值对
-		err := kvClient.Put(ctx, key, value, TTLKeep)
-		assert.NoError(t, err, "Put 不应返回错误")
-
-		// 获取存在的键
-		getVal, err := kvClient.Get(ctx, key)
-		assert.NoError(t, err, "Get 存在的键不应返回错误")
-		assert.Equal(t, value, getVal, "获取的值应与存入的值一致")
-
-		// 获取不存在的键
-		nonExistentKey := uniquePrefix + "non_exist_key"
-		getVal, err = kvClient.Get(ctx, nonExistentKey)
-		assert.ErrorIs(t, err, ErrKeyNotFound, "获取不存在的键应返回 ErrKeyNotFound")
-		assert.Empty(t, getVal, "不存在的键返回值应为空")
-	})
-
-	// 3. 测试 Delete（删除存在/不存在的键）
-	t.Run("Delete", func(t *testing.T) {
-		key := uniquePrefix + "delete_key"
-		_ = kvClient.Put(ctx, key, "delete_val", TTLKeep)
-
-		// 删除存在的键
+		// Delete
 		deleted, err := kvClient.Delete(ctx, key)
-		assert.NoError(t, err)
-		assert.True(t, deleted, "删除存在的键应返回 true")
-		_, err = kvClient.Get(ctx, key)
-		assert.ErrorIs(t, err, ErrKeyNotFound)
-
-		// 删除不存在的键
-		deleted, err = kvClient.Delete(ctx, key)
-		assert.NoError(t, err)
-		assert.False(t, deleted, "删除不存在的键应返回 false")
-	})
-
-	// 4. 测试 PutIfNotExists（键不存在时存入、存在时不覆盖）
-	t.Run("PutIfNotExists", func(t *testing.T) {
-		key := uniquePrefix + "pin_key"
-		val1 := "val1"
-		val2 := "val2"
-
-		// 键不存在：存入成功
-		ok, err := kvClient.PutIfNotExists(ctx, key, val1, TTLKeep)
-		assert.NoError(t, err)
-		assert.True(t, ok)
-		getVal, _ := kvClient.Get(ctx, key)
-		assert.Equal(t, val1, getVal)
-
-		// 键已存在：存入失败（值不覆盖）
-		ok, err = kvClient.PutIfNotExists(ctx, key, val2, TTLKeep)
-		assert.NoError(t, err)
-		assert.False(t, ok)
-		getVal, _ = kvClient.Get(ctx, key)
-		assert.Equal(t, val1, getVal)
-	})
-
-	// 5. 测试 CompareAndSwap（原子CAS操作）
-	t.Run("CompareAndSwap", func(t *testing.T) {
-		key := uniquePrefix + "cas_key"
-		oldVal := "old"
-		newVal := "new"
-		wrongOldVal := "wrong_old"
-
-		_ = kvClient.Put(ctx, key, oldVal, TTLKeep)
-
-		// 旧值匹配：CAS成功
-		ok, err := kvClient.CompareAndSwap(ctx, key, oldVal, newVal)
-		assert.NoError(t, err)
-		assert.True(t, ok)
-		getVal, _ := kvClient.Get(ctx, key)
-		assert.Equal(t, newVal, getVal)
-
-		// 旧值不匹配：CAS失败
-		ok, err = kvClient.CompareAndSwap(ctx, key, wrongOldVal, "fail")
-		assert.NoError(t, err)
-		assert.False(t, ok)
-		getVal, _ = kvClient.Get(ctx, key)
-		assert.Equal(t, newVal, getVal)
-
-		// 键不存在：CAS失败
-		nonExistentKey := uniquePrefix + "cas_non_exist"
-		ok, err = kvClient.CompareAndSwap(ctx, nonExistentKey, oldVal, newVal)
-		assert.Error(t, err)
-		assert.False(t, ok)
-	})
-
-	// 7. 测试 ListPage（分页查询）
-	if kvClient, ok := kvClient.(PagedKV); ok {
-		t.Run("ListPage", func(t *testing.T) {
-			prefix := uniquePrefix + "page_"
-			pageSize := uint(2)
-			// 存入 4 个有序键（假设实现按字典序排序）
-			keys := []struct {
-				key   string
-				value string
-			}{
-				{prefix + "1", "v1"},
-				{prefix + "2", "v2"},
-				{prefix + "3", "v3"},
-				{prefix + "4", "v4"},
-			}
-			for _, kv := range keys {
-				_ = kvClient.Put(ctx, kv.key, kv.value, TTLKeep)
-			}
-
-			// 第 0 页（假设 pageIndex 从 0 开始）
-			page0, err := kvClient.ListPage(ctx, prefix, 0, pageSize)
-			assert.NoError(t, err)
-			assert.Len(t, page0, 2)
-			assert.Equal(t, "v1", page0[keys[0].key])
-			assert.Equal(t, "v2", page0[keys[1].key])
-
-			// 第 1 页
-			page1, err := kvClient.ListPage(ctx, prefix, 1, pageSize)
-			assert.NoError(t, err)
-			assert.Len(t, page1, 2)
-			assert.Equal(t, "v3", page1[keys[2].key])
-			assert.Equal(t, "v4", page1[keys[3].key])
-
-			// 第 2 页（超出范围）
-			page2, err := kvClient.ListPage(ctx, prefix, 2, pageSize)
-			assert.NoError(t, err)
-			assert.Empty(t, page2, "超出范围的页应返回空")
-		})
-	}
-	// 8. 测试 TTL（过期键自动删除、永久键存活）
-	// 在测试TTL部分，增加等待时间和重试
-	t.Run("TTL", func(t *testing.T) {
-		// 带 TTL 的键（1秒过期）
-		ttlKey := uniquePrefix + "ttl_key"
-		err := kvClient.Put(ctx, ttlKey, "ttl_val", 1*time.Second)
-		assert.NoError(t, err)
-
-		// 立即获取（未过期）
-		getVal, err := kvClient.Get(ctx, ttlKey)
-		assert.NoError(t, err)
-		assert.Equal(t, "ttl_val", getVal)
-
-		// 等待过期（增加到2秒，确保etcd有足够时间清理）
-		time.Sleep(2 * time.Second)
-
-		// 使用重试机制，因为etcd的租约检查可能有延迟
-		var lastErr error
-		for i := 0; i < 5; i++ {
-			_, lastErr = kvClient.Get(ctx, ttlKey)
-			if errors.Is(lastErr, ErrKeyNotFound) {
-				break
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-		assert.ErrorIs(t, lastErr, ErrKeyNotFound, "key should be expired and deleted")
-
-		// 永久键（TTLKeep = -1）
-		keepKey := uniquePrefix + "keep_key"
-		err = kvClient.Put(ctx, keepKey, "keep_val", TTLKeep)
-		assert.NoError(t, err)
-
-		// 等待 0.5 秒后获取
-		time.Sleep(500 * time.Millisecond)
-		getVal, err = kvClient.Get(ctx, keepKey)
-		assert.NoError(t, err)
-		assert.Equal(t, "keep_val", getVal)
-	})
-	// 9. 测试 Count 方法
-	t.Run("Count", func(t *testing.T) {
-		prefix := uniquePrefix + "count_"
-		childKV := kvClient.Child(prefix)
-
-		// 初始数量应为 0
-		count, err := childKV.Count(ctx)
-		assert.NoError(t, err)
-		assert.Equal(t, int64(0), count)
-
-		// 添加 3 个键
-		testKeys := []string{"key1", "key2", "key3"}
-		for i, key := range testKeys {
-			err = childKV.Put(ctx, key, "value"+string(rune('a'+i)), TTLKeep)
-			assert.NoError(t, err)
-
-			// 每次添加后验证数量
-			count, err = childKV.Count(ctx)
-			assert.NoError(t, err)
-			assert.Equal(t, int64(i+1), count)
-		}
-
-		// 最终应该是 3 个键
-		count, err = childKV.Count(ctx)
-		assert.NoError(t, err)
-		assert.Equal(t, int64(3), count)
-
-		// 删除一个键，数量应该减少
-		deleted, err := childKV.Delete(ctx, "key2")
 		assert.NoError(t, err)
 		assert.True(t, deleted)
 
-		count, err = childKV.Count(ctx)
+		// Get after Delete
+		_, err = kvClient.Get(ctx, key)
+		assert.ErrorIs(t, err, ErrKeyNotFound)
+
+		// Delete non-existent
+		deleted, err = kvClient.Delete(ctx, key)
 		assert.NoError(t, err)
-		assert.Equal(t, int64(2), count)
+		assert.False(t, deleted)
+	})
 
-		// 测试不存在的键的 Count
-		emptyKV := kvClient.Child("nonexistent")
-		emptyCount, err := emptyKV.Count(ctx)
+	// Boundary Conditions
+	t.Run("Boundary_Conditions", func(t *testing.T) {
+		// Empty Value
+		keyEmptyVal := uniquePrefix + "empty_val"
+		err := kvClient.Put(ctx, keyEmptyVal, "", TTLKeep)
 		assert.NoError(t, err)
-		assert.Equal(t, int64(0), emptyCount)
-	})
-}
+		got, err := kvClient.Get(ctx, keyEmptyVal)
+		assert.NoError(t, err)
+		assert.Equal(t, "", got)
 
-// ########################### 具体实现测试 ###########################
-
-// TestMemoryKV 测试内存实现（两种 Scheme：memory / storage）
-func TestMemoryKV(t *testing.T) {
-	// 测试 memory scheme（纯内存，不持久化）
-	t.Run("memory-scheme-1", func(t *testing.T) {
-		memKV, err := NewMemory("")
-		require.NoError(t, err, "创建内存 KV 失败")
-		testKVConsistency(t, memKV)
-	})
-	t.Run("memory-scheme-2", func(t *testing.T) {
-		fromURL, err := NewKVFromURL("memory://")
-		require.NoError(t, err, "创建内存 KV 失败")
-		testKVConsistency(t, fromURL)
-	})
-
-	// 测试 storage scheme（持久化到本地文件）
-	t.Run("storage-scheme", func(t *testing.T) {
-		tempDir := t.TempDir() // 临时目录，测试后自动清理
-		storageKV, err := NewMemory(filepath.Join(tempDir, "1.json"))
-		require.NoError(t, err, "创建本地存储 KV 失败")
-		testKVConsistency(t, storageKV)
-	})
-	// 测试 storage scheme（持久化到本地文件）
-	t.Run("storage-scheme-child", func(t *testing.T) {
-		tempDir := t.TempDir() // 临时目录，测试后自动清理
-		storageKV, err := NewMemory(filepath.Join(tempDir, "1.json"))
-		require.NoError(t, err, "创建本地存储 KV 失败")
-		testKVConsistency(t, storageKV.Child("child/v1/data"))
-	})
-}
-
-// TestRedisKV 测试 Redis 实现（需本地 Redis 服务）
-func TestRedisKV(t *testing.T) {
-	// 可选：跳过无 Redis 环境的测试
-
-	// 1. 连接本地 Redis（默认配置）
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
-		Password: "", // 无密码
-		DB:       0,  // 默认数据库
-	})
-	ctx := context.Background()
-	err := redisClient.Ping(ctx).Err()
-	if err != nil {
-		t.Skip("如需测试 Redis 实现，请确保本地 Redis 运行")
-	}
-	defer redisClient.Close()
-
-	// 2. 创建 Redis KV 实例（需实现 NewRedis 函数）
-	redisKV := NewRedis(redisClient, "kv_test_")
-
-	// 3. 运行一致性测试
-	testKVConsistency(t, redisKV)
-}
-
-// TestRedisKV 测试 Redis 实现（需本地 Redis 服务）
-func TestEtcdKV(t *testing.T) {
-	parse, _ := url.Parse("etcd://127.0.0.1:2379")
-
-	etcd, err := connects.NewEtcd(parse)
-	if err != nil {
-		t.Skip("如需测试 etcd 实现，请确保本地 etcd 运行")
-	}
-	defer etcd.Close()
-
-	etcdKv := NewEtcd(etcd, "kv_test/")
-	require.NoError(t, err, "创建 ETCD KV 失败")
-
-	testKVConsistency(t, etcdKv)
-	t.Run("TestEtcdKVChild", func(t *testing.T) {
-		parse, _ := url.Parse("etcd://127.0.0.1:2379")
-
-		etcd, err := connects.NewEtcd(parse)
-		if err != nil {
-			t.Skip("如需测试 etcd 实现，请确保本地 etcd 运行")
+		// Keys with special characters
+		// Note: We expect all implementations to handle these (including slashes)
+		specialKeys := map[string]string{
+			uniquePrefix + "space key":   "space",
+			uniquePrefix + "dash-key":    "dash",
+			uniquePrefix + "under_score": "underscore",
+			uniquePrefix + "slash/key":   "slash", // Hierarchy implied
+			uniquePrefix + "中文key":       "unicode",
+			uniquePrefix + "dot.key":     "dot",
+			uniquePrefix + "eq=key":      "equal",
 		}
-		etcdKv := NewEtcd(etcd, "kv_test/")
-		child := etcdKv.Child("test/child/data")
-		testKVConsistency(t, child)
+
+		for k, v := range specialKeys {
+			err := kvClient.Put(ctx, k, v, TTLKeep)
+			assert.NoError(t, err, "Put failed for key: %s", k)
+			got, err := kvClient.Get(ctx, k)
+			assert.NoError(t, err, "Get failed for key: %s", k)
+			assert.Equal(t, v, got)
+		}
 	})
+
+	// TTL Handling
+	t.Run("TTL_Handling", func(t *testing.T) {
+		key := uniquePrefix + "ttl_short"
+		// 1 second TTL
+		err := kvClient.Put(ctx, key, "ttl_val", 1*time.Second)
+		assert.NoError(t, err)
+
+		// Should exist immediately
+		_, err = kvClient.Get(ctx, key)
+		assert.NoError(t, err)
+
+		// Wait for expiration (allow some buffer)
+		assert.Eventually(t, func() bool {
+			_, err := kvClient.Get(ctx, key)
+			return errors.Is(err, ErrKeyNotFound)
+		}, 3*time.Second, 200*time.Millisecond, "Key should expire")
+
+		// Test TTLKeep
+		keyKeep := uniquePrefix + "ttl_keep"
+		// Set with 2s TTL
+		err = kvClient.Put(ctx, keyKeep, "val1", 2*time.Second)
+		assert.NoError(t, err)
+
+		// Update value with TTLKeep (should preserve ~2s TTL)
+		err = kvClient.Put(ctx, keyKeep, "val2", TTLKeep)
+		assert.NoError(t, err)
+
+		got, err := kvClient.Get(ctx, keyKeep)
+		assert.NoError(t, err)
+		assert.Equal(t, "val2", got)
+
+		// Wait for it to expire
+		assert.Eventually(t, func() bool {
+			_, err := kvClient.Get(ctx, keyKeep)
+			return errors.Is(err, ErrKeyNotFound)
+		}, 3*time.Second, 200*time.Millisecond, "Key should expire after original TTL")
+
+		// Test TTLKeep on New Key (should be permanent or default)
+		keyNewKeep := uniquePrefix + "ttl_new_keep"
+		err = kvClient.Put(ctx, keyNewKeep, "val_new_keep", TTLKeep)
+		assert.NoError(t, err)
+		got, err = kvClient.Get(ctx, keyNewKeep)
+		assert.NoError(t, err)
+		assert.Equal(t, "val_new_keep", got)
+	})
+
+	// Put If Not Exists
+	t.Run("Put_If_Not_Exists", func(t *testing.T) {
+		key := uniquePrefix + "nx_key"
+		val1 := "v1"
+		val2 := "v2"
+
+		// Success
+		ok, err := kvClient.PutIfNotExists(ctx, key, val1, TTLKeep)
+		assert.NoError(t, err)
+		assert.True(t, ok)
+
+		got, err := kvClient.Get(ctx, key)
+		assert.NoError(t, err)
+		assert.Equal(t, val1, got)
+
+		// Failure (already exists)
+		ok, err = kvClient.PutIfNotExists(ctx, key, val2, TTLKeep)
+		assert.NoError(t, err)
+		assert.False(t, ok)
+
+		got, err = kvClient.Get(ctx, key)
+		assert.NoError(t, err)
+		assert.Equal(t, val1, got) // Should not change
+	})
+
+	// Compare And Swap
+	t.Run("Compare_And_Swap", func(t *testing.T) {
+		key := uniquePrefix + "cas_key"
+		_ = kvClient.Put(ctx, key, "old", TTLKeep)
+
+		// Success
+		ok, err := kvClient.CompareAndSwap(ctx, key, "old", "new")
+		assert.NoError(t, err)
+		assert.True(t, ok)
+		got, _ := kvClient.Get(ctx, key)
+		assert.Equal(t, "new", got)
+
+		// Failure (value mismatch)
+		ok, err = kvClient.CompareAndSwap(ctx, key, "wrong", "fail")
+		assert.NoError(t, err)
+		assert.False(t, ok)
+		got, _ = kvClient.Get(ctx, key)
+		assert.Equal(t, "new", got)
+
+		// Failure (key not found)
+		ok, err = kvClient.CompareAndSwap(ctx, uniquePrefix+"missing", "any", "val")
+		assert.Error(t, err)
+		assert.True(t, errors.Is(err, ErrKeyNotFound) || errors.Is(err, os.ErrNotExist), "Should return KeyNotFound error")
+	})
+
+	// Child & Hierarchy Isolation
+	t.Run("Child_And_Hierarchy_Isolation", func(t *testing.T) {
+		// Parent: uniquePrefix
+		// Child: uniquePrefix + "sub/"
+		child := kvClient.Child(uniquePrefix + "sub")
+
+		// Put in child
+		err := child.Put(ctx, "key", "child_val", TTLKeep)
+		assert.NoError(t, err)
+
+		// Get from child
+		got, err := child.Get(ctx, "key")
+		assert.NoError(t, err)
+		assert.Equal(t, "child_val", got)
+
+		// Let's test relative usage which is cleaner.
+		subKV := kvClient.Child(uniquePrefix + "child")
+		err = subKV.Put(ctx, "a", "val_a", TTLKeep)
+		assert.NoError(t, err)
+
+		// We Put `uniquePrefix + "child/direct_put"` into kvClient.
+		directKey := uniquePrefix + "child/direct_put"
+		err = kvClient.Put(ctx, directKey, "direct_val", TTLKeep)
+		assert.NoError(t, err)
+
+		// Create child for that path
+		cKV := kvClient.Child(uniquePrefix + "child")
+		// Should be able to get "direct_put"
+		got, err = cKV.Get(ctx, "direct_put")
+		assert.NoError(t, err)
+		assert.Equal(t, "direct_val", got)
+	})
+
+	// Offset-based Pagination
+	t.Run("Offset_Pagination", func(t *testing.T) {
+		prefix := uniquePrefix + "paged_"
+		// Insert 15 items: 01, 02, ..., 15
+		for i := 1; i <= 15; i++ {
+			k := fmt.Sprintf("%s%02d", prefix, i)
+			_ = kvClient.Put(ctx, k, fmt.Sprintf("val_%02d", i), TTLKeep)
+		}
+
+		// Test List (All)
+		all, err := kvClient.List(ctx, prefix)
+		assert.NoError(t, err)
+		assert.Len(t, all, 15)
+		assert.Equal(t, "val_01", all[prefix+"01"])
+
+		// Test ListPage
+		// Page 1 (size 10) -> 1-10
+		page1, err := kvClient.ListPage(ctx, prefix, 0, 10)
+		assert.NoError(t, err)
+		assert.Len(t, page1, 10)
+		// Verify order (assuming lexicographical)
+		// keys: 01, 02 ... 10
+		_, ok01 := page1[prefix+"01"]
+		assert.True(t, ok01)
+		_, ok10 := page1[prefix+"10"]
+		assert.True(t, ok10)
+
+		// Page 2 (size 10) -> 11-15
+		page2, err := kvClient.ListPage(ctx, prefix, 1, 10)
+		assert.NoError(t, err)
+		assert.Len(t, page2, 5)
+		_, ok11 := page2[prefix+"11"]
+		assert.True(t, ok11)
+
+		// Page 3 (size 10) -> Empty
+		page3, err := kvClient.ListPage(ctx, prefix, 2, 10)
+		assert.NoError(t, err)
+		assert.Empty(t, page3)
+	})
+
+	// Cursor-based Pagination
+	t.Run("Cursor_Pagination", func(t *testing.T) {
+		// Insert 5 items: a, b, c, d, e
+		keys := []string{"a", "b", "c", "d", "e"}
+
+		// Clean up and re-insert using Child
+		child := kvClient.Child(uniquePrefix + "cursor") // .../cursor/
+
+		for _, k := range keys {
+			_ = child.Put(ctx, k, "val_"+k, TTLKeep)
+		}
+
+		// 1. Get first 2
+		opts := &ListOptions{
+			Limit: 2,
+		}
+
+		// First page
+		resp, err := child.CursorList(ctx, opts)
+		assert.NoError(t, err)
+		assert.Len(t, resp.Keys, 2)
+		assert.Equal(t, "a", resp.Keys[0])
+		assert.Equal(t, "b", resp.Keys[1])
+		assert.True(t, resp.HasMore)
+		assert.NotEmpty(t, resp.Cursor)
+		// Cursor should be "b" (last key)
+		assert.Equal(t, "b", resp.Cursor)
+
+		// Second page
+		opts.Cursor = resp.Cursor
+		resp2, err := child.CursorList(ctx, opts)
+		assert.NoError(t, err)
+		assert.Len(t, resp2.Keys, 2)
+		assert.Equal(t, "c", resp2.Keys[0])
+		assert.Equal(t, "d", resp2.Keys[1])
+		assert.True(t, resp2.HasMore)
+
+		// Third page (last item)
+		opts.Cursor = resp2.Cursor
+		resp3, err := child.CursorList(ctx, opts)
+		assert.NoError(t, err)
+		assert.Len(t, resp3.Keys, 1)
+		assert.Equal(t, "e", resp3.Keys[0])
+
+		// Fourth page (empty)
+		if resp3.HasMore {
+			opts.Cursor = resp3.Cursor
+			resp4, err := child.CursorList(ctx, opts)
+			assert.NoError(t, err)
+			assert.Empty(t, resp4.Keys)
+		}
+	})
+
+	// Key Count Verification
+	t.Run("Key_Count_Verification", func(t *testing.T) {
+		prefix := uniquePrefix + "count_root"
+		child := kvClient.Child(prefix)
+
+		// 0 count
+		c, err := child.Count(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(0), c)
+
+		// Add items
+		_ = child.Put(ctx, "k1", "v", TTLKeep)
+		_ = child.Put(ctx, "k2", "v", TTLKeep)
+		_ = child.Put(ctx, "sub/k3", "v", TTLKeep) // Recursive count check
+
+		c, err = child.Count(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(3), c)
+	})
+
+	// Complex Hierarchy and Pagination
+	t.Run("Hierarchy_And_Pagination_Scenarios", func(t *testing.T) {
+		// Use a sub-namespace for this test
+		// prefix/hierarchy/
+		hPrefix := uniquePrefix + "hierarchy"
+		hKV := kvClient.Child(hPrefix)
+
+		// Data:
+		// a, a/c1, a/c2, b
+		keys := []string{"a", "a/c1", "a/c2", "b"}
+		for _, k := range keys {
+			err := hKV.Put(ctx, k, "val_"+k, TTLKeep)
+			require.NoError(t, err)
+		}
+
+		// 2. 验证父级分页 (CursorList)
+		t.Run("Parent_Pagination", func(t *testing.T) {
+			opts := &ListOptions{Limit: 1}
+
+			// Page 1 -> "a"
+			resp1, err := hKV.CursorList(ctx, opts)
+			require.NoError(t, err)
+			require.Len(t, resp1.Keys, 1)
+			assert.Equal(t, "a", resp1.Keys[0])
+			assert.True(t, resp1.HasMore)
+			assert.Equal(t, "a", resp1.Cursor)
+
+			// Page 2 -> "a/c1"
+			opts.Cursor = resp1.Cursor
+			resp2, err := hKV.CursorList(ctx, opts)
+			require.NoError(t, err)
+			require.Len(t, resp2.Keys, 1)
+			assert.Equal(t, "a/c1", resp2.Keys[0])
+			assert.True(t, resp2.HasMore)
+
+			// Page 3 -> "a/c2"
+			opts.Cursor = resp2.Cursor
+			resp3, err := hKV.CursorList(ctx, opts)
+			require.NoError(t, err)
+			require.Len(t, resp3.Keys, 1)
+			assert.Equal(t, "a/c2", resp3.Keys[0])
+
+			// Page 4 -> "b"
+			opts.Cursor = resp3.Cursor
+			resp4, err := hKV.CursorList(ctx, opts)
+			require.NoError(t, err)
+			require.Len(t, resp4.Keys, 1)
+			assert.Equal(t, "b", resp4.Keys[0])
+			assert.False(t, resp4.HasMore)
+			assert.Empty(t, resp4.Cursor)
+		})
+
+		// 3. 验证 Child 视图
+		t.Run("Child_View", func(t *testing.T) {
+			childKV := hKV.Child("a")
+
+			list, err := childKV.List(ctx, "")
+			require.NoError(t, err)
+			assert.Len(t, list, 2)
+			assert.Contains(t, list, "c1")
+			assert.Contains(t, list, "c2")
+
+			_, exists := list[""]
+			assert.False(t, exists, "Should not see parent key 'a' in child view 'a/'")
+
+			val, err := childKV.Get(ctx, "c1")
+			require.NoError(t, err)
+			assert.Equal(t, "val_a/c1", val)
+		})
+
+		// 4. 验证 Child 写入的互通性
+		t.Run("Child_Interoperability", func(t *testing.T) {
+			childKV := hKV.Child("a")
+			err := childKV.Put(ctx, "c3", "val_child_put", TTLKeep)
+			require.NoError(t, err)
+
+			val, err := hKV.Get(ctx, "a/c3")
+			require.NoError(t, err)
+			assert.Equal(t, "val_child_put", val)
+		})
+
+		// 5. 验证多级 Child ("a/b")
+		t.Run("Multi_Level_Child", func(t *testing.T) {
+			childMulti := hKV.Child("x/y")
+			err := childMulti.Put(ctx, "key", "val_multi", TTLKeep)
+			require.NoError(t, err)
+
+			childStep := hKV.Child("x", "y")
+			val, err := childStep.Get(ctx, "key")
+			require.NoError(t, err)
+			assert.Equal(t, "val_multi", val)
+
+			valParent, err := hKV.Get(ctx, "x/y/key")
+			require.NoError(t, err)
+			assert.Equal(t, "val_multi", valParent)
+
+			childChained := hKV.Child("x").Child("y")
+			valChain, err := childChained.Get(ctx, "key")
+			require.NoError(t, err)
+			assert.Equal(t, "val_multi", valChain)
+		})
+	})
+}
+
+func TestNewKVFromURL(t *testing.T) {
+	// 1. Memory
+	t.Run("Memory", func(t *testing.T) {
+		kv, err := NewKVFromURL("memory://")
+		require.NoError(t, err)
+		require.NotNil(t, kv)
+		require.NoError(t, kv.Close())
+
+		kv2, err := NewKVFromURL("mem://")
+		require.NoError(t, err)
+		require.NotNil(t, kv2)
+		require.NoError(t, kv2.Close())
+	})
+
+	// 2. Storage/Local
+	t.Run("Storage", func(t *testing.T) {
+		tmp := t.TempDir()
+		path := filepath.Join(tmp, "kv.json")
+
+		// storage://path
+		// URL parsing might be tricky with absolute paths.
+		// Usually: storage:///tmp/kv.json (3 slashes for local file on unix)
+		// Or relative: storage://./kv.json
+		// Implementation uses parse.Path.
+
+		kv, err := NewKVFromURL("storage://" + path)
+		require.NoError(t, err)
+		require.NotNil(t, kv)
+		require.NoError(t, kv.Close()) // Syncs
+
+		kv2, err := NewKVFromURL("local://" + path)
+		require.NoError(t, err)
+		require.NotNil(t, kv2)
+		require.NoError(t, kv2.Close())
+	})
+
+	// 3. Etcd (Mock/Check)
+	t.Run("Etcd", func(t *testing.T) {
+		// Just check if it attempts connection or validates URL
+		// We expect error if etcd is not running on random port, or success if it connects.
+		// "etcd://127.0.0.1:2379" might work if local etcd is up.
+		kv, err := NewKVFromURL("etcd://127.0.0.1:2379?prefix=test")
+		// If local etcd is up, err is nil. If not, err might be nil but ops fail, OR NewEtcd fails on Dial?
+		// NewEtcd uses Dial which is non-blocking usually unless configured otherwise.
+		// connects.NewEtcd might wait.
+		if err == nil {
+			assert.NotNil(t, kv)
+			_ = kv.Close()
+		}
+	})
+
+	// 4. Redis (Mock/Check)
+	t.Run("Redis", func(t *testing.T) {
+		kv, err := NewKVFromURL("redis://localhost:6379/0?prefix=test")
+		if err == nil {
+			assert.NotNil(t, kv)
+			_ = kv.Close()
+		}
+	})
+
+	// 5. Invalid
+	t.Run("Invalid", func(t *testing.T) {
+		_, err := NewKVFromURL("unknown://")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported scheme")
+
+		_, err = NewKVFromURL(":%") // Invalid URL
+		require.Error(t, err)
+	})
+}
+
+// ########################### Implementation Tests ###########################
+
+func TestMemoryKV(t *testing.T) {
+	// 1. Pure Memory
+	t.Run("Memory", func(t *testing.T) {
+		kv, err := NewMemory("")
+		require.NoError(t, err)
+		testKVConsistency(t, kv)
+	})
+
+	// 2. File Persistence
+	t.Run("FileStorage", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		storePath := filepath.Join(tmpDir, "kv.json")
+		kv, err := NewMemory(storePath)
+		require.NoError(t, err)
+
+		testKVConsistency(t, kv)
+
+		// Verify persistence
+		key := "persist_key"
+		val := "persist_val"
+		_ = kv.Put(context.Background(), key, val, TTLKeep)
+		_ = kv.Sync()
+
+		// Re-open
+		kv2, err := NewMemory(storePath)
+		require.NoError(t, err)
+		got, err := kv2.Get(context.Background(), key)
+		assert.NoError(t, err)
+		assert.Equal(t, val, got)
+	})
+}
+
+func TestRedisKV(t *testing.T) {
+	// Ensure local Redis is available or skip
+	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	if err := client.Ping(context.Background()).Err(); err != nil {
+		t.Skipf("Redis not available: %v", err)
+	}
+	defer client.Close()
+
+	kv := NewRedis(client, "test_kv_redis/")
+	testKVConsistency(t, kv)
+}
+
+func TestEtcdKV(t *testing.T) {
+	// Ensure local Etcd is available or skip
+	u, _ := url.Parse("etcd://127.0.0.1:2379")
+	etcdClient, err := connects.NewEtcd(u)
+	if err != nil {
+		t.Skipf("Etcd not available: %v", err)
+	}
+	defer etcdClient.Close()
+
+	kv := NewEtcd(etcdClient, "test_kv_etcd/")
+	testKVConsistency(t, kv)
 }

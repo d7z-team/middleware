@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -45,42 +46,97 @@ func (e *Etcd) Child(paths ...string) KV {
 
 // Count counts the number of keys matching the prefix.
 func (e *Etcd) Count(ctx context.Context) (int64, error) {
-	resp, err := e.client.Get(ctx, e.prefix, clientv3.WithPrefix(), clientv3.WithKeysOnly())
+	resp, err := e.client.Get(ctx, e.prefix, clientv3.WithPrefix(), clientv3.WithCountOnly())
 	if err != nil {
 		return 0, fmt.Errorf("count keys failed: %w", err)
 	}
-	count := int64(0)
-	prefixLen := len(e.prefix)
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
-		if !strings.HasPrefix(key, e.prefix) {
-			continue
-		}
-		relativeKey := key[prefixLen:]
-		if !strings.Contains(relativeKey, "/") {
-			count++
-		}
-	}
-	return count, nil
-}
-
-func (e *Etcd) validateKey(key string) error {
-	if strings.Contains(key, "/") {
-		return fmt.Errorf("key cannot contain '/': %s", key)
-	}
-	return nil
+	return resp.Count, nil
 }
 
 func (e *Etcd) buildKey(key string) (string, error) {
-	if err := e.validateKey(key); err != nil {
-		return "", err
-	}
 	key = strings.TrimPrefix(key, "/")
 	return e.prefix + key, nil
 }
 
 func (e *Etcd) extractKey(fullKey string) string {
 	return strings.TrimPrefix(fullKey, e.prefix)
+}
+
+// List returns all key-value pairs matching the prefix.
+func (e *Etcd) List(ctx context.Context, prefix string) (map[string]string, error) {
+	fullPrefix := e.prefix + prefix
+	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, fmt.Errorf("list keys failed: %w", err)
+	}
+
+	result := make(map[string]string, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		// Extract relative key from the full key, removing the base prefix
+		// Note: The prefix parameter passed to List is part of the key name relative to e.prefix
+		// The requirement is usually to return keys relative to the searched prefix?
+		// Let's check Memory implementation.
+		// Memory: result[k] = v.Data (where k is relative to m.prefix).
+		// Wait, Memory.List: if m.prefix != "" { k = k[len(m.prefix):] }
+		// So it returns keys relative to the Base Prefix of the KV, NOT the list prefix.
+		// e.g. KV(prefix="root/"), List("sub") -> returns "sub/a", "sub/b".
+		relKey := e.extractKey(key)
+		result[relKey] = string(kv.Value)
+	}
+	return result, nil
+}
+
+// ListPage returns a page of key-value pairs matching the prefix.
+func (e *Etcd) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
+	// For Etcd, efficient pagination requires using the key from the previous page as a starting point (cursor).
+	// Since ListPage uses numeric index, we have to fetch all keys or use a very inefficient skip.
+	// For consistency with other implementations and the interface, we fetch all (keys only first?) then slice.
+	// But ListPage returns values too.
+	// Optimization: Fetch only keys first, determine the range, then fetch values.
+	// Or just fetch everything if dataset is small.
+	// Given typical use of ListPage implies small datasets or bad design, let's do the safe implementation:
+	// Fetch all matching keys, sort, slice.
+
+	fullPrefix := e.prefix + prefix
+	// Get all keys with prefix
+	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, fmt.Errorf("list page failed: %w", err)
+	}
+
+	// Collect and sort
+	type kvPair struct {
+		key string
+		val string
+	}
+	kvs := make([]kvPair, 0, len(resp.Kvs))
+	for _, item := range resp.Kvs {
+		kvs = append(kvs, kvPair{key: string(item.Key), val: string(item.Value)})
+	}
+
+	// Sort by key (lexicographically)
+	sort.Slice(kvs, func(i, j int) bool {
+		return kvs[i].key < kvs[j].key
+	})
+
+	start := uint64(pageSize) * pageIndex
+	end := start + uint64(pageSize)
+
+	result := make(map[string]string)
+	if start >= uint64(len(kvs)) {
+		return result, nil
+	}
+	if end > uint64(len(kvs)) {
+		end = uint64(len(kvs))
+	}
+
+	for _, item := range kvs[start:end] {
+		relKey := e.extractKey(item.key)
+		result[relKey] = item.val
+	}
+
+	return result, nil
 }
 
 // Put stores a key-value pair. If ttl is not TTLKeep, it sets a lease.
@@ -90,24 +146,32 @@ func (e *Etcd) Put(ctx context.Context, key, value string, ttl time.Duration) er
 		return err
 	}
 
-	var opts []clientv3.OpOption
-
-	if ttl != TTLKeep {
-		ttlSeconds := int64(ttl / time.Second)
-		if ttlSeconds < 1 {
-			ttlSeconds = 1
-		}
-		resp, err := e.client.Grant(ctx, ttlSeconds)
+	if ttl == TTLKeep {
+		cmp := clientv3.Compare(clientv3.Version(fullKey), ">", 0)
+		opPutKeep := clientv3.OpPut(fullKey, value, clientv3.WithIgnoreLease())
+		opPutNew := clientv3.OpPut(fullKey, value)
+		_, err := e.client.Txn(ctx).If(cmp).Then(opPutKeep).Else(opPutNew).Commit()
 		if err != nil {
-			return fmt.Errorf("create lease failed: %w", err)
+			return fmt.Errorf("put key %s failed (ttl=keep): %w", fullKey, err)
 		}
-		defer func() {
-			if err != nil {
-				_, _ = e.client.Revoke(context.Background(), resp.ID)
-			}
-		}()
-		opts = append(opts, clientv3.WithLease(resp.ID))
+		return nil
 	}
+
+	var opts []clientv3.OpOption
+	ttlSeconds := int64(ttl / time.Second)
+	if ttlSeconds < 1 {
+		ttlSeconds = 1
+	}
+	resp, err := e.client.Grant(ctx, ttlSeconds)
+	if err != nil {
+		return fmt.Errorf("create lease failed: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_, _ = e.client.Revoke(context.Background(), resp.ID)
+		}
+	}()
+	opts = append(opts, clientv3.WithLease(resp.ID))
 
 	_, err = e.client.Put(ctx, fullKey, value, opts...)
 	if err != nil {
@@ -234,7 +298,7 @@ func (e *Etcd) CursorList(ctx context.Context, options *ListOptions) (*ListRespo
 	key := e.prefix
 	if opts.Cursor != "" {
 		etcdOpts = append(etcdOpts, clientv3.WithFromKey())
-		key += opts.Cursor
+		key += opts.Cursor + "\x00"
 	} else {
 		etcdOpts = append(etcdOpts, clientv3.WithPrefix())
 	}
@@ -257,11 +321,14 @@ func (e *Etcd) CursorList(ctx context.Context, options *ListOptions) (*ListRespo
 
 		if count >= opts.Limit {
 			result.HasMore = true
-			result.Cursor = e.extractKey(key)
 			break
 		}
 		result.Keys = append(result.Keys, e.extractKey(key))
 		count++
+	}
+
+	if result.HasMore && len(result.Keys) > 0 {
+		result.Cursor = result.Keys[len(result.Keys)-1]
 	}
 
 	return result, nil

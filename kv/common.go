@@ -31,6 +31,13 @@ type KV interface {
 	PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	// CompareAndSwap updates the value for a key only if the current value matches oldValue.
 	CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error)
+
+	// List returns all key-value pairs matching the prefix.
+	List(ctx context.Context, prefix string) (map[string]string, error)
+	// ListPage returns a page of key-value pairs matching the prefix.
+	ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error)
+	// CursorList returns a list of keys based on cursor and limit.
+	CursorList(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 }
 
 // RawKV interface allows access to the underlying KV implementation.
@@ -57,15 +64,6 @@ func (receiver closerKV) Raw() KV {
 	return receiver.KV
 }
 
-// PagedKV extends KV with pagination support.
-type PagedKV interface {
-	KV
-	// List returns all key-value pairs matching the prefix.
-	List(ctx context.Context, prefix string) (map[string]string, error)
-	// ListPage returns a page of key-value pairs matching the prefix.
-	ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error)
-}
-
 // ListOptions defines options for list operations.
 type ListOptions struct {
 	Limit  int64  // Maximum number of items to return
@@ -77,13 +75,6 @@ type ListResponse struct {
 	Keys    []string // Matched keys (relative to prefix, without root prefix)
 	Cursor  string   // Cursor for the next page (empty if no more data)
 	HasMore bool     // Indicates if there is more data available
-}
-
-// CursorPagedKV extends KV with cursor-based pagination support.
-type CursorPagedKV interface {
-	KV
-	// CursorList returns a list of keys based on cursor and limit.
-	CursorList(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 }
 
 // NewKVFromURL creates a new KV instance from a URL string.

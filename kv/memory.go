@@ -353,22 +353,33 @@ func (m *Memory) listInternal(ctx context.Context, prefix string) (map[string]me
 	return result, nil
 }
 
-// Put 存储键值对，可以设置过期时间
 // Put stores a key-value pair with an optional TTL.
 func (m *Memory) Put(_ context.Context, key, value string, ttl time.Duration) error {
 	now := time.Now()
+	fullKey := m.prefix + key
+
 	var td *time.Time
-	if ttl != -1 {
+	createAt := now
+
+	if ttl == TTLKeep {
+		if existing, ok := m.data.Load(fullKey); ok {
+			if content, ok := existing.(memoryContent); ok {
+				// Preserve existing TTL and CreationTime if still valid
+				if content.TTL == nil || now.Before(*content.TTL) {
+					td = content.TTL
+					createAt = content.CreateAt
+				}
+			}
+		}
+	} else {
 		d := now.Add(ttl)
 		td = &d
 	}
 
-	// Add prefix to key
-	fullKey := m.prefix + key
 	m.data.Store(fullKey, memoryContent{
 		Data:     value,
 		TTL:      td,
-		CreateAt: now,
+		CreateAt: createAt,
 	})
 	return nil
 }

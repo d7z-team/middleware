@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -78,7 +79,7 @@ func (r *RedisKV) Child(paths ...string) KV {
 func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration) error {
 	fullKey := r.prefix + key
 	if ttl == TTLKeep {
-		return r.client.Set(ctx, fullKey, value, 0).Err()
+		return r.client.Set(ctx, fullKey, value, redis.KeepTTL).Err()
 	}
 	return r.client.Set(ctx, fullKey, value, ttl).Err()
 }
@@ -144,7 +145,7 @@ func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue st
 			return ErrCASFailed
 		}
 		_, err = tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
-			pipe.Set(ctx, fullKey, newValue, 0)
+			pipe.Set(ctx, fullKey, newValue, redis.KeepTTL)
 			return nil
 		})
 		return err
@@ -156,6 +157,111 @@ func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue st
 	}
 
 	return true, nil
+}
+
+// CursorList implements cursor-based pagination.
+// Note: Redis SCAN does not support lexicographical order.
+// To ensure consistency with other implementations, this method fetches all keys matching the prefix,
+// sorts them, and then applies the cursor/limit logic.
+// This is inefficient for large datasets but necessary for strict interface compliance regarding ordering.
+func (r *RedisKV) CursorList(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+	opts := &ListOptions{}
+	if options != nil {
+		opts = options
+	}
+	if opts.Limit == 0 {
+		opts.Limit = 1000
+	}
+
+	// Fetch all keys matching prefix
+	// We re-use List which returns map[string]string, but we only need keys.
+	// Optimization: Implement a "ListKeys" internal method or just do scanning here.
+	fullPrefix := r.prefix
+	keys := make([]string, 0)
+	cursor := uint64(0)
+
+	for {
+		res, nextCursor, err := r.client.Scan(ctx, cursor, fullPrefix+"*", 1000).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan keys failed: %w", err)
+		}
+		keys = append(keys, res...)
+		if nextCursor == 0 {
+			break
+		}
+		cursor = nextCursor
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
+
+	// Filter keys that don't match prefix (SCAN pattern is glob-style, pretty accurate, but let's be safe)
+	// And strip prefix
+	filteredKeys := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if strings.HasPrefix(k, r.prefix) {
+			filteredKeys = append(filteredKeys, k[len(r.prefix):])
+		}
+	}
+
+	// Sort lexicographically
+	sort.Strings(filteredKeys)
+
+	// Apply Cursor
+	startIndex := 0
+	if opts.Cursor != "" {
+		for i, key := range filteredKeys {
+			if key > opts.Cursor {
+				startIndex = i
+				break
+			}
+		}
+		// If cursor is beyond all keys (or matches the last one), startIndex might be 0 but logic below handles it
+		// If no key > cursor, startIndex should be len
+		if startIndex == 0 && (len(filteredKeys) == 0 || filteredKeys[0] <= opts.Cursor) {
+			// Check if we actually found a key > cursor
+			found := false
+			for i, key := range filteredKeys {
+				if key > opts.Cursor {
+					startIndex = i
+					found = true
+					break
+				}
+			}
+			if !found {
+				startIndex = len(filteredKeys)
+			}
+		}
+	}
+
+	// Apply Limit
+	endIndex := startIndex + int(opts.Limit)
+	if endIndex > len(filteredKeys) {
+		endIndex = len(filteredKeys)
+	}
+
+	resultKeys := filteredKeys[startIndex:endIndex]
+
+	// Determine next cursor
+	var nextCursor string
+	hasMore := endIndex < len(filteredKeys)
+	if len(resultKeys) > 0 {
+		// Next cursor is the last key returned
+		// Wait, typical cursor pagination: pass the last key you saw.
+		// Next page starts after that.
+		// So HasMore is true if there are items after resultKeys
+	}
+	if hasMore {
+		nextCursor = resultKeys[len(resultKeys)-1]
+	}
+
+	return &ListResponse{
+		Keys:    resultKeys,
+		Cursor:  nextCursor,
+		HasMore: hasMore,
+	}, nil
 }
 
 // List retrieves all key-value pairs matching the prefix.
