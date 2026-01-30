@@ -3,6 +3,7 @@ package lock
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -60,13 +61,16 @@ func (e *EtcdLocker) TryLock(ctx context.Context, id string) func() {
 		return nil
 	}
 
+	var once sync.Once
 	return func() {
-		// Use a detached context for unlock to ensure it executes even if the original context is canceled
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		once.Do(func() {
+			// Use a detached context for unlock to ensure it executes even if the original context is canceled
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-		_ = mutex.Unlock(cleanupCtx)
-		_ = session.Close()
+			_ = mutex.Unlock(cleanupCtx)
+			_ = session.Close()
+		})
 	}
 }
 
@@ -90,12 +94,15 @@ func (e *EtcdLocker) Lock(ctx context.Context, id string) func() {
 		return nil
 	}
 
+	var once sync.Once
 	return func() {
-		// Use a detached context for unlock to ensure it executes even if the original context is canceled
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		once.Do(func() {
+			// Use a detached context for unlock to ensure it executes even if the original context is canceled
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
 
-		_ = mutex.Unlock(cleanupCtx)
-		_ = session.Close()
+			_ = mutex.Unlock(cleanupCtx)
+			_ = session.Close()
+		})
 	}
 }
