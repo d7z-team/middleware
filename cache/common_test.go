@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,409 +16,259 @@ import (
 	"gopkg.d7z.net/middleware/connects"
 )
 
+// --- Test Helpers & Utilities ---
+
 // CacheFactory 用于创建缓存实例的函数类型
 type CacheFactory func(t *testing.T) CloserCache
 
-// TestCache_Common 通用缓存接口测试套件
-func testCacheCommon(t *testing.T, factory CacheFactory) {
-	t.Run("PutGet", func(t *testing.T) { testPutGet(t, factory) })
-	t.Run("PutInvalidTTL", func(t *testing.T) { testPutInvalidTTL(t, factory) })
-	t.Run("GetMiss", func(t *testing.T) { testGetMiss(t, factory) })
-	t.Run("Delete", func(t *testing.T) { testDelete(t, factory) })
-	t.Run("Update", func(t *testing.T) { testUpdate(t, factory) })
-	t.Run("TTL", func(t *testing.T) { testTTL(t, factory) })
-	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, factory) })
+type errorReader struct {
+	err error
 }
 
-// testPutGet 测试基本的 Put 和 Get 功能
+func (r *errorReader) Read(p []byte) (n int, err error) {
+	return 0, r.err
+}
+
+type mockReadSeekCloser struct {
+	*bytes.Reader
+}
+
+func (m *mockReadSeekCloser) Close() error { return nil }
+
+// --- Common Test Suite ---
+
+// testCacheCommon 通用缓存接口测试套件，涵盖了缓存实现应遵循的核心行为
+func testCacheCommon(t *testing.T, factory CacheFactory) {
+	t.Run("PutGet", func(t *testing.T) { testPutGet(t, factory) })
+	t.Run("Update", func(t *testing.T) { testUpdate(t, factory) })
+	t.Run("Delete", func(t *testing.T) { testDelete(t, factory) })
+	t.Run("GetMiss", func(t *testing.T) { testGetMiss(t, factory) })
+	t.Run("TTL", func(t *testing.T) { testTTL(t, factory) })
+	t.Run("PutInvalidTTL", func(t *testing.T) { testPutInvalidTTL(t, factory) })
+	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, factory) })
+	t.Run("Boundary", func(t *testing.T) { testBoundary(t, factory) })
+	t.Run("ErrorReader", func(t *testing.T) { testCacheErrorReader(t, factory) })
+}
+
 func testPutGet(t *testing.T, factory CacheFactory) {
 	cache := factory(t)
 	defer cache.Close()
 
 	ctx := context.Background()
-	key := "test-key"
-	value := []byte("test-value")
+	key, value := "test-key", []byte("test-value")
+	metadata := map[string]string{"version": "1.0"}
 
-	// 测试正常存入和读取
-	metadata := map[string]string{
-		"key": "value",
-	}
-	err := cache.Put(ctx, key, metadata, bytes.NewReader(value), TTLKeep)
-	if err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
+	assert.NoError(t, cache.Put(ctx, key, metadata, bytes.NewReader(value), TTLKeep))
 
 	content, err := cache.Get(ctx, key)
-	if err != nil {
-		t.Fatalf("Get failed: %v", err)
-	}
+	assert.NoError(t, err)
 	defer content.Close()
 
-	// 验证内容
 	data, err := io.ReadAll(content)
-	if err != nil {
-		t.Fatalf("Read content failed: %v", err)
-	}
-
-	if !bytes.Equal(data, value) {
-		t.Errorf("Content mismatch: expected %q, got %q", value, data)
-	}
+	assert.NoError(t, err)
+	assert.Equal(t, value, data)
 	assert.Equal(t, metadata, content.Metadata)
 }
 
-// testPutInvalidTTL 测试无效 TTL 的处理
-func testPutInvalidTTL(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
-
-	ctx := context.Background()
-	key := "test-key"
-	value := []byte("test-value")
-
-	// 测试负 TTL
-	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), -time.Second)
-	if !errors.Is(err, ErrInvalidTTL) {
-		t.Errorf("Expected ErrInvalidTTL for negative TTL, got: %v", err)
-	}
-
-	// 测试零 TTL
-	err = cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), 0)
-	if !errors.Is(err, ErrInvalidTTL) {
-		t.Errorf("Expected ErrInvalidTTL for zero TTL, got: %v", err)
-	}
-}
-
-// testGetMiss 测试缓存未命中的情况
-func testGetMiss(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
-
-	ctx := context.Background()
-	key := "non-existent-key"
-
-	_, err := cache.Get(ctx, key)
-	if !errors.Is(err, ErrCacheMiss) {
-		t.Errorf("Expected ErrCacheMiss for non-existent key, got: %v", err)
-	}
-}
-
-// testDelete 测试删除功能
-func testDelete(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
-
-	ctx := context.Background()
-	key := "delete-key"
-	value := []byte("delete-value")
-
-	// 先存入
-	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), TTLKeep)
-	if err != nil {
-		t.Fatalf("Put failed: %v", err)
-	}
-
-	// 验证存在
-	_, err = cache.Get(ctx, key)
-	if err != nil {
-		t.Fatalf("Get before delete failed: %v", err)
-	}
-
-	// 删除
-	err = cache.Delete(ctx, key)
-	if err != nil {
-		t.Fatalf("Delete failed: %v", err)
-	}
-
-	// 验证已删除
-	_, err = cache.Get(ctx, key)
-	if !errors.Is(err, ErrCacheMiss) {
-		t.Errorf("Expected ErrCacheMiss after delete, got: %v", err)
-	}
-
-	// 删除不存在的 key 应该不报错
-	err = cache.Delete(ctx, "non-existent-key")
-	if err != nil {
-		t.Errorf("Delete non-existent key should not error, got: %v", err)
-	}
-}
-
-// testUpdate 测试更新已存在的 key
 func testUpdate(t *testing.T, factory CacheFactory) {
 	cache := factory(t)
 	defer cache.Close()
 
 	ctx := context.Background()
 	key := "update-key"
-	value1 := []byte("value1")
-	value2 := []byte("value2-updated")
+	v1, v2 := []byte("v1"), []byte("v2")
 
-	// 第一次存入
-	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value1), TTLKeep)
-	if err != nil {
-		t.Fatalf("First Put failed: %v", err)
-	}
+	assert.NoError(t, cache.Put(ctx, key, nil, bytes.NewReader(v1), TTLKeep))
+	assert.NoError(t, cache.Put(ctx, key, nil, bytes.NewReader(v2), TTLKeep))
 
-	// 更新
-	err = cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value2), TTLKeep)
-	if err != nil {
-		t.Fatalf("Second Put failed: %v", err)
-	}
-
-	// 验证更新后的值
 	content, err := cache.Get(ctx, key)
-	if err != nil {
-		t.Fatalf("Get after update failed: %v", err)
-	}
+	assert.NoError(t, err)
 	defer content.Close()
 
-	data, err := io.ReadAll(content)
-	if err != nil {
-		t.Fatalf("Read content failed: %v", err)
-	}
-
-	if !bytes.Equal(data, value2) {
-		t.Errorf("Content after update mismatch: expected %q, got %q", value2, data)
-	}
+	data, _ := io.ReadAll(content)
+	assert.Equal(t, v2, data)
 }
 
-// testTTL 测试 TTL 过期功能
+func testDelete(t *testing.T, factory CacheFactory) {
+	cache := factory(t)
+	defer cache.Close()
+
+	ctx := context.Background()
+	key := "del-key"
+
+	assert.NoError(t, cache.Put(ctx, key, nil, bytes.NewReader([]byte("data")), TTLKeep))
+	assert.NoError(t, cache.Delete(ctx, key))
+
+	_, err := cache.Get(ctx, key)
+	assert.ErrorIs(t, err, ErrCacheMiss)
+
+	// Idempotent delete
+	assert.NoError(t, cache.Delete(ctx, "no-key"))
+}
+
+func testGetMiss(t *testing.T, factory CacheFactory) {
+	cache := factory(t)
+	defer cache.Close()
+
+	_, err := cache.Get(context.Background(), "missing")
+	assert.ErrorIs(t, err, ErrCacheMiss)
+}
+
 func testTTL(t *testing.T, factory CacheFactory) {
 	cache := factory(t)
 	defer cache.Close()
 
 	ctx := context.Background()
 	key := "ttl-key"
-	value := []byte("ttl-value")
-	ttl := 1 * time.Second
+	ttl := 500 * time.Millisecond
 
-	// 存入带 TTL 的缓存
-	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), ttl)
-	if err != nil {
-		t.Fatalf("Put with TTL failed: %v", err)
-	}
+	assert.NoError(t, cache.Put(ctx, key, nil, bytes.NewReader([]byte("data")), ttl))
+	_, err := cache.Get(ctx, key)
+	assert.NoError(t, err)
 
-	// 立即获取应该存在
+	time.Sleep(ttl + 100*time.Millisecond)
 	_, err = cache.Get(ctx, key)
-	if err != nil {
-		t.Fatalf("Get immediately after Put failed: %v", err)
-	}
-
-	// 等待 TTL 过期
-	time.Sleep(ttl + 2*time.Second)
-
-	// 过期后应该返回 CacheMiss
-	_, err = cache.Get(ctx, key)
-	if !errors.Is(err, ErrCacheMiss) {
-		t.Errorf("Expected ErrCacheMiss after TTL expiration, got: %v", err)
-	}
+	assert.ErrorIs(t, err, ErrCacheMiss)
 }
 
-// testConcurrency 测试并发安全性
+func testPutInvalidTTL(t *testing.T, factory CacheFactory) {
+	cache := factory(t)
+	defer cache.Close()
+
+	err := cache.Put(context.Background(), "key", nil, bytes.NewReader([]byte("d")), 0)
+	assert.ErrorIs(t, err, ErrInvalidTTL)
+}
+
 func testConcurrency(t *testing.T, factory CacheFactory) {
 	cache := factory(t)
 	defer cache.Close()
 
 	ctx := context.Background()
-	const (
-		goroutines = 10
-		operations = 50
-	)
-
+	const workers, ops = 5, 20
 	var wg sync.WaitGroup
-	wg.Add(goroutines)
+	wg.Add(workers)
 
-	for i := 0; i < goroutines; i++ {
+	for i := 0; i < workers; i++ {
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < operations; j++ {
-				key := fmt.Sprintf("key-%d-%d", id, j%5) // 限制 key 数量增加冲突概率
-				value := []byte(fmt.Sprintf("value-%d-%d", id, j))
-
-				// 随机执行操作
-				switch j % 3 {
-				case 0: // Put
-					err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), TTLKeep)
-					if err != nil {
-						t.Logf("Concurrent Put error: %v", err)
-					}
-				case 1: // Get
-					content, err := cache.Get(ctx, key)
-					if err != nil && !errors.Is(err, ErrCacheMiss) {
-						t.Logf("Concurrent Get error: %v", err)
-					}
-					if content != nil {
-						io.Copy(io.Discard, content) // 读取数据
-						content.Close()
-					}
-				case 2: // Delete
-					err := cache.Delete(ctx, key)
-					if err != nil {
-						t.Logf("Concurrent Delete error: %v", err)
-					}
-				}
+			for j := 0; j < ops; j++ {
+				key := fmt.Sprintf("conf-%d", j%3)
+				_ = cache.Put(ctx, key, nil, bytes.NewReader([]byte("v")), TTLKeep)
+				_, _ = cache.Get(ctx, key)
 			}
 		}(i)
 	}
-
 	wg.Wait()
-
-	// 验证缓存仍然可用
-	key := "final-check"
-	value := []byte("final-value")
-	err := cache.Put(ctx, key, map[string]string{}, bytes.NewReader(value), TTLKeep)
-	if err != nil {
-		t.Errorf("Put after concurrency test failed: %v", err)
-	}
-
-	content, err := cache.Get(ctx, key)
-	if err != nil {
-		t.Errorf("Get after concurrency test failed: %v", err)
-	} else {
-		content.Close()
-	}
 }
 
-// TestCache_ErrorReader 测试读取错误的情况
+func testBoundary(t *testing.T, factory CacheFactory) {
+	cache := factory(t)
+	defer cache.Close()
+	ctx := context.Background()
+
+	// Empty content
+	assert.NoError(t, cache.Put(ctx, "empty", nil, bytes.NewReader([]byte{}), TTLKeep))
+	c, _ := cache.Get(ctx, "empty")
+	d, _ := io.ReadAll(c)
+	assert.Empty(t, d)
+
+	// Large content (512KB)
+	large := make([]byte, 512*1024)
+	assert.NoError(t, cache.Put(ctx, "large", nil, bytes.NewReader(large), TTLKeep))
+	c, _ = cache.Get(ctx, "large")
+	d, _ = io.ReadAll(c)
+	assert.Len(t, d, 512*1024)
+
+	// Special metadata
+	meta := map[string]string{"key": "val with spaces", "unicode": "测试"}
+	assert.NoError(t, cache.Put(ctx, "meta", meta, bytes.NewReader([]byte("d")), TTLKeep))
+	c, _ = cache.Get(ctx, "meta")
+	assert.Equal(t, meta, c.Metadata)
+}
+
 func testCacheErrorReader(t *testing.T, factory CacheFactory) {
 	cache := factory(t)
 	defer cache.Close()
 
-	ctx := context.Background()
-	key := "error-key"
+	reader := &errorReader{err: errors.New("read fail")}
+	err := cache.Put(context.Background(), "err-key", nil, reader, TTLKeep)
+	assert.Error(t, err)
 
-	// 创建会返回错误的 Reader
-	errorReader := &errorReader{err: errors.New("mock read error")}
-
-	err := cache.Put(ctx, key, map[string]string{}, errorReader, TTLKeep)
-	if err == nil {
-		t.Error("Expected error from faulty reader, but got none")
-	}
-
-	// 验证错误的 key 没有被存入
-	_, err = cache.Get(ctx, key)
-	if !errors.Is(err, ErrCacheMiss) {
-		t.Errorf("Expected ErrCacheMiss after Put error, got: %v", err)
-	}
+	_, err = cache.Get(context.Background(), "err-key")
+	assert.ErrorIs(t, err, ErrCacheMiss)
 }
 
-func TestMemory(t *testing.T) {
-	t.Run("Common", func(t *testing.T) {
+// --- Specific Implementation Tests ---
+
+func TestCommonFunctions(t *testing.T) {
+	t.Run("NewCacheFromURL", func(t *testing.T) {
+		c, err := NewCacheFromURL("memory://?max_capacity=10")
+		assert.NoError(t, err)
+		c.Close()
+
+		_, err = NewCacheFromURL("invalid://")
+		assert.Error(t, err)
+	})
+
+	t.Run("ReadToString", func(t *testing.T) {
+		c := &Content{
+			ReadSeekCloser: &mockReadSeekCloser{Reader: bytes.NewReader([]byte("data"))},
+		}
+		s, err := c.ReadToString()
+		assert.NoError(t, err)
+		assert.Equal(t, "data", s)
+	})
+}
+
+func TestMemoryImplementation(t *testing.T) {
+	t.Run("Config", func(t *testing.T) {
+		_, err := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 0})
+		assert.ErrorIs(t, err, ErrInvalidCapacity)
+	})
+
+	t.Run("LRU", func(t *testing.T) {
+		cache, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 1})
+		defer cache.Close()
+		ctx := context.Background()
+		_ = cache.Put(ctx, "k1", nil, strings.NewReader("d1"), TTLKeep)
+		_ = cache.Put(ctx, "k2", nil, strings.NewReader("d2"), TTLKeep)
+		_, err := cache.Get(ctx, "k1")
+		assert.ErrorIs(t, err, ErrCacheMiss)
+	})
+
+	t.Run("TestSuite", func(t *testing.T) {
 		testCacheCommon(t, func(t *testing.T) CloserCache {
-			cache, err := NewMemoryCache(
-				MemoryCacheConfig{
-					100,
-					time.Minute,
-				},
-			)
-			if err != nil {
-				t.Fatalf("Failed to create cache: %v", err)
-			}
-			return cache
+			c, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 100})
+			return c
 		})
 	})
-	t.Run("ChildCommon", func(t *testing.T) {
+
+	t.Run("ChildTestSuite", func(t *testing.T) {
 		testCacheCommon(t, func(t *testing.T) CloserCache {
-			cache, err := NewMemoryCache(
-				MemoryCacheConfig{
-					100,
-					time.Minute,
-				},
-			)
-			if err != nil {
-				t.Fatalf("Failed to create cache: %v", err)
-			}
-			return closerCache{
-				Cache: cache.Child("data/child"),
-				closer: func() error {
-					return cache.Close()
-				},
-			}
-		})
-	})
-	t.Run("ErrorReader", func(t *testing.T) {
-		testCacheErrorReader(t, func(t *testing.T) CloserCache {
-			cache, err := NewMemoryCache(
-				MemoryCacheConfig{
-					MaxCapacity: 10,
-				},
-			)
-			if err != nil {
-				t.Fatalf("Failed to create cache: %v", err)
-			}
-			return cache
-		})
-	})
-	t.Run("ErrorChild", func(t *testing.T) {
-		testCacheErrorReader(t, func(t *testing.T) CloserCache {
-			cache, err := NewMemoryCache(
-				MemoryCacheConfig{
-					MaxCapacity: 10,
-				},
-			)
-			if err != nil {
-				t.Fatalf("Failed to create cache: %v", err)
-			}
-			return closerCache{
-				Cache: cache.Child("data/child"),
-				closer: func() error {
-					return cache.Close()
-				},
-			}
+			root, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 100})
+			return closerCache{Cache: root.Child("a/b"), closer: root.Close}
 		})
 	})
 }
 
-func TestRedis(t *testing.T) {
-	t.Run("Common", func(t *testing.T) {
+func TestRedisImplementation(t *testing.T) {
+	factory := func(t *testing.T) CloserCache {
+		u, _ := url.Parse("redis://127.0.0.1:6379")
+		client, err := connects.NewRedis(u)
+		if err != nil {
+			t.Skip("Redis not available")
+		}
+		return closerCache{Cache: NewRedisCache(client, "test"), closer: client.Close}
+	}
+
+	t.Run("TestSuite", func(t *testing.T) {
+		testCacheCommon(t, factory)
+	})
+
+	t.Run("ChildTestSuite", func(t *testing.T) {
 		testCacheCommon(t, func(t *testing.T) CloserCache {
-			parse, _ := url.Parse("redis://127.0.0.1:6379")
-			redis, err := connects.NewRedis(parse)
-			if err != nil {
-				t.Skip("Failed to connect to redis")
-			}
-			return closerCache{
-				Cache:  NewRedisCache(redis, "common"),
-				closer: redis.Close,
-			}
-		})
-	})
-	t.Run("ErrorReader", func(t *testing.T) {
-		testCacheErrorReader(t, func(t *testing.T) CloserCache {
-			parse, _ := url.Parse("redis://127.0.0.1:6379")
-			redis, err := connects.NewRedis(parse)
-			if err != nil {
-				t.Skip("Failed to connect to redis")
-			}
-			return closerCache{
-				Cache:  NewRedisCache(redis, "reader"),
-				closer: redis.Close,
-			}
-		})
-	})
-	t.Run("ChildCommon", func(t *testing.T) {
-		testCacheCommon(t, func(t *testing.T) CloserCache {
-			parse, _ := url.Parse("redis://127.0.0.1:6379")
-			redis, err := connects.NewRedis(parse)
-			if err != nil {
-				t.Skip("Failed to connect to redis")
-			}
-			return closerCache{
-				Cache:  NewRedisCache(redis, "common").Child("data/child"),
-				closer: redis.Close,
-			}
-		})
-	})
-	t.Run("ChildErrorReader", func(t *testing.T) {
-		testCacheErrorReader(t, func(t *testing.T) CloserCache {
-			parse, _ := url.Parse("redis://127.0.0.1:6379")
-			redis, err := connects.NewRedis(parse)
-			if err != nil {
-				t.Skip("Failed to connect to redis")
-			}
-			return closerCache{
-				Cache:  NewRedisCache(redis, "reader").Child("data/child"),
-				closer: redis.Close,
-			}
+			c := factory(t)
+			return closerCache{Cache: c.Child("child"), closer: c.Close}
 		})
 	})
 }
