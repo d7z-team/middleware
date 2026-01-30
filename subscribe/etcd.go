@@ -56,9 +56,17 @@ func (e *EtcdSubscriber) Child(paths ...string) Subscriber {
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+
+	// Ensure slash separator
+	basePrefix := e.prefix
+	if basePrefix != "" && !strings.HasSuffix(basePrefix, "/") {
+		basePrefix += "/"
+	}
+	newPrefix := basePrefix + strings.Join(keys, "/") + "/"
+
 	if e.closed {
 		child := &EtcdSubscriber{
-			prefix:   e.prefix + strings.Join(keys, "/") + "/",
+			prefix:   newPrefix,
 			client:   e.client,
 			watchers: make(map[string][]*etcdWatcher),
 			closed:   true,
@@ -67,7 +75,7 @@ func (e *EtcdSubscriber) Child(paths ...string) Subscriber {
 	}
 
 	return &EtcdSubscriber{
-		prefix:   e.prefix + strings.Join(keys, "/") + "/",
+		prefix:   newPrefix,
 		client:   e.client,
 		watchers: make(map[string][]*etcdWatcher),
 		closed:   false,
@@ -186,6 +194,9 @@ func (e *EtcdSubscriber) buildFullKey(key string) string {
 	key = strings.TrimPrefix(key, "/")
 	if e.prefix == "" {
 		return key
+	}
+	if strings.HasSuffix(e.prefix, "/") {
+		return e.prefix + key
 	}
 	return e.prefix + "/" + key
 }

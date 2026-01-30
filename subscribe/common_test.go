@@ -3,6 +3,7 @@ package subscribe
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -599,9 +600,7 @@ func TestResourceLeak(t *testing.T) {
 // getGoroutineCount 获取当前 goroutine 数量（测试辅助函数）
 func getGoroutineCount(t *testing.T) int {
 	t.Helper()
-	// 在实际测试中，你可能需要更精确的方法来计数
-	// 这里返回一个固定值，实际实现应该使用 runtime.NumGoroutine()
-	return 0
+	return runtime.NumGoroutine()
 }
 
 func TestConcurrentSafety(t *testing.T) {
@@ -689,6 +688,112 @@ func TestConcurrentSafety(t *testing.T) {
 				t.Errorf("Too many concurrent operation errors: %d/%d", errorCount, numOperations)
 			} else {
 				t.Logf("Concurrent safety test passed with %d/%d errors", errorCount, numOperations)
+			}
+		})
+	}
+}
+
+func TestChildClosingIsolation(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{
+			name: "memory child isolation",
+			url:  "memory://",
+		},
+		{
+			name: "etcd child isolation",
+			url:  "etcd://127.0.0.1:2379?prefix=test-child-iso",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parent, err := NewSubscriberFromURL(tt.url)
+			if err != nil {
+				t.Skipf("skipping %s: %v", tt.name, err)
+			}
+			defer parent.Close()
+
+			if strings.Contains(tt.name, "etcd") {
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			// 1. Create a child subscriber
+			child := parent.Child("child-iso")
+
+			// 2. Subscribe via child
+			ctx := context.Background()
+			childCh, err := child.Subscribe(ctx, "topic")
+			require.NoError(t, err)
+
+			// 3. Subscribe via parent (to ensure parent stays active)
+			parentCh, err := parent.Subscribe(ctx, "child-iso/topic") // Manual prefix for parent to match child
+			require.NoError(t, err)
+
+			// Allow subscriptions to establish (important for etcd watchers)
+			time.Sleep(100 * time.Millisecond)
+
+			// 4. Publish via parent (should reach both)
+			// Note: child.Subscribe("topic") -> actual key "prefix/child-iso/topic"
+			// parent.Subscribe("child-iso/topic") -> actual key "prefix/child-iso/topic"
+			msg1 := "message-1"
+			err = parent.Publish(ctx, "child-iso/topic", msg1)
+			require.NoError(t, err)
+
+			// Verify both receive
+			select {
+			case m := <-childCh:
+				assert.Equal(t, msg1, m)
+			case <-time.After(time.Second):
+				t.Fatal("child did not receive message 1")
+			}
+
+			select {
+			case m := <-parentCh:
+				assert.Equal(t, msg1, m)
+			case <-time.After(time.Second):
+				t.Fatal("parent did not receive message 1")
+			}
+
+			// 5. Close child
+			// If child is CloserSubscriber, we can cast. But Child() returns Subscriber.
+			// We need to check if it implements Closer.
+			// The implementations (EtcdSubscriber, MemorySubscriber) have Close(), but Subscriber interface doesn't.
+			// However, in our code:
+			// type Subscriber interface { Child... Publish... Subscribe... }
+			// The implementations *do* have Close().
+			// We need to type assert.
+			if closer, ok := child.(interface{ Close() error }); ok {
+				err := closer.Close()
+				require.NoError(t, err)
+			} else {
+				t.Fatal("child subscriber does not implement Close()")
+			}
+
+			// 6. Publish again
+			msg2 := "message-2"
+			err = parent.Publish(ctx, "child-iso/topic", msg2)
+			require.NoError(t, err)
+
+			// 7. Verify parent still receives
+			select {
+			case m := <-parentCh:
+				assert.Equal(t, msg2, m)
+			case <-time.After(time.Second):
+				t.Fatal("parent did not receive message 2 after child close")
+			}
+
+			// 8. Verify child does NOT receive (channel should be closed or silent)
+			select {
+			case _, open := <-childCh:
+				if open {
+					t.Error("child channel should be closed or silent")
+				}
+			case <-time.After(200 * time.Millisecond):
+				// If it timeouts, that's also acceptable if it just stops receiving.
+				// But our implementation usually closes channels on Close().
 			}
 		})
 	}
