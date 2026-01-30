@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	kv2 "gopkg.d7z.net/middleware/kv"
+	"gopkg.d7z.net/middleware/kv"
 )
 
 type ID2KVI[ID comparable, Data any] interface {
@@ -18,11 +18,11 @@ type ID2KVI[ID comparable, Data any] interface {
 }
 
 type ID2KV[Data any] struct {
-	kv     kv2.PagedKV
+	kv     kv.KV
 	prefix string
 }
 
-func NewID2KV[Data any](kv kv2.PagedKV, prefix string) ID2KVI[string, Data] {
+func NewID2KV[Data any](kv kv.KV, prefix string) ID2KVI[string, Data] {
 	return &ID2KV[Data]{
 		kv:     kv,
 		prefix: prefix,
@@ -72,7 +72,7 @@ func (d *ID2KV[Data]) Put(ctx context.Context, id string, value Data) error {
 	if err != nil {
 		return err
 	}
-	return d.kv.Put(ctx, key, string(data), kv2.TTLKeep)
+	return d.kv.Put(ctx, key, string(data), kv.TTLKeep)
 }
 
 func (d *ID2KV[Data]) PutIfNotExists(ctx context.Context, id string, value Data) (bool, error) {
@@ -81,7 +81,7 @@ func (d *ID2KV[Data]) PutIfNotExists(ctx context.Context, id string, value Data)
 	if err != nil {
 		return false, err
 	}
-	return d.kv.PutIfNotExists(ctx, key, string(data), kv2.TTLKeep)
+	return d.kv.PutIfNotExists(ctx, key, string(data), kv.TTLKeep)
 }
 
 func (d *ID2KV[Data]) Delete(ctx context.Context, id string) (bool, error) {

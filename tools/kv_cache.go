@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"encoding/json"
-	"reflect"
 	"time"
 
 	"gopkg.d7z.net/middleware/kv"
@@ -28,14 +27,8 @@ func (c *KVCache[Data]) Load(ctx context.Context, key string) (Data, bool) {
 		return zero, false
 	}
 	var data Data
-	if reflect.TypeOf(data).Kind() == reflect.Ptr {
-		if err := json.Unmarshal([]byte(valStr), data); err != nil {
-			return zero, false
-		}
-	} else {
-		if err := json.Unmarshal([]byte(valStr), &data); err != nil {
-			return zero, false
-		}
+	if err := json.Unmarshal([]byte(valStr), &data); err != nil {
+		return zero, false
 	}
 
 	return data, true

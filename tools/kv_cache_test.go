@@ -95,3 +95,24 @@ func TestKVCache_Delete(t *testing.T) {
 	_, found = cache.Load(t.Context(), "key2")
 	assert.False(t, found)
 }
+
+func TestKVCache_PointerType(t *testing.T) {
+	memory, err := kv.NewMemory("")
+	assert.NoError(t, err)
+
+	// Use *testStruct as Data
+	cache := NewCache[*testStruct](memory, "cache_ptr", time.Second)
+	value := &testStruct{
+		K: "key",
+		V: "val",
+	}
+
+	// Test storing
+	err = cache.Store(t.Context(), "key", value)
+	assert.NoError(t, err)
+
+	// Test loading
+	load, found := cache.Load(t.Context(), "key")
+	assert.True(t, found)
+	assert.Equal(t, value, load)
+}
