@@ -36,10 +36,16 @@ type KV interface {
 
 	// List returns all key-value pairs matching the prefix.
 	List(ctx context.Context, prefix string) (map[string]string, error)
+	// ListCurrent returns key-value pairs at the current level (excluding children).
+	ListCurrent(ctx context.Context, prefix string) (map[string]string, error)
 	// ListPage returns a page of key-value pairs matching the prefix.
 	ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error)
+	// ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
+	ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error)
 	// CursorList returns a list of keys based on cursor and limit.
 	CursorList(ctx context.Context, opts *ListOptions) (*ListResponse, error)
+	// CursorListCurrent returns a list of keys at the current level based on cursor and limit.
+	CursorListCurrent(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 }
 
 // RawKV interface allows access to the underlying KV implementation.

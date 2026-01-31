@@ -329,6 +329,61 @@ func (r *RedisKV) List(ctx context.Context, prefix string) (map[string]string, e
 	return result, nil
 }
 
+// ListCurrent returns key-value pairs at the current level (excluding children).
+func (r *RedisKV) ListCurrent(ctx context.Context, prefix string) (map[string]string, error) {
+	fullPrefix := r.prefix + prefix
+	keys := make([]string, 0)
+	cursor := uint64(0)
+
+	for {
+		res, nextCursor, err := r.client.Scan(ctx, cursor, fullPrefix+"*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, res...)
+		if nextCursor == 0 {
+			break
+		}
+		cursor = nextCursor
+	}
+
+	if len(keys) == 0 {
+		return make(map[string]string), nil
+	}
+
+	values, err := r.client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	result := make(map[string]string)
+	for i, fullKey := range keys {
+		bizKey := fullKey[len(r.prefix):]
+		val, ok := values[i].(string)
+
+		if !ok || val == "" {
+			continue
+		}
+
+		if !strings.HasPrefix(bizKey, prefix) {
+			continue
+		}
+
+		check := bizKey[len(prefix):]
+		check = strings.TrimPrefix(check, "/")
+		if strings.Contains(check, "/") {
+			continue
+		}
+		if check == "" {
+			continue
+		}
+
+		result[bizKey] = val
+	}
+
+	return result, nil
+}
+
 // ListPage retrieves paginated key-value pairs matching the prefix.
 func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
 	fullList, err := r.List(ctx, prefix)
@@ -357,4 +412,129 @@ func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64,
 		pageResult[k] = fullList[k]
 	}
 	return pageResult, nil
+}
+
+// ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
+func (r *RedisKV) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
+	fullList, err := r.ListCurrent(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	keys := make([]string, 0, len(fullList))
+	for k := range fullList {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	start := pageIndex * uint64(pageSize)
+	if start >= uint64(len(keys)) {
+		return make(map[string]string), nil
+	}
+	end := start + uint64(pageSize)
+	if end > uint64(len(keys)) {
+		end = uint64(len(keys))
+	}
+
+	pageKeys := keys[start:end]
+	pageResult := make(map[string]string, len(pageKeys))
+	for _, k := range pageKeys {
+		pageResult[k] = fullList[k]
+	}
+	return pageResult, nil
+}
+
+// CursorListCurrent implements cursor-based pagination for current level.
+func (r *RedisKV) CursorListCurrent(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+	opts := &ListOptions{}
+	if options != nil {
+		opts = options
+	}
+	if opts.Limit == 0 {
+		opts.Limit = 1000
+	}
+
+	// Fetch all to filter
+	fullPrefix := r.prefix
+	keys := make([]string, 0)
+	cursor := uint64(0)
+
+	for {
+		res, nextCursor, err := r.client.Scan(ctx, cursor, fullPrefix+"*", 1000).Result()
+		if err != nil {
+			return nil, fmt.Errorf("scan keys failed: %w", err)
+		}
+		keys = append(keys, res...)
+		if nextCursor == 0 {
+			break
+		}
+		cursor = nextCursor
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
+
+	filteredKeys := make([]string, 0)
+	for _, k := range keys {
+		if !strings.HasPrefix(k, r.prefix) {
+			continue
+		}
+		relKey := k[len(r.prefix):]
+
+		if strings.Contains(relKey, "/") {
+			continue
+		}
+		if relKey == "" {
+			continue
+		}
+		filteredKeys = append(filteredKeys, relKey)
+	}
+
+	sort.Strings(filteredKeys)
+
+	// Apply Cursor
+	startIndex := 0
+	if opts.Cursor != "" {
+		for i, key := range filteredKeys {
+			if key > opts.Cursor {
+				startIndex = i
+				break
+			}
+		}
+		if startIndex == 0 && (len(filteredKeys) == 0 || filteredKeys[0] <= opts.Cursor) {
+			found := false
+			for i, key := range filteredKeys {
+				if key > opts.Cursor {
+					startIndex = i
+					found = true
+					break
+				}
+			}
+			if !found {
+				startIndex = len(filteredKeys)
+			}
+		}
+	}
+
+	// Apply Limit
+	endIndex := startIndex + int(opts.Limit)
+	if endIndex > len(filteredKeys) {
+		endIndex = len(filteredKeys)
+	}
+
+	resultKeys := filteredKeys[startIndex:endIndex]
+
+	var nextCursor string
+	hasMore := endIndex < len(filteredKeys)
+	if hasMore {
+		nextCursor = resultKeys[len(resultKeys)-1]
+	}
+
+	return &ListResponse{
+		Keys:    resultKeys,
+		Cursor:  nextCursor,
+		HasMore: hasMore,
+	}, nil
 }

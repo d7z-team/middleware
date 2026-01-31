@@ -442,6 +442,140 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.Equal(t, "v", val)
 	})
 
+	// ListCurrent
+	t.Run("List_Current", func(t *testing.T) {
+		lcPrefix := uniquePrefix + "list_current/"
+		lcKV := kvClient.Child(lcPrefix)
+
+		// Structure:
+		// a
+		// b
+		// sub/c
+		// sub/d
+		// deep/e/f
+
+		keys := map[string]string{
+			"a":        "val_a",
+			"b":        "val_b",
+			"sub/c":    "val_c",
+			"sub/d":    "val_d",
+			"deep/e/f": "val_f",
+		}
+
+		for k, v := range keys {
+			err := lcKV.Put(ctx, k, v, TTLKeep)
+			require.NoError(t, err)
+		}
+
+		// 1. Root level list
+		current, err := lcKV.ListCurrent(ctx, "")
+		require.NoError(t, err)
+		assert.Len(t, current, 2)
+		assert.Equal(t, "val_a", current["a"])
+		assert.Equal(t, "val_b", current["b"])
+		_, ok := current["sub/c"]
+		assert.False(t, ok)
+
+		// 2. Sub level list
+		currentSub, err := lcKV.ListCurrent(ctx, "sub/")
+		require.NoError(t, err)
+		assert.Len(t, currentSub, 2)
+		assert.Equal(t, "val_c", currentSub["sub/c"])
+		assert.Equal(t, "val_d", currentSub["sub/d"])
+
+		// 3. Deep level list (e/)
+		currentDeep, err := lcKV.ListCurrent(ctx, "deep/e/")
+		require.NoError(t, err)
+		assert.Len(t, currentDeep, 1)
+		assert.Equal(t, "val_f", currentDeep["deep/e/f"])
+
+		// 4. Non-existent level
+		currentNone, err := lcKV.ListCurrent(ctx, "nonexistent/")
+		require.NoError(t, err)
+		assert.Empty(t, currentNone)
+	})
+
+	// ListCurrentPage
+	t.Run("List_Current_Page", func(t *testing.T) {
+		lcpPrefix := uniquePrefix + "lcp/"
+		lcpKV := kvClient.Child(lcpPrefix)
+
+		// Create files: a, b, c, d
+		// Create subdirs: sub/e
+		keys := []string{"a", "b", "c", "d", "sub/e"}
+		for _, k := range keys {
+			_ = lcpKV.Put(ctx, k, "val", TTLKeep)
+		}
+
+		// Page 1 (Limit 2) -> a, b
+		p1, err := lcpKV.ListCurrentPage(ctx, "", 0, 2)
+		require.NoError(t, err)
+		assert.Len(t, p1, 2)
+		// For Memory this depends on sort order (CreateAt). Since we put them sequentially, order is usually preserved or fast.
+		// For Etcd/Redis it's Key order.
+		// To be safe, we verify presence of "a" or "b" or "c" or "d" and size.
+		// And ensure "sub/e" is NOT there.
+
+		for k := range p1 {
+			assert.NotContains(t, k, "/")
+		}
+
+		// Check full list coverage across pages
+		allItems := make(map[string]string)
+
+		p1_all, _ := lcpKV.ListCurrentPage(ctx, "", 0, 2)
+		for k, v := range p1_all {
+			allItems[k] = v
+		}
+
+		p2_all, _ := lcpKV.ListCurrentPage(ctx, "", 1, 2)
+		for k, v := range p2_all {
+			allItems[k] = v
+		}
+
+		p3_all, _ := lcpKV.ListCurrentPage(ctx, "", 2, 2) // Should be empty or last item if logic allows?
+		// 4 items total at current level. Page 0: 2, Page 1: 2, Page 2: 0.
+		for k, v := range p3_all {
+			allItems[k] = v
+		}
+
+		assert.Len(t, allItems, 4) // a, b, c, d
+		_, hasSub := allItems["sub/e"]
+		assert.False(t, hasSub)
+	})
+
+	// CursorListCurrent
+	t.Run("Cursor_List_Current", func(t *testing.T) {
+		clcPrefix := uniquePrefix + "clc/"
+		clcKV := kvClient.Child(clcPrefix)
+
+		// a, b, c, sub/d
+		keys := []string{"a", "b", "c", "sub/d"}
+		for _, k := range keys {
+			_ = clcKV.Put(ctx, k, "val", TTLKeep)
+		}
+
+		opts := &ListOptions{Limit: 2}
+
+		// Page 1
+		resp1, err := clcKV.CursorListCurrent(ctx, opts)
+		require.NoError(t, err)
+		require.Len(t, resp1.Keys, 2)
+		assert.Contains(t, resp1.Keys, "a")
+		assert.Contains(t, resp1.Keys, "b") // Lexicographical expected
+		assert.True(t, resp1.HasMore)
+		assert.Equal(t, "b", resp1.Cursor)
+
+		// Page 2
+		opts.Cursor = resp1.Cursor
+		resp2, err := clcKV.CursorListCurrent(ctx, opts)
+		require.NoError(t, err)
+		require.Len(t, resp2.Keys, 1) // "c"
+		assert.Contains(t, resp2.Keys, "c")
+		assert.False(t, resp2.HasMore)
+		// "sub/d" should be filtered out
+	})
+
 	// Complex Hierarchy and Pagination
 	t.Run("Hierarchy_And_Pagination_Scenarios", func(t *testing.T) {
 		// Use a sub-namespace for this test

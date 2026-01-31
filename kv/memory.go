@@ -260,6 +260,112 @@ func (m *Memory) CursorList(ctx context.Context, opts *ListOptions) (*ListRespon
 	}, nil
 }
 
+// CursorListCurrent implements cursor-based pagination for current level.
+func (m *Memory) CursorListCurrent(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
+	// Get all keys and sort them lexicographically
+	allKeys := make([]string, 0)
+	now := time.Now()
+
+	m.data.Range(func(key, value interface{}) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+
+		k, ok := key.(string)
+		if !ok {
+			return true // skip non-string keys
+		}
+
+		// Filter by prefix
+		if !strings.HasPrefix(k, m.prefix) {
+			return true
+		}
+
+		// Filter children (Current Level Only)
+		rel := k[len(m.prefix):]
+		if strings.Contains(rel, "/") {
+			return true
+		}
+		if rel == "" {
+			return true
+		}
+
+		content, ok := value.(memoryContent)
+		if !ok {
+			return true // skip wrong value types
+		}
+
+		// Check expiration
+		if content.TTL != nil && now.After(*content.TTL) {
+			return true
+		}
+		allKeys = append(allKeys, k)
+		return true
+	})
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	// Sort keys
+	sort.Strings(allKeys)
+
+	// Handle cursor
+	startIndex := 0
+	if opts.Cursor != "" {
+		// Cursor is relative or absolute?
+		// Existing CursorList adds m.prefix if not present?
+		// Let's check CursorList implementation.
+		// "if m.prefix != "" { opts.Cursor = m.prefix + opts.Cursor }"
+		// It assumes opts.Cursor is relative.
+		cursor := opts.Cursor
+		if m.prefix != "" && !strings.HasPrefix(cursor, m.prefix) {
+			cursor = m.prefix + cursor
+		}
+		for i, key := range allKeys {
+			if key > cursor {
+				startIndex = i
+				break
+			}
+		}
+	}
+
+	// Calculate pagination
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = int64(len(allKeys)) // Default return all
+	}
+
+	endIndex := startIndex + int(limit)
+	if endIndex > len(allKeys) {
+		endIndex = len(allKeys)
+	}
+
+	// Strip prefix for response
+	if m.prefix != "" {
+		for i := range allKeys {
+			allKeys[i] = allKeys[i][len(m.prefix):]
+		}
+	}
+	// Build response
+	keys := allKeys[startIndex:endIndex]
+	hasMore := endIndex < len(allKeys)
+	var nextCursor string
+	if hasMore {
+		nextCursor = keys[len(keys)-1]
+	}
+
+	return &ListResponse{
+		Keys:    keys,
+		Cursor:  nextCursor,
+		HasMore: hasMore,
+	}, nil
+}
+
 // ListPage 分页获取前缀匹配的键值对
 // ListPage retrieves paginated key-value pairs matching the prefix.
 func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
@@ -270,6 +376,79 @@ func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, 
 
 	temp := make([]memoryKv, 0, len(internal))
 	for k, v := range internal {
+		temp = append(temp, memoryKv{Key: k, Val: v})
+	}
+
+	sort.Slice(temp, func(i, j int) bool {
+		return temp[i].Val.CreateAt.Before(temp[j].Val.CreateAt)
+	})
+
+	result := make(map[string]string)
+	start := int(pageSize * uint(pageIndex))
+	end := int(pageSize * uint(pageIndex+1))
+
+	if start >= len(temp) {
+		return result, nil
+	}
+
+	if end > len(temp) {
+		end = len(temp)
+	}
+
+	for _, item := range temp[start:end] {
+		if m.prefix != "" {
+			item.Key = item.Key[len(m.prefix):]
+		}
+		result[item.Key] = item.Val.Data
+	}
+	return result, nil
+}
+
+// ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
+func (m *Memory) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
+	internal, err := m.listInternal(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	temp := make([]memoryKv, 0, len(internal))
+	for k, v := range internal {
+		// Filter children
+		// k is full key. internal = listInternal(ctx, prefix)
+		// internal filters by m.prefix + prefix.
+		// we need to filter if (k without m.prefix+prefix) contains "/"
+
+		// Actually, standard ListCurrent logic:
+		// rel = k relative to (m.prefix + prefix) ?
+		// or k relative to m.prefix?
+		// In ListCurrent:
+		// rel := k[len(prefix):]  <-- This was wrong in ListCurrent implementation if k was full key?
+		// Let's re-verify ListCurrent implementation.
+		// In Memory.ListCurrent: `k = k[len(m.prefix):]`. Then `rel = k[len(prefix):]`.
+		// So `k` became relative to m.prefix.
+
+		// Here k is full key.
+
+		// Remove m.prefix
+		if !strings.HasPrefix(k, m.prefix) {
+			continue
+		}
+		relKV := k[len(m.prefix):]
+
+		// Remove prefix arg
+		if !strings.HasPrefix(relKV, prefix) {
+			continue
+		}
+
+		check := relKV[len(prefix):]
+		check = strings.TrimPrefix(check, "/")
+		if strings.Contains(check, "/") {
+			continue
+		}
+		if check == "" {
+			continue
+		}
+
 		temp = append(temp, memoryKv{Key: k, Val: v})
 	}
 
@@ -309,6 +488,61 @@ func (m *Memory) List(ctx context.Context, prefix string) (map[string]string, er
 		if m.prefix != "" {
 			k = k[len(m.prefix):]
 		}
+		result[k] = v.Data
+	}
+	return result, nil
+}
+
+// ListCurrent returns key-value pairs at the current level (excluding children).
+func (m *Memory) ListCurrent(ctx context.Context, prefix string) (map[string]string, error) {
+	result := make(map[string]string)
+	internal, err := m.listInternal(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range internal {
+		if m.prefix != "" {
+			k = k[len(m.prefix):]
+		}
+		// Skip if key contains separator after prefix
+		// m.listInternal already handles m.prefix + prefix filtering.
+		// Here k is full key relative to m.prefix (because listInternal returns full keys? No, wait.)
+		// listInternal returns keys relative to what?
+		// Let's check listInternal implementation.
+		// listInternal returns keys as they are stored (full keys? No, let's check).
+		// m.data.Range provides full keys.
+		// listInternal result[k] = content. k is full key.
+		// So `k` here is full key.
+		// We stripped m.prefix above: `k = k[len(m.prefix):]`.
+		// Now `k` is relative to Memory root.
+		// We want to filter based on `prefix` passed to function.
+		// If prefix is "sub/", keys are "sub/a", "sub/b/c".
+		// logic:
+		// rel = strings.TrimPrefix(k, prefix)
+		// if strings.Contains(rel, "/") { continue }
+
+		if !strings.HasPrefix(k, prefix) {
+			continue // Should not happen given listInternal logic but safe
+		}
+		rel := k[len(prefix):]
+		// Remove leading slash if prefix didn't have it?
+		// Usually keys are "path/to/key".
+		// If prefix is "path/", rel is "to/key". Contains "/" -> skip.
+		// If prefix is "path", rel is "/to/key". Contains "/" -> skip.
+		// If rel starts with "/", trim it?
+		// Standard: keys are "a/b".
+		// If prefix is "a", List("a") matches "a/b"?
+		// listInternal uses `strings.HasPrefix(k, m.prefix+prefix)`.
+		// So yes.
+
+		rel = strings.TrimPrefix(rel, "/")
+		if strings.Contains(rel, "/") {
+			continue
+		}
+		if rel == "" {
+			continue // Exact match of directory name? usually keys don't have empty name
+		}
+
 		result[k] = v.Data
 	}
 	return result, nil

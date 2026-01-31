@@ -73,15 +73,39 @@ func (e *Etcd) List(ctx context.Context, prefix string) (map[string]string, erro
 	result := make(map[string]string, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
-		// Extract relative key from the full key, removing the base prefix
-		// Note: The prefix parameter passed to List is part of the key name relative to e.prefix
-		// The requirement is usually to return keys relative to the searched prefix?
-		// Let's check Memory implementation.
-		// Memory: result[k] = v.Data (where k is relative to m.prefix).
-		// Wait, Memory.List: if m.prefix != "" { k = k[len(m.prefix):] }
-		// So it returns keys relative to the Base Prefix of the KV, NOT the list prefix.
-		// e.g. KV(prefix="root/"), List("sub") -> returns "sub/a", "sub/b".
 		relKey := e.extractKey(key)
+		result[relKey] = string(kv.Value)
+	}
+	return result, nil
+}
+
+// ListCurrent returns key-value pairs at the current level (excluding children).
+func (e *Etcd) ListCurrent(ctx context.Context, prefix string) (map[string]string, error) {
+	fullPrefix := e.prefix + prefix
+	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, fmt.Errorf("list current keys failed: %w", err)
+	}
+
+	result := make(map[string]string)
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		relKey := e.extractKey(key)
+
+		// Logic similar to Memory
+		if !strings.HasPrefix(relKey, prefix) {
+			continue
+		}
+
+		check := relKey[len(prefix):]
+		check = strings.TrimPrefix(check, "/")
+		if strings.Contains(check, "/") {
+			continue
+		}
+		if check == "" {
+			continue
+		}
+
 		result[relKey] = string(kv.Value)
 	}
 	return result, nil
@@ -137,6 +161,144 @@ func (e *Etcd) ListPage(ctx context.Context, prefix string, pageIndex uint64, pa
 	}
 
 	return result, nil
+}
+
+// ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
+func (e *Etcd) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
+	// Fetch all to filter (inefficient but safe for "current level" semantics)
+	fullPrefix := e.prefix + prefix
+	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix())
+	if err != nil {
+		return nil, fmt.Errorf("list current page failed: %w", err)
+	}
+
+	type kvPair struct {
+		key string
+		val string
+	}
+	kvs := make([]kvPair, 0)
+
+	for _, item := range resp.Kvs {
+		key := string(item.Key)
+		relKey := e.extractKey(key)
+
+		// Filter
+		if !strings.HasPrefix(relKey, prefix) {
+			continue
+		}
+
+		check := relKey[len(prefix):]
+		check = strings.TrimPrefix(check, "/")
+		if strings.Contains(check, "/") {
+			continue
+		}
+		if check == "" {
+			continue
+		}
+
+		kvs = append(kvs, kvPair{key: relKey, val: string(item.Value)})
+	}
+
+	// Sort by Key (consistent with Etcd ListPage)
+	sort.Slice(kvs, func(i, j int) bool {
+		return kvs[i].key < kvs[j].key
+	})
+
+	start := uint64(pageSize) * pageIndex
+	end := start + uint64(pageSize)
+
+	result := make(map[string]string)
+	if start >= uint64(len(kvs)) {
+		return result, nil
+	}
+	if end > uint64(len(kvs)) {
+		end = uint64(len(kvs))
+	}
+
+	for _, item := range kvs[start:end] {
+		result[item.key] = item.val
+	}
+
+	return result, nil
+}
+
+// CursorListCurrent implements cursor-based pagination for current level.
+func (e *Etcd) CursorListCurrent(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+	opts := &ListOptions{}
+	if options != nil {
+		opts = options
+	}
+	if opts.Limit == 0 {
+		opts.Limit = 1000
+	}
+
+	// Scan/Get all to filter correctly.
+	// Optimizing with WithFromKey is risky if many children exist between cursor and next sibling.
+	// We'll use the safe "Get All" approach for consistency with ListCurrent logic.
+
+	resp, err := e.client.Get(ctx, e.prefix, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	if err != nil {
+		return nil, fmt.Errorf("cursor list current failed: %w", err)
+	}
+
+	filteredKeys := make([]string, 0)
+	for _, kv := range resp.Kvs {
+		key := string(kv.Key)
+		relKey := e.extractKey(key)
+
+		if strings.Contains(relKey, "/") {
+			continue
+		}
+		if relKey == "" {
+			continue
+		}
+		filteredKeys = append(filteredKeys, relKey)
+	}
+
+	// Apply Cursor
+	startIndex := 0
+	if opts.Cursor != "" {
+		for i, key := range filteredKeys {
+			if key > opts.Cursor {
+				startIndex = i
+				break
+			}
+		}
+		// If cursor > all or not found logic
+		if startIndex == 0 && (len(filteredKeys) == 0 || filteredKeys[0] <= opts.Cursor) {
+			found := false
+			for i, key := range filteredKeys {
+				if key > opts.Cursor {
+					startIndex = i
+					found = true
+					break
+				}
+			}
+			if !found {
+				startIndex = len(filteredKeys)
+			}
+		}
+	}
+
+	// Apply Limit
+	endIndex := startIndex + int(opts.Limit)
+	if endIndex > len(filteredKeys) {
+		endIndex = len(filteredKeys)
+	}
+
+	resultKeys := filteredKeys[startIndex:endIndex]
+
+	var nextCursor string
+	hasMore := endIndex < len(filteredKeys)
+	if hasMore {
+		nextCursor = resultKeys[len(resultKeys)-1]
+	}
+
+	return &ListResponse{
+		Keys:    resultKeys,
+		Cursor:  nextCursor,
+		HasMore: hasMore,
+	}, nil
 }
 
 // Put stores a key-value pair. If ttl is not TTLKeep, it sets a lease.
