@@ -93,10 +93,16 @@ func (mc *MemoryCache) Child(paths ...string) Cache {
 	}
 }
 
-func (mc *MemoryCache) Put(_ context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error {
+func (mc *MemoryCache) Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error {
 	if mc.closed.Load() {
 		return ErrCacheClosed
 	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	key = mc.prefix + key
 	data, err := io.ReadAll(value)
 	if err != nil {
@@ -130,9 +136,14 @@ func (mc *MemoryCache) Put(_ context.Context, key string, metadata map[string]st
 	return nil
 }
 
-func (mc *MemoryCache) Get(_ context.Context, key string) (*Content, error) {
+func (mc *MemoryCache) Get(ctx context.Context, key string) (*Content, error) {
 	if mc.closed.Load() {
 		return nil, ErrCacheClosed
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
 	}
 
 	key = mc.prefix + key
@@ -161,10 +172,16 @@ func (mc *MemoryCache) Get(_ context.Context, key string) (*Content, error) {
 	}, nil
 }
 
-func (mc *MemoryCache) Delete(_ context.Context, key string) error {
+func (mc *MemoryCache) Delete(ctx context.Context, key string) error {
 	if mc.closed.Load() {
 		return ErrCacheClosed
 	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	key = mc.prefix + key
 	mc.mu.Lock()
 	mc.lruCache.Remove(key)

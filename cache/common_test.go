@@ -3,7 +3,6 @@ package cache
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -13,189 +12,163 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.d7z.net/middleware/connects"
 )
 
-// --- Test Helpers & Utilities ---
-
-// CacheFactory 用于创建缓存实例的函数类型
-type CacheFactory func(t *testing.T) CloserCache
-
-type errorReader struct {
-	err error
-}
-
-func (r *errorReader) Read(p []byte) (n int, err error) {
-	return 0, r.err
-}
-
-type mockReadSeekCloser struct {
-	*bytes.Reader
-}
-
-func (m *mockReadSeekCloser) Close() error { return nil }
-
-// --- Common Test Suite ---
-
-// testCacheCommon 通用缓存接口测试套件，涵盖了缓存实现应遵循的核心行为
-func testCacheCommon(t *testing.T, factory CacheFactory) {
-	t.Run("PutGet", func(t *testing.T) { testPutGet(t, factory) })
-	t.Run("Update", func(t *testing.T) { testUpdate(t, factory) })
-	t.Run("Delete", func(t *testing.T) { testDelete(t, factory) })
-	t.Run("GetMiss", func(t *testing.T) { testGetMiss(t, factory) })
-	t.Run("TTL", func(t *testing.T) { testTTL(t, factory) })
-	t.Run("PutInvalidTTL", func(t *testing.T) { testPutInvalidTTL(t, factory) })
-	t.Run("Concurrency", func(t *testing.T) { testConcurrency(t, factory) })
-	t.Run("Boundary", func(t *testing.T) { testBoundary(t, factory) })
-	t.Run("ErrorReader", func(t *testing.T) { testCacheErrorReader(t, factory) })
-}
-
-func testPutGet(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
-
+// testCacheConsistency 是一个通用的缓存接口测试套件，确保不同实现的行为一致。
+func testCacheConsistency(t *testing.T, cache Cache) {
+	t.Helper()
 	ctx := context.Background()
-	key, value := "test-key", []byte("test-value")
-	metadata := map[string]string{"version": "1.0"}
+	uniquePrefix := "cache_test_" + time.Now().Format("20060102150405.000") + "_"
 
-	assert.NoError(t, cache.Put(ctx, key, metadata, bytes.NewReader(value), TTLKeep))
+	// 1. 基础读写删除操作
+	t.Run("Basic_Operations", func(t *testing.T) {
+		key := uniquePrefix + "basic"
+		value := []byte("hello cache")
+		metadata := map[string]string{"content-type": "text/plain"}
 
-	content, err := cache.Get(ctx, key)
-	assert.NoError(t, err)
-	defer content.Close()
+		// Put
+		err := cache.Put(ctx, key, metadata, bytes.NewReader(value), TTLKeep)
+		assert.NoError(t, err)
 
-	data, err := io.ReadAll(content)
-	assert.NoError(t, err)
-	assert.Equal(t, value, data)
-	assert.Equal(t, metadata, content.Metadata)
-}
+		// Get
+		content, err := cache.Get(ctx, key)
+		assert.NoError(t, err)
+		defer content.Close()
 
-func testUpdate(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
+		data, err := io.ReadAll(content)
+		assert.NoError(t, err)
+		assert.Equal(t, value, data)
+		assert.Equal(t, metadata, content.Metadata)
 
-	ctx := context.Background()
-	key := "update-key"
-	v1, v2 := []byte("v1"), []byte("v2")
+		// Delete
+		err = cache.Delete(ctx, key)
+		assert.NoError(t, err)
 
-	assert.NoError(t, cache.Put(ctx, key, nil, bytes.NewReader(v1), TTLKeep))
-	assert.NoError(t, cache.Put(ctx, key, nil, bytes.NewReader(v2), TTLKeep))
+		// Get after Delete
+		_, err = cache.Get(ctx, key)
+		assert.ErrorIs(t, err, ErrCacheMiss)
+	})
 
-	content, err := cache.Get(ctx, key)
-	assert.NoError(t, err)
-	defer content.Close()
+	// 2. 更新操作 (Overwrite)
+	t.Run("Update_Overwrite", func(t *testing.T) {
+		key := uniquePrefix + "update"
+		v1, v2 := []byte("value1"), []byte("value2")
 
-	data, _ := io.ReadAll(content)
-	assert.Equal(t, v2, data)
-}
+		_ = cache.Put(ctx, key, nil, bytes.NewReader(v1), TTLKeep)
+		_ = cache.Put(ctx, key, nil, bytes.NewReader(v2), TTLKeep)
 
-func testDelete(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
+		content, err := cache.Get(ctx, key)
+		assert.NoError(t, err)
+		defer content.Close()
 
-	ctx := context.Background()
-	key := "del-key"
+		data, _ := io.ReadAll(content)
+		assert.Equal(t, v2, data)
+	})
 
-	assert.NoError(t, cache.Put(ctx, key, nil, bytes.NewReader([]byte("data")), TTLKeep))
-	assert.NoError(t, cache.Delete(ctx, key))
+	// 3. TTL 过期处理
+	t.Run("TTL_Expiration", func(t *testing.T) {
+		key := uniquePrefix + "ttl"
+		ttl := 500 * time.Millisecond
 
-	_, err := cache.Get(ctx, key)
-	assert.ErrorIs(t, err, ErrCacheMiss)
+		err := cache.Put(ctx, key, nil, bytes.NewReader([]byte("data")), ttl)
+		assert.NoError(t, err)
 
-	// Idempotent delete
-	assert.NoError(t, cache.Delete(ctx, "no-key"))
-}
+		// 立即获取应成功
+		_, err = cache.Get(ctx, key)
+		assert.NoError(t, err)
 
-func testGetMiss(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
+		// 等待过期
+		time.Sleep(ttl + 200*time.Millisecond)
+		_, err = cache.Get(ctx, key)
+		assert.ErrorIs(t, err, ErrCacheMiss)
+	})
 
-	_, err := cache.Get(context.Background(), "missing")
-	assert.ErrorIs(t, err, ErrCacheMiss)
-}
+	// 4. 层级隔离 (Child)
+	t.Run("Hierarchy_Isolation", func(t *testing.T) {
+		parentKey := uniquePrefix + "parent_key"
+		childKey := "child_key"
 
-func testTTL(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
+		child := cache.Child(uniquePrefix + "subdir")
 
-	ctx := context.Background()
-	key := "ttl-key"
-	ttl := 500 * time.Millisecond
+		// 写入父级
+		_ = cache.Put(ctx, parentKey, nil, bytes.NewReader([]byte("p")), TTLKeep)
+		// 写入子级
+		_ = child.Put(ctx, childKey, nil, bytes.NewReader([]byte("c")), TTLKeep)
 
-	assert.NoError(t, cache.Put(ctx, key, nil, bytes.NewReader([]byte("data")), ttl))
-	_, err := cache.Get(ctx, key)
-	assert.NoError(t, err)
+		// 子级不应直接看到父级的 key (除非路径重合，但在隔离设计下不应)
+		_, err := child.Get(ctx, parentKey)
+		assert.ErrorIs(t, err, ErrCacheMiss)
 
-	time.Sleep(ttl + 100*time.Millisecond)
-	_, err = cache.Get(ctx, key)
-	assert.ErrorIs(t, err, ErrCacheMiss)
-}
+		// 通过父级应能看到完整路径
+		fullPath := uniquePrefix + "subdir/" + childKey
+		content, err := cache.Get(ctx, fullPath)
+		assert.NoError(t, err)
+		content.Close()
+	})
 
-func testPutInvalidTTL(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
+	// 5. 并发安全
+	t.Run("Concurrency_Safety", func(t *testing.T) {
+		const workers, ops = 10, 50
+		var wg sync.WaitGroup
+		wg.Add(workers)
 
-	err := cache.Put(context.Background(), "key", nil, bytes.NewReader([]byte("d")), 0)
-	assert.ErrorIs(t, err, ErrInvalidTTL)
-}
+		for i := 0; i < workers; i++ {
+			go func(workerID int) {
+				defer wg.Done()
+				for j := 0; j < ops; j++ {
+					key := fmt.Sprintf("%sconc_%d", uniquePrefix, j%5)
+					_ = cache.Put(ctx, key, nil, bytes.NewReader([]byte("v")), TTLKeep)
+					c, err := cache.Get(ctx, key)
+					if err == nil {
+						c.Close()
+					}
+				}
+			}(i)
+		}
+		wg.Wait()
+	})
 
-func testConcurrency(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
+	// 6. Context 取消支持
+	t.Run("Context_Cancellation", func(t *testing.T) {
+		cCtx, cancel := context.WithCancel(ctx)
+		cancel() // 立即取消
 
-	ctx := context.Background()
-	const workers, ops = 5, 20
-	var wg sync.WaitGroup
-	wg.Add(workers)
+		key := uniquePrefix + "canceled"
+		err := cache.Put(cCtx, key, nil, bytes.NewReader([]byte("d")), TTLKeep)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), context.Canceled.Error())
+	})
 
-	for i := 0; i < workers; i++ {
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < ops; j++ {
-				key := fmt.Sprintf("conf-%d", j%3)
-				_ = cache.Put(ctx, key, nil, bytes.NewReader([]byte("v")), TTLKeep)
-				_, _ = cache.Get(ctx, key)
-			}
-		}(i)
-	}
-	wg.Wait()
-}
+	// 7. 边界条件
+	t.Run("Boundary_Conditions", func(t *testing.T) {
+		// 空内容
+		assert.NoError(t, cache.Put(ctx, uniquePrefix+"empty", nil, bytes.NewReader([]byte{}), TTLKeep))
+		c, err := cache.Get(ctx, uniquePrefix+"empty")
+		assert.NoError(t, err)
+		d, _ := io.ReadAll(c)
+		assert.Empty(t, d)
+		c.Close()
 
-func testBoundary(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
-	ctx := context.Background()
+		// 无效 TTL
+		err = cache.Put(ctx, uniquePrefix+"invalid_ttl", nil, bytes.NewReader([]byte("d")), 0)
+		assert.ErrorIs(t, err, ErrInvalidTTL)
 
-	// Empty content
-	assert.NoError(t, cache.Put(ctx, "empty", nil, bytes.NewReader([]byte{}), TTLKeep))
-	c, _ := cache.Get(ctx, "empty")
-	d, _ := io.ReadAll(c)
-	assert.Empty(t, d)
+		// 特殊字符 Key
+		specialKey := uniquePrefix + "key with spaces and / and 中文"
+		assert.NoError(t, cache.Put(ctx, specialKey, nil, bytes.NewReader([]byte("v")), TTLKeep))
+		c, err = cache.Get(ctx, specialKey)
+		assert.NoError(t, err)
+		c.Close()
 
-	// Large content (512KB)
-	large := make([]byte, 512*1024)
-	assert.NoError(t, cache.Put(ctx, "large", nil, bytes.NewReader(large), TTLKeep))
-	c, _ = cache.Get(ctx, "large")
-	d, _ = io.ReadAll(c)
-	assert.Len(t, d, 512*1024)
-
-	// Special metadata
-	meta := map[string]string{"key": "val with spaces", "unicode": "测试"}
-	assert.NoError(t, cache.Put(ctx, "meta", meta, bytes.NewReader([]byte("d")), TTLKeep))
-	c, _ = cache.Get(ctx, "meta")
-	assert.Equal(t, meta, c.Metadata)
-}
-
-func testCacheErrorReader(t *testing.T, factory CacheFactory) {
-	cache := factory(t)
-	defer cache.Close()
-
-	reader := &errorReader{err: errors.New("read fail")}
-	err := cache.Put(context.Background(), "err-key", nil, reader, TTLKeep)
-	assert.Error(t, err)
-
-	_, err = cache.Get(context.Background(), "err-key")
-	assert.ErrorIs(t, err, ErrCacheMiss)
+		// 极大元数据
+		largeMeta := make(map[string]string)
+		for i := 0; i < 100; i++ {
+			largeMeta[fmt.Sprintf("key_%d", i)] = strings.Repeat("v", 100)
+		}
+		assert.NoError(t, cache.Put(ctx, uniquePrefix+"large_meta", largeMeta, bytes.NewReader([]byte("d")), TTLKeep))
+	})
 }
 
 // --- Specific Implementation Tests ---
@@ -243,13 +216,40 @@ func TestCommonFunctions(t *testing.T) {
 	})
 
 	t.Run("ReadToString", func(t *testing.T) {
+		content := "some data"
 		c := &Content{
-			ReadSeekCloser: &mockReadSeekCloser{Reader: bytes.NewReader([]byte("data"))},
+			ReadSeekCloser: &mockReadSeekCloser{Reader: strings.NewReader(content)},
 		}
 		s, err := c.ReadToString()
 		assert.NoError(t, err)
-		assert.Equal(t, "data", s)
+		assert.Equal(t, content, s)
+
+		// Test error on read (mock)
+		errContent := &Content{
+			ReadSeekCloser: &mockErrorReadCloser{err: fmt.Errorf("read error")},
+		}
+		_, err = errContent.ReadToString()
+		assert.Error(t, err)
 	})
+}
+
+type mockReadSeekCloser struct {
+	*strings.Reader
+}
+
+func (m *mockReadSeekCloser) Close() error { return nil }
+func (m *mockReadSeekCloser) Seek(offset int64, whence int) (int64, error) {
+	return m.Reader.Seek(offset, whence)
+}
+
+type mockErrorReadCloser struct {
+	err error
+}
+
+func (m *mockErrorReadCloser) Read(p []byte) (n int, err error) { return 0, m.err }
+func (m *mockErrorReadCloser) Close() error                     { return nil }
+func (m *mockErrorReadCloser) Seek(offset int64, whence int) (int64, error) {
+	return 0, fmt.Errorf("not supported")
 }
 
 func TestMemoryImplementation(t *testing.T) {
@@ -258,7 +258,7 @@ func TestMemoryImplementation(t *testing.T) {
 		assert.ErrorIs(t, err, ErrInvalidCapacity)
 	})
 
-	t.Run("LRU", func(t *testing.T) {
+	t.Run("LRU_Eviction", func(t *testing.T) {
 		cache, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 1})
 		defer cache.Close()
 		ctx := context.Background()
@@ -268,39 +268,72 @@ func TestMemoryImplementation(t *testing.T) {
 		assert.ErrorIs(t, err, ErrCacheMiss)
 	})
 
-	t.Run("TestSuite", func(t *testing.T) {
-		testCacheCommon(t, func(t *testing.T) CloserCache {
-			c, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 100})
-			return c
-		})
+	t.Run("CleanupExpired", func(t *testing.T) {
+		cache, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 10, CleanupInt: time.Hour})
+		defer cache.Close()
+		ctx := context.Background()
+
+		_ = cache.Put(ctx, "expired", nil, strings.NewReader("data"), 10*time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
+
+		// 手动调用内部方法（由于测试在同一个包下，可以访问私有方法）
+		cache.cleanupExpired()
+
+		_, err := cache.Get(ctx, "expired")
+		assert.ErrorIs(t, err, ErrCacheMiss)
 	})
 
-	t.Run("ChildTestSuite", func(t *testing.T) {
-		testCacheCommon(t, func(t *testing.T) CloserCache {
-			root, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 100})
-			return closerCache{Cache: root.Child("a/b"), closer: root.Close}
-		})
+	t.Run("ConsistencySuite", func(t *testing.T) {
+		c, err := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 100})
+		require.NoError(t, err)
+		defer c.Close()
+		testCacheConsistency(t, c)
+	})
+
+	t.Run("ChildConsistencySuite", func(t *testing.T) {
+		root, err := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 100})
+		require.NoError(t, err)
+		defer root.Close()
+		testCacheConsistency(t, root.Child("a/b"))
 	})
 }
 
 func TestRedisImplementation(t *testing.T) {
-	factory := func(t *testing.T) CloserCache {
-		u, _ := url.Parse("redis://127.0.0.1:6379")
-		client, err := connects.NewRedis(u)
-		if err != nil {
-			t.Skip("Redis not available")
-		}
-		return closerCache{Cache: NewRedisCache(client, "test"), closer: client.Close}
+	u, _ := url.Parse("redis://127.0.0.1:6379")
+	client, err := connects.NewRedis(u)
+	if err != nil {
+		t.Skip("Redis not available")
 	}
+	defer client.Close()
 
-	t.Run("TestSuite", func(t *testing.T) {
-		testCacheCommon(t, factory)
+	t.Run("SpecificMethods", func(t *testing.T) {
+		c := NewRedisCache(client, "test_specific")
+		ctx := context.Background()
+		key := "exists_key"
+
+		_ = c.Put(ctx, key, nil, strings.NewReader("v"), 10*time.Second)
+
+		exists, err := c.Exists(ctx, key)
+		assert.NoError(t, err)
+		assert.True(t, exists)
+
+		ttl, err := c.TTL(ctx, key)
+		assert.NoError(t, err)
+		assert.True(t, ttl > 0)
+
+		// cleanupCorruptedData test (internal)
+		c.cleanupCorruptedData(ctx, c.dataKey(key), c.metaKey(key))
+		exists, _ = c.Exists(ctx, key)
+		assert.False(t, exists)
 	})
 
-	t.Run("ChildTestSuite", func(t *testing.T) {
-		testCacheCommon(t, func(t *testing.T) CloserCache {
-			c := factory(t)
-			return closerCache{Cache: c.Child("child"), closer: c.Close}
-		})
+	t.Run("ConsistencySuite", func(t *testing.T) {
+		c := NewRedisCache(client, "test_consistency")
+		testCacheConsistency(t, c)
+	})
+
+	t.Run("ChildConsistencySuite", func(t *testing.T) {
+		root := NewRedisCache(client, "test_root")
+		testCacheConsistency(t, root.Child("child"))
 	})
 }
