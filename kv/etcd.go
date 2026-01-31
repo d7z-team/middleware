@@ -54,7 +54,9 @@ func (e *Etcd) Count(ctx context.Context) (int64, error) {
 }
 
 func (e *Etcd) buildKey(key string) (string, error) {
-	key = strings.TrimPrefix(key, "/")
+	if strings.Contains(key, "/") {
+		return "", ErrInvalidKey
+	}
 	return e.prefix + key, nil
 }
 

@@ -61,15 +61,14 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.NoError(t, err)
 		got, err := kvClient.Get(ctx, keyEmptyVal)
 		assert.NoError(t, err)
-		assert.Equal(t, "", got)
+		assert.Empty(t, got)
 
 		// Keys with special characters
-		// Note: We expect all implementations to handle these (including slashes)
+		// Note: We expect all implementations to handle these (excluding slashes)
 		specialKeys := map[string]string{
 			uniquePrefix + "space key":   "space",
 			uniquePrefix + "dash-key":    "dash",
 			uniquePrefix + "under_score": "underscore",
-			uniquePrefix + "slash/key":   "slash", // Hierarchy implied
 			uniquePrefix + "中文key":       "unicode",
 			uniquePrefix + "dot.key":     "dot",
 			uniquePrefix + "eq=key":      "equal",
@@ -161,21 +160,21 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		_ = kvClient.Put(ctx, key, "old", TTLKeep)
 
 		// Success
-		ok, err := kvClient.CompareAndSwap(ctx, key, "old", "new")
+		done, err := kvClient.CompareAndSwap(ctx, key, "old", "new")
 		assert.NoError(t, err)
-		assert.True(t, ok)
+		assert.True(t, done)
 		got, _ := kvClient.Get(ctx, key)
 		assert.Equal(t, "new", got)
 
 		// Failure (value mismatch)
-		ok, err = kvClient.CompareAndSwap(ctx, key, "wrong", "fail")
+		done, err = kvClient.CompareAndSwap(ctx, key, "wrong", "fail")
 		assert.NoError(t, err)
-		assert.False(t, ok)
+		assert.False(t, done)
 		got, _ = kvClient.Get(ctx, key)
 		assert.Equal(t, "new", got)
 
 		// Failure (key not found)
-		ok, err = kvClient.CompareAndSwap(ctx, uniquePrefix+"missing", "any", "val")
+		_, err = kvClient.CompareAndSwap(ctx, uniquePrefix+"missing", "any", "val")
 		assert.Error(t, err)
 		assert.True(t, errors.Is(err, ErrKeyNotFound) || errors.Is(err, os.ErrNotExist), "Should return KeyNotFound error")
 	})
@@ -200,14 +199,12 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		err = subKV.Put(ctx, "a", "val_a", TTLKeep)
 		assert.NoError(t, err)
 
-		// We Put `uniquePrefix + "child/direct_put"` into kvClient.
-		directKey := uniquePrefix + "child/direct_put"
-		err = kvClient.Put(ctx, directKey, "direct_val", TTLKeep)
+		// We Put `uniquePrefix + "child/direct_put"` into kvClient via Child.
+		cKV := kvClient.Child(uniquePrefix, "child")
+		err = cKV.Put(ctx, "direct_put", "direct_val", TTLKeep)
 		assert.NoError(t, err)
 
-		// Create child for that path
-		cKV := kvClient.Child(uniquePrefix + "child")
-		// Should be able to get "direct_put"
+		// Should be able to get "direct_put" from the same child
 		got, err = cKV.Get(ctx, "direct_put")
 		assert.NoError(t, err)
 		assert.Equal(t, "direct_val", got)
@@ -319,7 +316,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		// Add items
 		_ = child.Put(ctx, "k1", "v", TTLKeep)
 		_ = child.Put(ctx, "k2", "v", TTLKeep)
-		_ = child.Put(ctx, "sub/k3", "v", TTLKeep) // Recursive count check
+		_ = child.Child("sub").Put(ctx, "k3", "v", TTLKeep) // Recursive count check
 
 		c, err = child.Count(ctx)
 		assert.NoError(t, err)
@@ -332,11 +329,12 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		daKV := kvClient.Child(daPrefix)
 
 		// Populate
-		keys := []string{"k1", "k2", "sub/k3"}
-		for _, k := range keys {
-			err := daKV.Put(ctx, k, "val", TTLKeep)
-			require.NoError(t, err)
-		}
+		err := daKV.Put(ctx, "k1", "val", TTLKeep)
+		require.NoError(t, err)
+		err = daKV.Put(ctx, "k2", "val", TTLKeep)
+		require.NoError(t, err)
+		err = daKV.Child("sub").Put(ctx, "k3", "val", TTLKeep)
+		require.NoError(t, err)
 
 		// Verify count before
 		c, err := daKV.Count(ctx)
@@ -353,10 +351,12 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		require.Equal(t, int64(0), c)
 
 		// Verify individual keys are gone
-		for _, k := range keys {
-			_, err := daKV.Get(ctx, k)
-			require.ErrorIs(t, err, ErrKeyNotFound)
-		}
+		_, err = daKV.Get(ctx, "k1")
+		require.ErrorIs(t, err, ErrKeyNotFound)
+		_, err = daKV.Get(ctx, "k2")
+		require.ErrorIs(t, err, ErrKeyNotFound)
+		_, err = daKV.Child("sub").Get(ctx, "k3")
+		require.ErrorIs(t, err, ErrKeyNotFound)
 	})
 
 	// Concurrency Safety
@@ -364,18 +364,18 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		var wg sync.WaitGroup
 		concurrency := 10
 		ops := 50
-		prefix := uniquePrefix + "conc/"
+		concKV := kvClient.Child(uniquePrefix, "conc")
 
 		for i := 0; i < concurrency; i++ {
 			wg.Add(1)
 			go func(id int) {
 				defer wg.Done()
 				for j := 0; j < ops; j++ {
-					key := fmt.Sprintf("%s%d-%d", prefix, id, j)
-					err := kvClient.Put(ctx, key, "val", TTLKeep)
+					key := fmt.Sprintf("%d-%d", id, j)
+					err := concKV.Put(ctx, key, "val", TTLKeep)
 					assert.NoError(t, err)
 
-					_, err = kvClient.Get(ctx, key)
+					_, err = concKV.Get(ctx, key)
 					assert.NoError(t, err)
 				}
 			}(i)
@@ -383,7 +383,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		wg.Wait()
 
 		// Verify count
-		count, err := kvClient.Child(uniquePrefix + "conc").Count(ctx)
+		count, err := concKV.Count(ctx)
 		assert.NoError(t, err)
 		assert.Equal(t, int64(concurrency*ops), count)
 	})
@@ -410,9 +410,8 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		err := l3.Put(ctx, key, "deep_val", TTLKeep)
 		assert.NoError(t, err)
 
-		// Verify visibility from top
-		fullKey := uniquePrefix + "level1/level2/level3/" + key
-		val, err := kvClient.Get(ctx, fullKey)
+		// Verify visibility from top via child navigation
+		val, err := kvClient.Child(uniquePrefix+"level1").Child("level2", "level3").Get(ctx, key)
 		assert.NoError(t, err)
 		assert.Equal(t, "deep_val", val)
 	})
@@ -454,18 +453,11 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		// sub/d
 		// deep/e/f
 
-		keys := map[string]string{
-			"a":        "val_a",
-			"b":        "val_b",
-			"sub/c":    "val_c",
-			"sub/d":    "val_d",
-			"deep/e/f": "val_f",
-		}
-
-		for k, v := range keys {
-			err := lcKV.Put(ctx, k, v, TTLKeep)
-			require.NoError(t, err)
-		}
+		_ = lcKV.Put(ctx, "a", "val_a", TTLKeep)
+		_ = lcKV.Put(ctx, "b", "val_b", TTLKeep)
+		_ = lcKV.Child("sub").Put(ctx, "c", "val_c", TTLKeep)
+		_ = lcKV.Child("sub").Put(ctx, "d", "val_d", TTLKeep)
+		_ = lcKV.Child("deep", "e").Put(ctx, "f", "val_f", TTLKeep)
 
 		// 1. Root level list
 		current, err := lcKV.ListCurrent(ctx, "")
@@ -480,6 +472,9 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		currentSub, err := lcKV.ListCurrent(ctx, "sub/")
 		require.NoError(t, err)
 		assert.Len(t, currentSub, 2)
+		// Note: ListCurrent returns keys relative to prefix argument?
+		// Actually Memory and Redis return relative to root? Let's check.
+		// Memory.ListCurrent returns `result[k] = v.Data` where `k` is relative to Memory instance root.
 		assert.Equal(t, "val_c", currentSub["sub/c"])
 		assert.Equal(t, "val_d", currentSub["sub/d"])
 
@@ -502,10 +497,11 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 		// Create files: a, b, c, d
 		// Create subdirs: sub/e
-		keys := []string{"a", "b", "c", "d", "sub/e"}
-		for _, k := range keys {
-			_ = lcpKV.Put(ctx, k, "val", TTLKeep)
-		}
+		_ = lcpKV.Put(ctx, "a", "val", TTLKeep)
+		_ = lcpKV.Put(ctx, "b", "val", TTLKeep)
+		_ = lcpKV.Put(ctx, "c", "val", TTLKeep)
+		_ = lcpKV.Put(ctx, "d", "val", TTLKeep)
+		_ = lcpKV.Child("sub").Put(ctx, "e", "val", TTLKeep)
 
 		// Page 1 (Limit 2) -> a, b
 		p1, err := lcpKV.ListCurrentPage(ctx, "", 0, 2)
@@ -523,19 +519,19 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		// Check full list coverage across pages
 		allItems := make(map[string]string)
 
-		p1_all, _ := lcpKV.ListCurrentPage(ctx, "", 0, 2)
-		for k, v := range p1_all {
+		p1All, _ := lcpKV.ListCurrentPage(ctx, "", 0, 2)
+		for k, v := range p1All {
 			allItems[k] = v
 		}
 
-		p2_all, _ := lcpKV.ListCurrentPage(ctx, "", 1, 2)
-		for k, v := range p2_all {
+		p2All, _ := lcpKV.ListCurrentPage(ctx, "", 1, 2)
+		for k, v := range p2All {
 			allItems[k] = v
 		}
 
-		p3_all, _ := lcpKV.ListCurrentPage(ctx, "", 2, 2) // Should be empty or last item if logic allows?
+		p3All, _ := lcpKV.ListCurrentPage(ctx, "", 2, 2) // Should be empty or last item if logic allows?
 		// 4 items total at current level. Page 0: 2, Page 1: 2, Page 2: 0.
-		for k, v := range p3_all {
+		for k, v := range p3All {
 			allItems[k] = v
 		}
 
@@ -550,10 +546,10 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		clcKV := kvClient.Child(clcPrefix)
 
 		// a, b, c, sub/d
-		keys := []string{"a", "b", "c", "sub/d"}
-		for _, k := range keys {
-			_ = clcKV.Put(ctx, k, "val", TTLKeep)
-		}
+		_ = clcKV.Put(ctx, "a", "val", TTLKeep)
+		_ = clcKV.Put(ctx, "b", "val", TTLKeep)
+		_ = clcKV.Put(ctx, "c", "val", TTLKeep)
+		_ = clcKV.Child("sub").Put(ctx, "d", "val", TTLKeep)
 
 		opts := &ListOptions{Limit: 2}
 
@@ -584,11 +580,10 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 		// Data:
 		// a, a/c1, a/c2, b
-		keys := []string{"a", "a/c1", "a/c2", "b"}
-		for _, k := range keys {
-			err := hKV.Put(ctx, k, "val_"+k, TTLKeep)
-			require.NoError(t, err)
-		}
+		_ = hKV.Put(ctx, "a", "val_a", TTLKeep)
+		_ = hKV.Child("a").Put(ctx, "c1", "val_a/c1", TTLKeep)
+		_ = hKV.Child("a").Put(ctx, "c2", "val_a/c2", TTLKeep)
+		_ = hKV.Put(ctx, "b", "val_b", TTLKeep)
 
 		// 2. 验证父级分页 (CursorList)
 		t.Run("Parent_Pagination", func(t *testing.T) {
@@ -651,7 +646,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 			err := childKV.Put(ctx, "c3", "val_child_put", TTLKeep)
 			require.NoError(t, err)
 
-			val, err := hKV.Get(ctx, "a/c3")
+			val, err := hKV.Child("a").Get(ctx, "c3")
 			require.NoError(t, err)
 			assert.Equal(t, "val_child_put", val)
 		})
@@ -667,7 +662,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 			require.NoError(t, err)
 			assert.Equal(t, "val_multi", val)
 
-			valParent, err := hKV.Get(ctx, "x/y/key")
+			valParent, err := hKV.Child("x", "y").Get(ctx, "key")
 			require.NoError(t, err)
 			assert.Equal(t, "val_multi", valParent)
 

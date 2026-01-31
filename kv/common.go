@@ -138,4 +138,5 @@ func NewKVFromURL(s string) (CloserKV, error) {
 var (
 	ErrKeyNotFound = errors.Join(os.ErrNotExist, errors.New("key not found"))
 	ErrCASFailed   = errors.New("compare and swap failed")
+	ErrInvalidKey  = errors.New("key must not contain '/'")
 )

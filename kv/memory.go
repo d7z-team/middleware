@@ -587,6 +587,13 @@ func (m *Memory) listInternal(ctx context.Context, prefix string) (map[string]me
 	return result, nil
 }
 
+func (m *Memory) buildKey(key string) (string, error) {
+	if strings.Contains(key, "/") {
+		return "", ErrInvalidKey
+	}
+	return m.prefix + key, nil
+}
+
 // Put stores a key-value pair with an optional TTL.
 func (m *Memory) Put(ctx context.Context, key, value string, ttl time.Duration) error {
 	select {
@@ -594,8 +601,11 @@ func (m *Memory) Put(ctx context.Context, key, value string, ttl time.Duration) 
 		return ctx.Err()
 	default:
 	}
+	fullKey, err := m.buildKey(key)
+	if err != nil {
+		return err
+	}
 	now := time.Now()
-	fullKey := m.prefix + key
 
 	var td *time.Time
 	createAt := now
@@ -632,7 +642,10 @@ func (m *Memory) Get(ctx context.Context, key string) (string, error) {
 	default:
 	}
 	// Add prefix to key
-	fullKey := m.prefix + key
+	fullKey, err := m.buildKey(key)
+	if err != nil {
+		return "", err
+	}
 	if value, ok := m.data.Load(fullKey); ok {
 		content, ok := value.(memoryContent)
 		if !ok {
@@ -659,7 +672,10 @@ func (m *Memory) Delete(ctx context.Context, key string) (bool, error) {
 	default:
 	}
 	// Add prefix to key
-	fullKey := m.prefix + key
+	fullKey, err := m.buildKey(key)
+	if err != nil {
+		return false, err
+	}
 	_, loaded := m.data.LoadAndDelete(fullKey)
 	return loaded, nil
 }
@@ -692,6 +708,10 @@ func (m *Memory) PutIfNotExists(ctx context.Context, key, value string, ttl time
 		return false, ctx.Err()
 	default:
 	}
+	fullKey, err := m.buildKey(key)
+	if err != nil {
+		return false, err
+	}
 	now := time.Now()
 	var td *time.Time
 	if ttl != -1 {
@@ -699,8 +719,6 @@ func (m *Memory) PutIfNotExists(ctx context.Context, key, value string, ttl time
 		td = &d
 	}
 
-	// Add prefix to key
-	fullKey := m.prefix + key
 	newValue := memoryContent{
 		Data:     value,
 		TTL:      td,
@@ -739,7 +757,10 @@ func (m *Memory) CompareAndSwap(ctx context.Context, key, oldValue, newValue str
 	default:
 	}
 	// Add prefix to key
-	fullKey := m.prefix + key
+	fullKey, err := m.buildKey(key)
+	if err != nil {
+		return false, err
+	}
 	val, exists := m.data.Load(fullKey)
 	if !exists {
 		return false, ErrKeyNotFound

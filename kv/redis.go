@@ -75,9 +75,19 @@ func (r *RedisKV) Child(paths ...string) KV {
 	}
 }
 
+func (r *RedisKV) buildKey(key string) (string, error) {
+	if strings.Contains(key, "/") {
+		return "", ErrInvalidKey
+	}
+	return r.prefix + key, nil
+}
+
 // Put stores a key-value pair.
 func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration) error {
-	fullKey := r.prefix + key
+	fullKey, err := r.buildKey(key)
+	if err != nil {
+		return err
+	}
 	if ttl == TTLKeep {
 		return r.client.Set(ctx, fullKey, value, redis.KeepTTL).Err()
 	}
@@ -86,7 +96,10 @@ func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration)
 
 // Get retrieves the value for a key. Returns ErrKeyNotFound if not found.
 func (r *RedisKV) Get(ctx context.Context, key string) (string, error) {
-	fullKey := r.prefix + key
+	fullKey, err := r.buildKey(key)
+	if err != nil {
+		return "", err
+	}
 	val, err := r.client.Get(ctx, fullKey).Result()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
@@ -99,7 +112,10 @@ func (r *RedisKV) Get(ctx context.Context, key string) (string, error) {
 
 // Delete removes a key.
 func (r *RedisKV) Delete(ctx context.Context, key string) (bool, error) {
-	fullKey := r.prefix + key
+	fullKey, err := r.buildKey(key)
+	if err != nil {
+		return false, err
+	}
 	delCount, err := r.client.Del(ctx, fullKey).Result()
 	if err != nil {
 		return false, err
@@ -139,7 +155,10 @@ func (r *RedisKV) DeleteAll(ctx context.Context) error {
 
 // PutIfNotExists sets the value only if the key does not exist.
 func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
-	fullKey := r.prefix + key
+	fullKey, err := r.buildKey(key)
+	if err != nil {
+		return false, err
+	}
 	var cmd *redis.BoolCmd
 
 	pipe := r.client.Pipeline()
@@ -151,7 +170,7 @@ func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl tim
 		cmd = pipe.SetNX(ctx, fullKey, value, ttl)
 	}
 
-	_, err := pipe.Exec(ctx)
+	_, err = pipe.Exec(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -161,7 +180,10 @@ func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl tim
 
 // CompareAndSwap updates the value if it matches the old value.
 func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
-	fullKey := r.prefix + key
+	fullKey, err := r.buildKey(key)
+	if err != nil {
+		return false, err
+	}
 
 	if err := r.client.Watch(ctx, func(tx *redis.Tx) error {
 		currentVal, err := tx.Get(ctx, fullKey).Result()
@@ -277,12 +299,6 @@ func (r *RedisKV) ListCursor(ctx context.Context, options *ListOptions) (*ListRe
 	// Determine next cursor
 	var nextCursor string
 	hasMore := endIndex < len(filteredKeys)
-	if len(resultKeys) > 0 {
-		// Next cursor is the last key returned
-		// Wait, typical cursor pagination: pass the last key you saw.
-		// Next page starts after that.
-		// So HasMore is true if there are items after resultKeys
-	}
 	if hasMore {
 		nextCursor = resultKeys[len(resultKeys)-1]
 	}
