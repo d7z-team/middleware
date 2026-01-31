@@ -169,9 +169,9 @@ func testBoundary(t *testing.T, factory LockerFactory) {
 
 // --- Implementation Tests ---
 
-func TestLocalLocker(t *testing.T) {
+func TestMemoryLocker(t *testing.T) {
 	testLockerCommon(t, func(t *testing.T) Locker {
-		return NewLocalLocker()
+		return NewMemoryLocker()
 	})
 }
 

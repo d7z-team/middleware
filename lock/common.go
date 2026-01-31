@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strconv"
 
 	"gopkg.d7z.net/middleware/connects"
 )
@@ -89,7 +90,9 @@ func NewLocker(s string) (Locker, error) {
 	}
 	switch ur.Scheme {
 	case "local", "memory", "mem":
-		return NewLocalLocker(), nil
+		shards, _ := strconv.Atoi(ur.Query().Get("shards"))
+		max, _ := strconv.Atoi(ur.Query().Get("max"))
+		return NewMemoryLockerWithConfig(shards, max), nil
 	case "etcd":
 		etcd, err := connects.NewEtcd(ur)
 		if err != nil {
