@@ -189,7 +189,7 @@ func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue st
 		currentVal, err := tx.Get(ctx, fullKey).Result()
 		if err != nil {
 			if errors.Is(err, redis.Nil) {
-				return ErrKeyNotFound
+				return ErrCASFailed
 			}
 			return err
 		}

@@ -445,7 +445,7 @@ func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue strin
 	if len(txnResp.Responses) > 0 {
 		getResp := txnResp.Responses[0].GetResponseRange()
 		if getResp != nil && getResp.Count == 0 {
-			return false, errors.Join(ErrKeyNotFound, fmt.Errorf("key %s not found", key))
+			return false, nil
 		}
 	}
 

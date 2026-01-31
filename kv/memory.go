@@ -763,7 +763,7 @@ func (m *Memory) CompareAndSwap(ctx context.Context, key, oldValue, newValue str
 	}
 	val, exists := m.data.Load(fullKey)
 	if !exists {
-		return false, ErrKeyNotFound
+		return false, nil
 	}
 	content, ok := val.(memoryContent)
 	if !ok {
@@ -773,7 +773,7 @@ func (m *Memory) CompareAndSwap(ctx context.Context, key, oldValue, newValue str
 	// Check if expired
 	now := time.Now()
 	if content.TTL != nil && now.After(*content.TTL) {
-		return false, ErrKeyNotFound
+		return false, nil
 	}
 
 	// Compare current value with old value

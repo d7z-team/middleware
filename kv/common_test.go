@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -174,9 +173,9 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.Equal(t, "new", got)
 
 		// Failure (key not found)
-		_, err = kvClient.CompareAndSwap(ctx, uniquePrefix+"missing", "any", "val")
-		assert.Error(t, err)
-		assert.True(t, errors.Is(err, ErrKeyNotFound) || errors.Is(err, os.ErrNotExist), "Should return KeyNotFound error")
+		done, err = kvClient.CompareAndSwap(ctx, uniquePrefix+"missing", "any", "val")
+		assert.NoError(t, err)
+		assert.False(t, done)
 	})
 
 	// Child & Hierarchy Isolation
