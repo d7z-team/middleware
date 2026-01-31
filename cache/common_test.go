@@ -202,12 +202,44 @@ func testCacheErrorReader(t *testing.T, factory CacheFactory) {
 
 func TestCommonFunctions(t *testing.T) {
 	t.Run("NewCacheFromURL", func(t *testing.T) {
-		c, err := NewCacheFromURL("memory://?max_capacity=10")
+		// 1. Memory with parameters
+		c1, err := NewCacheFromURL("memory://?max_capacity=100&cleanup_interval=1m")
 		assert.NoError(t, err)
-		c.Close()
+		assert.NotNil(t, c1)
+		_ = c1.Close()
 
-		_, err = NewCacheFromURL("invalid://")
-		assert.Error(t, err)
+		// 2. Memory with defaults
+		c2, err := NewCacheFromURL("mem://")
+		assert.NoError(t, err)
+		assert.NotNil(t, c2)
+		_ = c2.Close()
+
+		// 3. Redis (basic parsing)
+		c3, err := NewCacheFromURL("redis://localhost:6379/0?prefix=test:")
+		if err == nil {
+			assert.NotNil(t, c3)
+			_ = c3.Close()
+		}
+
+		// 4. Error cases
+		testCases := []struct {
+			name string
+			url  string
+		}{
+			{"InvalidURL", ":%"},
+			{"UnsupportedScheme", "unknown://"},
+			{"InvalidCapacity", "memory://?max_capacity=-1"},
+			{"ZeroCapacity", "memory://?max_capacity=0"},
+			{"NonIntCapacity", "memory://?max_capacity=abc"},
+			{"InvalidInterval", "memory://?cleanup_interval=invalid"},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := NewCacheFromURL(tc.url)
+				assert.Error(t, err)
+			})
+		}
 	})
 
 	t.Run("ReadToString", func(t *testing.T) {
