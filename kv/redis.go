@@ -107,6 +107,36 @@ func (r *RedisKV) Delete(ctx context.Context, key string) (bool, error) {
 	return delCount > 0, nil
 }
 
+// DeleteAll removes all keys under the current prefix.
+func (r *RedisKV) DeleteAll(ctx context.Context) error {
+	fullPattern := r.prefix + "*"
+	cursor := uint64(0)
+	for {
+		var keys []string
+		var err error
+		keys, cursor, err = r.client.Scan(ctx, cursor, fullPattern, 1000).Result()
+		if err != nil {
+			return fmt.Errorf("scan keys failed: %w", err)
+		}
+
+		if len(keys) > 0 {
+			if err := r.client.Del(ctx, keys...).Err(); err != nil {
+				return fmt.Errorf("delete keys failed: %w", err)
+			}
+		}
+
+		if cursor == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+	return nil
+}
+
 // PutIfNotExists sets the value only if the key does not exist.
 func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
 	fullKey := r.prefix + key

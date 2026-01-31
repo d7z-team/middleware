@@ -25,6 +25,8 @@ type KV interface {
 	Get(ctx context.Context, key string) (string, error)
 	// Delete removes the value associated with the key.
 	Delete(ctx context.Context, key string) (bool, error)
+	// DeleteAll removes all keys under the current prefix.
+	DeleteAll(ctx context.Context) error
 	// Count returns the number of keys.
 	Count(ctx context.Context) (int64, error)
 	// PutIfNotExists stores the key-value pair only if the key does not exist.

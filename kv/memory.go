@@ -354,7 +354,12 @@ func (m *Memory) listInternal(ctx context.Context, prefix string) (map[string]me
 }
 
 // Put stores a key-value pair with an optional TTL.
-func (m *Memory) Put(_ context.Context, key, value string, ttl time.Duration) error {
+func (m *Memory) Put(ctx context.Context, key, value string, ttl time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
 	now := time.Now()
 	fullKey := m.prefix + key
 
@@ -386,7 +391,12 @@ func (m *Memory) Put(_ context.Context, key, value string, ttl time.Duration) er
 
 // Get 获取指定键的值，过期则删除并返回不存在
 // Get retrieves the value for a key. Returns ErrKeyNotFound if the key does not exist or has expired.
-func (m *Memory) Get(_ context.Context, key string) (string, error) {
+func (m *Memory) Get(ctx context.Context, key string) (string, error) {
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	default:
+	}
 	// Add prefix to key
 	fullKey := m.prefix + key
 	if value, ok := m.data.Load(fullKey); ok {
@@ -408,16 +418,46 @@ func (m *Memory) Get(_ context.Context, key string) (string, error) {
 
 // Delete 删除指定的键
 // Delete removes the specified key.
-func (m *Memory) Delete(_ context.Context, key string) (bool, error) {
+func (m *Memory) Delete(ctx context.Context, key string) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	default:
+	}
 	// Add prefix to key
 	fullKey := m.prefix + key
 	_, loaded := m.data.LoadAndDelete(fullKey)
 	return loaded, nil
 }
 
+// DeleteAll removes all keys under the current prefix.
+func (m *Memory) DeleteAll(ctx context.Context) error {
+	m.data.Range(func(key, value interface{}) bool {
+		select {
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		k, ok := key.(string)
+		if !ok {
+			return true
+		}
+		if strings.HasPrefix(k, m.prefix) {
+			m.data.Delete(k)
+		}
+		return true
+	})
+	return ctx.Err()
+}
+
 // PutIfNotExists 仅在键不存在时设置值（原子操作）
 // PutIfNotExists sets the value only if the key does not exist (atomic operation).
-func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
+func (m *Memory) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	default:
+	}
 	now := time.Now()
 	var td *time.Time
 	if ttl != -1 {
@@ -458,7 +498,12 @@ func (m *Memory) PutIfNotExists(_ context.Context, key, value string, ttl time.D
 
 // CompareAndSwap 当当前值等于oldValue时，将其更新为newValue（原子操作）
 // CompareAndSwap updates the value to newValue only if the current value matches oldValue (atomic operation).
-func (m *Memory) CompareAndSwap(_ context.Context, key, oldValue, newValue string) (bool, error) {
+func (m *Memory) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	default:
+	}
 	// Add prefix to key
 	fullKey := m.prefix + key
 	val, exists := m.data.Load(fullKey)

@@ -213,6 +213,15 @@ func (e *Etcd) Delete(ctx context.Context, key string) (bool, error) {
 	return r.Deleted > 0, nil
 }
 
+// DeleteAll removes all keys under the current prefix.
+func (e *Etcd) DeleteAll(ctx context.Context) error {
+	_, err := e.client.Delete(ctx, e.prefix, clientv3.WithPrefix())
+	if err != nil {
+		return fmt.Errorf("delete all keys failed: %w", err)
+	}
+	return nil
+}
+
 // PutIfNotExists sets the value only if the key does not exist.
 func (e *Etcd) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
 	fullKey, err := e.buildKey(key)

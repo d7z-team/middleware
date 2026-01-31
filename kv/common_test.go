@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -323,6 +324,122 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		c, err = child.Count(ctx)
 		assert.NoError(t, err)
 		assert.Equal(t, int64(3), c)
+	})
+
+	// Delete All
+	t.Run("Delete_All", func(t *testing.T) {
+		daPrefix := uniquePrefix + "delete_all"
+		daKV := kvClient.Child(daPrefix)
+
+		// Populate
+		keys := []string{"k1", "k2", "sub/k3"}
+		for _, k := range keys {
+			err := daKV.Put(ctx, k, "val", TTLKeep)
+			require.NoError(t, err)
+		}
+
+		// Verify count before
+		c, err := daKV.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, int64(3), c)
+
+		// DeleteAll
+		err = daKV.DeleteAll(ctx)
+		require.NoError(t, err)
+
+		// Verify count after
+		c, err = daKV.Count(ctx)
+		require.NoError(t, err)
+		require.Equal(t, int64(0), c)
+
+		// Verify individual keys are gone
+		for _, k := range keys {
+			_, err := daKV.Get(ctx, k)
+			require.ErrorIs(t, err, ErrKeyNotFound)
+		}
+	})
+
+	// Concurrency Safety
+	t.Run("Concurrency_Safe", func(t *testing.T) {
+		var wg sync.WaitGroup
+		concurrency := 10
+		ops := 50
+		prefix := uniquePrefix + "conc/"
+
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for j := 0; j < ops; j++ {
+					key := fmt.Sprintf("%s%d-%d", prefix, id, j)
+					err := kvClient.Put(ctx, key, "val", TTLKeep)
+					assert.NoError(t, err)
+
+					_, err = kvClient.Get(ctx, key)
+					assert.NoError(t, err)
+				}
+			}(i)
+		}
+		wg.Wait()
+
+		// Verify count
+		count, err := kvClient.Child(uniquePrefix + "conc").Count(ctx)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(concurrency*ops), count)
+	})
+
+	// Context Cancellation
+	t.Run("Context_Cancellation", func(t *testing.T) {
+		cCtx, cancel := context.WithCancel(ctx)
+		cancel() // Cancel immediately
+
+		key := uniquePrefix + "ctx_cancel"
+		err := kvClient.Put(cCtx, key, "val", TTLKeep)
+		// Operations should fail with context canceled or similar error
+		assert.Error(t, err)
+	})
+
+	// Deep Nested Child
+	t.Run("Deep_Nested_Child", func(t *testing.T) {
+		// root -> l1 -> l2 -> l3
+		l1 := kvClient.Child(uniquePrefix + "level1")
+		l2 := l1.Child("level2")
+		l3 := l2.Child("level3")
+
+		key := "deep_key"
+		err := l3.Put(ctx, key, "deep_val", TTLKeep)
+		assert.NoError(t, err)
+
+		// Verify visibility from top
+		fullKey := uniquePrefix + "level1/level2/level3/" + key
+		val, err := kvClient.Get(ctx, fullKey)
+		assert.NoError(t, err)
+		assert.Equal(t, "deep_val", val)
+	})
+
+	// DeleteAll Isolation
+	t.Run("DeleteAll_Isolation", func(t *testing.T) {
+		// structure:
+		// prefix/keep/k1
+		// prefix/del/k1
+
+		keepKV := kvClient.Child(uniquePrefix + "keep")
+		delKV := kvClient.Child(uniquePrefix + "del")
+
+		_ = keepKV.Put(ctx, "k1", "v", TTLKeep)
+		_ = delKV.Put(ctx, "k1", "v", TTLKeep)
+
+		err := delKV.DeleteAll(ctx)
+		assert.NoError(t, err)
+
+		// Verify del is gone
+		c, _ := delKV.Count(ctx)
+		assert.Equal(t, int64(0), c)
+
+		// Verify keep is there
+		val, err := keepKV.Get(ctx, "k1")
+		assert.NoError(t, err)
+		assert.Equal(t, "v", val)
 	})
 
 	// Complex Hierarchy and Pagination
