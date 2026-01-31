@@ -91,8 +91,8 @@ func NewLocker(s string) (Locker, error) {
 	switch ur.Scheme {
 	case "local", "memory", "mem":
 		shards, _ := strconv.Atoi(ur.Query().Get("shards"))
-		max, _ := strconv.Atoi(ur.Query().Get("max"))
-		return NewMemoryLockerWithConfig(shards, max), nil
+		maxLocks, _ := strconv.Atoi(ur.Query().Get("max"))
+		return NewMemoryLockerWithConfig(shards, maxLocks), nil
 	case "etcd":
 		etcd, err := connects.NewEtcd(ur)
 		if err != nil {

@@ -43,5 +43,5 @@ func TestMemoryLocker_ConfigFromURL(t *testing.T) {
 	memory, ok := l.(*MemoryLocker)
 	assert.True(t, ok)
 	assert.Equal(t, int32(10), memory.maxLocks)
-	assert.Equal(t, 64, len(memory.shards))
+	assert.Len(t, memory.shards, 64)
 }
