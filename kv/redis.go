@@ -404,13 +404,7 @@ func (r *RedisKV) ListCurrent(ctx context.Context, prefix string) (map[string]st
 	return result, nil
 }
 
-// ListPage retrieves paginated key-value pairs matching the prefix.
-func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
-	fullList, err := r.List(ctx, prefix)
-	if err != nil {
-		return nil, err
-	}
-
+func (r *RedisKV) listPageInternal(fullList map[string]string, pageIndex uint64, pageSize uint) (map[string]string, error) {
 	keys := make([]string, 0, len(fullList))
 	for k := range fullList {
 		keys = append(keys, k)
@@ -434,34 +428,22 @@ func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64,
 	return pageResult, nil
 }
 
+// ListPage retrieves paginated key-value pairs matching the prefix.
+func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
+	fullList, err := r.List(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	return r.listPageInternal(fullList, pageIndex, pageSize)
+}
+
 // ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
 func (r *RedisKV) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
 	fullList, err := r.ListCurrent(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
-
-	keys := make([]string, 0, len(fullList))
-	for k := range fullList {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	start := pageIndex * uint64(pageSize)
-	if start >= uint64(len(keys)) {
-		return make(map[string]string), nil
-	}
-	end := start + uint64(pageSize)
-	if end > uint64(len(keys)) {
-		end = uint64(len(keys))
-	}
-
-	pageKeys := keys[start:end]
-	pageResult := make(map[string]string, len(pageKeys))
-	for _, k := range pageKeys {
-		pageResult[k] = fullList[k]
-	}
-	return pageResult, nil
+	return r.listPageInternal(fullList, pageIndex, pageSize)
 }
 
 // ListCurrentCursor implements cursor-based pagination for current level.
