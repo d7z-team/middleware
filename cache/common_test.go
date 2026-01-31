@@ -3,6 +3,7 @@ package cache
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -226,7 +227,7 @@ func TestCommonFunctions(t *testing.T) {
 
 		// Test error on read (mock)
 		errContent := &Content{
-			ReadSeekCloser: &mockErrorReadCloser{err: fmt.Errorf("read error")},
+			ReadSeekCloser: &mockErrorReadCloser{err: errors.New("read error")},
 		}
 		_, err = errContent.ReadToString()
 		assert.Error(t, err)
@@ -249,7 +250,7 @@ type mockErrorReadCloser struct {
 func (m *mockErrorReadCloser) Read(p []byte) (n int, err error) { return 0, m.err }
 func (m *mockErrorReadCloser) Close() error                     { return nil }
 func (m *mockErrorReadCloser) Seek(offset int64, whence int) (int64, error) {
-	return 0, fmt.Errorf("not supported")
+	return 0, errors.New("not supported")
 }
 
 func TestMemoryImplementation(t *testing.T) {
@@ -319,7 +320,7 @@ func TestRedisImplementation(t *testing.T) {
 
 		ttl, err := c.TTL(ctx, key)
 		assert.NoError(t, err)
-		assert.True(t, ttl > 0)
+		assert.Positive(t, ttl)
 
 		// cleanupCorruptedData test (internal)
 		c.cleanupCorruptedData(ctx, c.dataKey(key), c.metaKey(key))
