@@ -312,6 +312,10 @@ func (r *RedisKV) List(ctx context.Context, prefix string) (map[string]string, e
 		cursor = nextCursor
 	}
 
+	if len(keys) == 0 {
+		return make(map[string]string), nil
+	}
+
 	values, err := r.client.MGet(ctx, keys...).Result()
 	if err != nil {
 		return nil, err

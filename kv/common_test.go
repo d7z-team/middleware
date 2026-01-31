@@ -677,6 +677,61 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 			assert.Equal(t, "val_multi", valChain)
 		})
 	})
+
+	// Boundary Conditions & Edge Cases
+	t.Run("KV_Boundary_Edge_Cases", func(t *testing.T) {
+		// 1. 空 Key 处理 (应作为路径处理或报错，视具体实现而定)
+		// 大多数 KV 实现会把空 key 当作 prefix 本身
+		_ = kvClient.Put(ctx, "", "root_val", TTLKeep)
+		// 不强制要求 Get("") 成功，但验证不崩溃
+
+		// 2. 特殊 Value (含换行符、特殊符号)
+		specialVal := "line1\nline2\r\n\t!@#$%^&*()"
+		keySpec := uniquePrefix + "special_val"
+		assert.NoError(t, kvClient.Put(ctx, keySpec, specialVal, TTLKeep))
+		got, err := kvClient.Get(ctx, keySpec)
+		assert.NoError(t, err)
+		assert.Equal(t, specialVal, got)
+
+		// 3. PutIfNotExists 详细分支 (针对已存在和过期)
+		keyNX := uniquePrefix + "nx_edge"
+		// 初始存入带 TTL (1s)
+		ok, err := kvClient.PutIfNotExists(ctx, keyNX, "v1", 1*time.Second)
+		assert.NoError(t, err)
+		assert.True(t, ok)
+
+		// 存入期间再次尝试 (应失败)
+		ok, _ = kvClient.PutIfNotExists(ctx, keyNX, "v2", TTLKeep)
+		assert.False(t, ok)
+
+		// 等待过期 (增加缓冲时间到 2s)
+		assert.Eventually(t, func() bool {
+			ok, _ := kvClient.PutIfNotExists(ctx, keyNX, "v3", TTLKeep)
+			return ok
+		}, 5*time.Second, 200*time.Millisecond, "Should be able to PutIfNotExists after original key expires")
+
+		v3, _ := kvClient.Get(ctx, keyNX)
+		assert.Equal(t, "v3", v3)
+
+		// 4. List / ListCurrent 在空目录下的表现
+		emptyDir := kvClient.Child(uniquePrefix + "empty_dir")
+		l, err := emptyDir.List(ctx, "")
+		assert.NoError(t, err)
+		assert.Empty(t, l)
+
+		lc, err := emptyDir.ListCurrent(ctx, "")
+		assert.NoError(t, err)
+		assert.Empty(t, lc)
+	})
+}
+
+func TestCloserKV_Raw(t *testing.T) {
+	mem, _ := NewMemory("")
+	ckv := closerKV{
+		KV:     mem,
+		closer: func() error { return nil },
+	}
+	assert.Equal(t, mem, ckv.Raw())
 }
 
 func TestNewKVFromURL(t *testing.T) {
