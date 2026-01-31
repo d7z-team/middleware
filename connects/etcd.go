@@ -13,11 +13,9 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// EtcdOption 定义 Etcd 配置选项
 // EtcdOption defines the configuration options for Etcd.
 type EtcdOption func(*clientv3.Config)
 
-// WithEtcdAuth 设置认证信息
 // WithEtcdAuth sets the authentication credentials.
 func WithEtcdAuth(username, password string) EtcdOption {
 	return func(c *clientv3.Config) {
@@ -26,7 +24,6 @@ func WithEtcdAuth(username, password string) EtcdOption {
 	}
 }
 
-// WithEtcdDialTimeout 设置连接超时时间
 // WithEtcdDialTimeout sets the dial timeout.
 func WithEtcdDialTimeout(d time.Duration) EtcdOption {
 	return func(c *clientv3.Config) {
@@ -34,7 +31,6 @@ func WithEtcdDialTimeout(d time.Duration) EtcdOption {
 	}
 }
 
-// WithEtcdTLS 设置 TLS 配置
 // WithEtcdTLS sets the TLS configuration.
 func WithEtcdTLS(config *tls.Config) EtcdOption {
 	return func(c *clientv3.Config) {
@@ -42,7 +38,6 @@ func WithEtcdTLS(config *tls.Config) EtcdOption {
 	}
 }
 
-// ConnectEtcd 连接 Etcd
 // ConnectEtcd connects to Etcd with the given endpoints and options.
 func ConnectEtcd(endpoints []string, opts ...EtcdOption) (*clientv3.Client, error) {
 	if len(endpoints) == 0 {
@@ -61,7 +56,6 @@ func ConnectEtcd(endpoints []string, opts ...EtcdOption) (*clientv3.Client, erro
 	return clientv3.New(cfg)
 }
 
-// NewEtcd 从 URL 解析配置创建 Etcd 客户端
 // NewEtcd creates an Etcd client from a URL configuration.
 // URL format: etcd://host:port?endpoints=host1:port,host2:port&ca-file=...
 // Supported parameters:
@@ -72,12 +66,16 @@ func ConnectEtcd(endpoints []string, opts ...EtcdOption) (*clientv3.Client, erro
 // - dial_timeout: Connection timeout (e.g., 5s)
 func NewEtcd(u *url.URL) (*clientv3.Client, error) {
 	query := u.Query()
-	endpoints := []string{u.Host}
+	var endpoints []string
 
-	// 检查是否有多个端点
-	// Check if multiple endpoints are specified
 	if endpointsStr := query.Get("endpoints"); endpointsStr != "" {
 		endpoints = strings.Split(endpointsStr, ",")
+	} else if u.Host != "" {
+		endpoints = []string{u.Host}
+	}
+
+	if len(endpoints) == 0 {
+		return nil, errors.New("no etcd endpoints found in URL")
 	}
 
 	var parsedOpts []EtcdOption
