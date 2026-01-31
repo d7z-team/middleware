@@ -170,9 +170,9 @@ func (m *Memory) Sync() error {
 	return nil
 }
 
-// CursorList 实现游标分页查询
-// CursorList implements cursor-based pagination.
-func (m *Memory) CursorList(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
+// ListCursor 实现游标分页查询
+// ListCursor implements cursor-based pagination.
+func (m *Memory) ListCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
 	// Get all keys and sort them lexicographically
 	allKeys := make([]string, 0)
 	now := time.Now()
@@ -260,8 +260,8 @@ func (m *Memory) CursorList(ctx context.Context, opts *ListOptions) (*ListRespon
 	}, nil
 }
 
-// CursorListCurrent implements cursor-based pagination for current level.
-func (m *Memory) CursorListCurrent(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
+// ListCurrentCursor implements cursor-based pagination for current level.
+func (m *Memory) ListCurrentCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
 	// Get all keys and sort them lexicographically
 	allKeys := make([]string, 0)
 	now := time.Now()
@@ -318,8 +318,8 @@ func (m *Memory) CursorListCurrent(ctx context.Context, opts *ListOptions) (*Lis
 	startIndex := 0
 	if opts.Cursor != "" {
 		// Cursor is relative or absolute?
-		// Existing CursorList adds m.prefix if not present?
-		// Let's check CursorList implementation.
+		// Existing ListCursor adds m.prefix if not present?
+		// Let's check ListCursor implementation.
 		// "if m.prefix != "" { opts.Cursor = m.prefix + opts.Cursor }"
 		// It assumes opts.Cursor is relative.
 		cursor := opts.Cursor

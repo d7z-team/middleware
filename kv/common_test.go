@@ -271,7 +271,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		}
 
 		// First page
-		resp, err := child.CursorList(ctx, opts)
+		resp, err := child.ListCursor(ctx, opts)
 		assert.NoError(t, err)
 		assert.Len(t, resp.Keys, 2)
 		assert.Equal(t, "a", resp.Keys[0])
@@ -283,7 +283,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 		// Second page
 		opts.Cursor = resp.Cursor
-		resp2, err := child.CursorList(ctx, opts)
+		resp2, err := child.ListCursor(ctx, opts)
 		assert.NoError(t, err)
 		assert.Len(t, resp2.Keys, 2)
 		assert.Equal(t, "c", resp2.Keys[0])
@@ -292,7 +292,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 		// Third page (last item)
 		opts.Cursor = resp2.Cursor
-		resp3, err := child.CursorList(ctx, opts)
+		resp3, err := child.ListCursor(ctx, opts)
 		assert.NoError(t, err)
 		assert.Len(t, resp3.Keys, 1)
 		assert.Equal(t, "e", resp3.Keys[0])
@@ -300,7 +300,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		// Fourth page (empty)
 		if resp3.HasMore {
 			opts.Cursor = resp3.Cursor
-			resp4, err := child.CursorList(ctx, opts)
+			resp4, err := child.ListCursor(ctx, opts)
 			assert.NoError(t, err)
 			assert.Empty(t, resp4.Keys)
 		}
@@ -544,8 +544,8 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.False(t, hasSub)
 	})
 
-	// CursorListCurrent
-	t.Run("Cursor_List_Current", func(t *testing.T) {
+	// ListCurrentCursor
+	t.Run("List_Current_Cursor", func(t *testing.T) {
 		clcPrefix := uniquePrefix + "clc/"
 		clcKV := kvClient.Child(clcPrefix)
 
@@ -558,7 +558,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		opts := &ListOptions{Limit: 2}
 
 		// Page 1
-		resp1, err := clcKV.CursorListCurrent(ctx, opts)
+		resp1, err := clcKV.ListCurrentCursor(ctx, opts)
 		require.NoError(t, err)
 		require.Len(t, resp1.Keys, 2)
 		assert.Contains(t, resp1.Keys, "a")
@@ -568,14 +568,13 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 		// Page 2
 		opts.Cursor = resp1.Cursor
-		resp2, err := clcKV.CursorListCurrent(ctx, opts)
+		resp2, err := clcKV.ListCurrentCursor(ctx, opts)
 		require.NoError(t, err)
 		require.Len(t, resp2.Keys, 1) // "c"
 		assert.Contains(t, resp2.Keys, "c")
 		assert.False(t, resp2.HasMore)
 		// "sub/d" should be filtered out
 	})
-
 	// Complex Hierarchy and Pagination
 	t.Run("Hierarchy_And_Pagination_Scenarios", func(t *testing.T) {
 		// Use a sub-namespace for this test
@@ -596,7 +595,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 			opts := &ListOptions{Limit: 1}
 
 			// Page 1 -> "a"
-			resp1, err := hKV.CursorList(ctx, opts)
+			resp1, err := hKV.ListCursor(ctx, opts)
 			require.NoError(t, err)
 			require.Len(t, resp1.Keys, 1)
 			assert.Equal(t, "a", resp1.Keys[0])
@@ -605,7 +604,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 			// Page 2 -> "a/c1"
 			opts.Cursor = resp1.Cursor
-			resp2, err := hKV.CursorList(ctx, opts)
+			resp2, err := hKV.ListCursor(ctx, opts)
 			require.NoError(t, err)
 			require.Len(t, resp2.Keys, 1)
 			assert.Equal(t, "a/c1", resp2.Keys[0])
@@ -613,14 +612,14 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 			// Page 3 -> "a/c2"
 			opts.Cursor = resp2.Cursor
-			resp3, err := hKV.CursorList(ctx, opts)
+			resp3, err := hKV.ListCursor(ctx, opts)
 			require.NoError(t, err)
 			require.Len(t, resp3.Keys, 1)
 			assert.Equal(t, "a/c2", resp3.Keys[0])
 
 			// Page 4 -> "b"
 			opts.Cursor = resp3.Cursor
-			resp4, err := hKV.CursorList(ctx, opts)
+			resp4, err := hKV.ListCursor(ctx, opts)
 			require.NoError(t, err)
 			require.Len(t, resp4.Keys, 1)
 			assert.Equal(t, "b", resp4.Keys[0])

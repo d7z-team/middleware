@@ -222,8 +222,8 @@ func (e *Etcd) ListCurrentPage(ctx context.Context, prefix string, pageIndex uin
 	return result, nil
 }
 
-// CursorListCurrent implements cursor-based pagination for current level.
-func (e *Etcd) CursorListCurrent(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+// ListCurrentCursor implements cursor-based pagination for current level.
+func (e *Etcd) ListCurrentCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
 	opts := &ListOptions{}
 	if options != nil {
 		opts = options
@@ -450,8 +450,8 @@ func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue strin
 	return false, nil
 }
 
-// CursorList implements cursor-based pagination.
-func (e *Etcd) CursorList(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+// ListCursor implements cursor-based pagination.
+func (e *Etcd) ListCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
 	opts := &ListOptions{}
 	if options != nil {
 		opts = options

@@ -2,14 +2,7 @@ GOPATH := $(shell go env GOPATH)
 GOARCH ?= $(shell go env GOARCH)
 
 .PHONY: deps
-deps: minio etcd redis
-
-.PHONY: minio
-minio:
-	@docker kill sync-minio ||: && sleep 1&& docker run -d --rm --name sync-minio --network host \
-	--env MINIO_ROOT_USER="minio_admin" \
-  --env MINIO_ROOT_PASSWORD="minio_admin" \
-	quay.io/minio/minio server /data --console-address ":9001"
+deps: etcd redis
 
 .PHONY: redis
 redis:

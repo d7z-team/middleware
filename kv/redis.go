@@ -189,12 +189,12 @@ func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue st
 	return true, nil
 }
 
-// CursorList implements cursor-based pagination.
+// ListCursor implements cursor-based pagination.
 // Note: Redis SCAN does not support lexicographical order.
 // To ensure consistency with other implementations, this method fetches all keys matching the prefix,
 // sorts them, and then applies the cursor/limit logic.
 // This is inefficient for large datasets but necessary for strict interface compliance regarding ordering.
-func (r *RedisKV) CursorList(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+func (r *RedisKV) ListCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
 	opts := &ListOptions{}
 	if options != nil {
 		opts = options
@@ -444,8 +444,8 @@ func (r *RedisKV) ListCurrentPage(ctx context.Context, prefix string, pageIndex 
 	return pageResult, nil
 }
 
-// CursorListCurrent implements cursor-based pagination for current level.
-func (r *RedisKV) CursorListCurrent(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+// ListCurrentCursor implements cursor-based pagination for current level.
+func (r *RedisKV) ListCurrentCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
 	opts := &ListOptions{}
 	if options != nil {
 		opts = options
