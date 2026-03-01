@@ -222,26 +222,25 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		all, err := kvClient.List(ctx, prefix)
 		assert.NoError(t, err)
 		assert.Len(t, all, 15)
-		assert.Equal(t, "val_01", all[prefix+"01"])
+		// Verify some items (assume lexicographical order for stable tests)
+		assert.Equal(t, prefix+"01", all[0].Key)
+		assert.Equal(t, "val_01", all[0].Value)
 
 		// Test ListPage
 		// Page 1 (size 10) -> 1-10
 		page1, err := kvClient.ListPage(ctx, prefix, 0, 10)
 		assert.NoError(t, err)
 		assert.Len(t, page1, 10)
-		// Verify order (assuming lexicographical)
-		// keys: 01, 02 ... 10
-		_, ok01 := page1[prefix+"01"]
-		assert.True(t, ok01)
-		_, ok10 := page1[prefix+"10"]
-		assert.True(t, ok10)
+		// Verify order (assuming lexicographical or creation order depending on implementation,
+		// but both are consistent for this test setup)
+		assert.Equal(t, prefix+"01", page1[0].Key)
+		assert.Equal(t, prefix+"10", page1[9].Key)
 
 		// Page 2 (size 10) -> 11-15
 		page2, err := kvClient.ListPage(ctx, prefix, 1, 10)
 		assert.NoError(t, err)
 		assert.Len(t, page2, 5)
-		_, ok11 := page2[prefix+"11"]
-		assert.True(t, ok11)
+		assert.Equal(t, prefix+"11", page2[0].Key)
 
 		// Page 3 (size 10) -> Empty
 		page3, err := kvClient.ListPage(ctx, prefix, 2, 10)
@@ -269,9 +268,10 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		// First page
 		resp, err := child.ListCursor(ctx, opts)
 		assert.NoError(t, err)
-		assert.Len(t, resp.Keys, 2)
-		assert.Equal(t, "a", resp.Keys[0])
-		assert.Equal(t, "b", resp.Keys[1])
+		assert.Len(t, resp.Pairs, 2)
+		assert.Equal(t, "a", resp.Pairs[0].Key)
+		assert.Equal(t, "val_a", resp.Pairs[0].Value)
+		assert.Equal(t, "b", resp.Pairs[1].Key)
 		assert.True(t, resp.HasMore)
 		assert.NotEmpty(t, resp.Cursor)
 		// Cursor should be "b" (last key)
@@ -281,24 +281,24 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		opts.Cursor = resp.Cursor
 		resp2, err := child.ListCursor(ctx, opts)
 		assert.NoError(t, err)
-		assert.Len(t, resp2.Keys, 2)
-		assert.Equal(t, "c", resp2.Keys[0])
-		assert.Equal(t, "d", resp2.Keys[1])
+		assert.Len(t, resp2.Pairs, 2)
+		assert.Equal(t, "c", resp2.Pairs[0].Key)
+		assert.Equal(t, "d", resp2.Pairs[1].Key)
 		assert.True(t, resp2.HasMore)
 
 		// Third page (last item)
 		opts.Cursor = resp2.Cursor
 		resp3, err := child.ListCursor(ctx, opts)
 		assert.NoError(t, err)
-		assert.Len(t, resp3.Keys, 1)
-		assert.Equal(t, "e", resp3.Keys[0])
+		assert.Len(t, resp3.Pairs, 1)
+		assert.Equal(t, "e", resp3.Pairs[0].Key)
 
 		// Fourth page (empty)
 		if resp3.HasMore {
 			opts.Cursor = resp3.Cursor
 			resp4, err := child.ListCursor(ctx, opts)
 			assert.NoError(t, err)
-			assert.Empty(t, resp4.Keys)
+			assert.Empty(t, resp4.Pairs)
 		}
 	})
 
@@ -462,26 +462,28 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		current, err := lcKV.ListCurrent(ctx, "")
 		require.NoError(t, err)
 		assert.Len(t, current, 2)
-		assert.Equal(t, "val_a", current["a"])
-		assert.Equal(t, "val_b", current["b"])
-		_, ok := current["sub/c"]
-		assert.False(t, ok)
+		// Expect sorted by key: a, b
+		assert.Equal(t, "a", current[0].Key)
+		assert.Equal(t, "val_a", current[0].Value)
+		assert.Equal(t, "b", current[1].Key)
+		assert.Equal(t, "val_b", current[1].Value)
 
 		// 2. Sub level list
 		currentSub, err := lcKV.ListCurrent(ctx, "sub/")
 		require.NoError(t, err)
 		assert.Len(t, currentSub, 2)
-		// Note: ListCurrent returns keys relative to prefix argument?
-		// Actually Memory and Redis return relative to root? Let's check.
-		// Memory.ListCurrent returns `result[k] = v.Data` where `k` is relative to Memory instance root.
-		assert.Equal(t, "val_c", currentSub["sub/c"])
-		assert.Equal(t, "val_d", currentSub["sub/d"])
+		// Memory and Redis return relative to root? Let's check.
+		assert.Equal(t, "sub/c", currentSub[0].Key)
+		assert.Equal(t, "val_c", currentSub[0].Value)
+		assert.Equal(t, "sub/d", currentSub[1].Key)
+		assert.Equal(t, "val_d", currentSub[1].Value)
 
 		// 3. Deep level list (e/)
 		currentDeep, err := lcKV.ListCurrent(ctx, "deep/e/")
 		require.NoError(t, err)
 		assert.Len(t, currentDeep, 1)
-		assert.Equal(t, "val_f", currentDeep["deep/e/f"])
+		assert.Equal(t, "deep/e/f", currentDeep[0].Key)
+		assert.Equal(t, "val_f", currentDeep[0].Value)
 
 		// 4. Non-existent level
 		currentNone, err := lcKV.ListCurrent(ctx, "nonexistent/")
@@ -496,42 +498,37 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 		// Create files: a, b, c, d
 		// Create subdirs: sub/e
-		_ = lcpKV.Put(ctx, "a", "val", TTLKeep)
-		_ = lcpKV.Put(ctx, "b", "val", TTLKeep)
-		_ = lcpKV.Put(ctx, "c", "val", TTLKeep)
-		_ = lcpKV.Put(ctx, "d", "val", TTLKeep)
-		_ = lcpKV.Child("sub").Put(ctx, "e", "val", TTLKeep)
+		_ = lcpKV.Put(ctx, "a", "val_a", TTLKeep)
+		_ = lcpKV.Put(ctx, "b", "val_b", TTLKeep)
+		_ = lcpKV.Put(ctx, "c", "val_c", TTLKeep)
+		_ = lcpKV.Put(ctx, "d", "val_d", TTLKeep)
+		_ = lcpKV.Child("sub").Put(ctx, "e", "val_e", TTLKeep)
 
-		// Page 1 (Limit 2) -> a, b
+		// Page 1 (Limit 2) -> a, b (assuming sequential put or sorted)
 		p1, err := lcpKV.ListCurrentPage(ctx, "", 0, 2)
 		require.NoError(t, err)
 		assert.Len(t, p1, 2)
-		// For Memory this depends on sort order (CreateAt). Since we put them sequentially, order is usually preserved or fast.
-		// For Etcd/Redis it's Key order.
-		// To be safe, we verify presence of "a" or "b" or "c" or "d" and size.
-		// And ensure "sub/e" is NOT there.
 
-		for k := range p1 {
-			assert.NotContains(t, k, "/")
+		for _, p := range p1 {
+			assert.NotContains(t, p.Key, "/")
 		}
 
 		// Check full list coverage across pages
 		allItems := make(map[string]string)
 
 		p1All, _ := lcpKV.ListCurrentPage(ctx, "", 0, 2)
-		for k, v := range p1All {
-			allItems[k] = v
+		for _, p := range p1All {
+			allItems[p.Key] = p.Value
 		}
 
 		p2All, _ := lcpKV.ListCurrentPage(ctx, "", 1, 2)
-		for k, v := range p2All {
-			allItems[k] = v
+		for _, p := range p2All {
+			allItems[p.Key] = p.Value
 		}
 
-		p3All, _ := lcpKV.ListCurrentPage(ctx, "", 2, 2) // Should be empty or last item if logic allows?
-		// 4 items total at current level. Page 0: 2, Page 1: 2, Page 2: 0.
-		for k, v := range p3All {
-			allItems[k] = v
+		p3All, _ := lcpKV.ListCurrentPage(ctx, "", 2, 2)
+		for _, p := range p3All {
+			allItems[p.Key] = p.Value
 		}
 
 		assert.Len(t, allItems, 4) // a, b, c, d
@@ -555,9 +552,9 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		// Page 1
 		resp1, err := clcKV.ListCurrentCursor(ctx, opts)
 		require.NoError(t, err)
-		require.Len(t, resp1.Keys, 2)
-		assert.Contains(t, resp1.Keys, "a")
-		assert.Contains(t, resp1.Keys, "b") // Lexicographical expected
+		require.Len(t, resp1.Pairs, 2)
+		assert.Equal(t, "a", resp1.Pairs[0].Key)
+		assert.Equal(t, "b", resp1.Pairs[1].Key)
 		assert.True(t, resp1.HasMore)
 		assert.Equal(t, "b", resp1.Cursor)
 
@@ -565,8 +562,8 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		opts.Cursor = resp1.Cursor
 		resp2, err := clcKV.ListCurrentCursor(ctx, opts)
 		require.NoError(t, err)
-		require.Len(t, resp2.Keys, 1) // "c"
-		assert.Contains(t, resp2.Keys, "c")
+		require.Len(t, resp2.Pairs, 1) // "c"
+		assert.Equal(t, "c", resp2.Pairs[0].Key)
 		assert.False(t, resp2.HasMore)
 		// "sub/d" should be filtered out
 	})
@@ -591,8 +588,8 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 			// Page 1 -> "a"
 			resp1, err := hKV.ListCursor(ctx, opts)
 			require.NoError(t, err)
-			require.Len(t, resp1.Keys, 1)
-			assert.Equal(t, "a", resp1.Keys[0])
+			require.Len(t, resp1.Pairs, 1)
+			assert.Equal(t, "a", resp1.Pairs[0].Key)
 			assert.True(t, resp1.HasMore)
 			assert.Equal(t, "a", resp1.Cursor)
 
@@ -600,23 +597,23 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 			opts.Cursor = resp1.Cursor
 			resp2, err := hKV.ListCursor(ctx, opts)
 			require.NoError(t, err)
-			require.Len(t, resp2.Keys, 1)
-			assert.Equal(t, "a/c1", resp2.Keys[0])
+			require.Len(t, resp2.Pairs, 1)
+			assert.Equal(t, "a/c1", resp2.Pairs[0].Key)
 			assert.True(t, resp2.HasMore)
 
 			// Page 3 -> "a/c2"
 			opts.Cursor = resp2.Cursor
 			resp3, err := hKV.ListCursor(ctx, opts)
 			require.NoError(t, err)
-			require.Len(t, resp3.Keys, 1)
-			assert.Equal(t, "a/c2", resp3.Keys[0])
+			require.Len(t, resp3.Pairs, 1)
+			assert.Equal(t, "a/c2", resp3.Pairs[0].Key)
 
 			// Page 4 -> "b"
 			opts.Cursor = resp3.Cursor
 			resp4, err := hKV.ListCursor(ctx, opts)
 			require.NoError(t, err)
-			require.Len(t, resp4.Keys, 1)
-			assert.Equal(t, "b", resp4.Keys[0])
+			require.Len(t, resp4.Pairs, 1)
+			assert.Equal(t, "b", resp4.Pairs[0].Key)
 			assert.False(t, resp4.HasMore)
 			assert.Empty(t, resp4.Cursor)
 		})
@@ -628,10 +625,15 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 			list, err := childKV.List(ctx, "")
 			require.NoError(t, err)
 			assert.Len(t, list, 2)
-			assert.Contains(t, list, "c1")
-			assert.Contains(t, list, "c2")
+			// Convert to map for easy checking if order doesn't matter here
+			m := make(map[string]string)
+			for _, p := range list {
+				m[p.Key] = p.Value
+			}
+			assert.Contains(t, m, "c1")
+			assert.Contains(t, m, "c2")
 
-			_, exists := list[""]
+			_, exists := m[""]
 			assert.False(t, exists, "Should not see parent key 'a' in child view 'a/'")
 
 			val, err := childKV.Get(ctx, "c1")

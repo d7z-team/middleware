@@ -15,7 +15,7 @@ etcd:
 .PHONY: fmt
 fmt:
 	@(test -f "$(GOPATH)/bin/gofumpt" || go install mvdan.cc/gofumpt@latest) && \
-	"$(GOPATH)/bin/gofumpt" -l -w .
+	"$(GOPATH)/bin/gofumpt" -l -w . && go mod tidy
 
 .PHONY: lint
 lint:

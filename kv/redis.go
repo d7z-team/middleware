@@ -211,31 +211,13 @@ func (r *RedisKV) CompareAndSwap(ctx context.Context, key, oldValue, newValue st
 	return true, nil
 }
 
-// ListCursor implements cursor-based pagination.
-// Note: Redis SCAN does not support lexicographical order.
-// To ensure consistency with other implementations, this method fetches all keys matching the prefix,
-// sorts them, and then applies the cursor/limit logic.
-// This is inefficient for large datasets but necessary for strict interface compliance regarding ordering.
-func (r *RedisKV) ListCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
-	opts := &ListOptions{}
-	if options != nil {
-		opts = options
-	}
-	if opts.Limit == 0 {
-		opts.Limit = 1000
-	}
-
-	// Fetch all keys matching prefix
-	// We re-use List which returns map[string]string, but we only need keys.
-	// Optimization: Implement a "ListKeys" internal method or just do scanning here.
-	fullPrefix := r.prefix
+func (r *RedisKV) scanKeys(ctx context.Context, pattern string) ([]string, error) {
 	keys := make([]string, 0)
 	cursor := uint64(0)
-
 	for {
-		res, nextCursor, err := r.client.Scan(ctx, cursor, fullPrefix+"*", 1000).Result()
+		res, nextCursor, err := r.client.Scan(ctx, cursor, pattern, 1000).Result()
 		if err != nil {
-			return nil, fmt.Errorf("scan keys failed: %w", err)
+			return nil, err
 		}
 		keys = append(keys, res...)
 		if nextCursor == 0 {
@@ -248,202 +230,115 @@ func (r *RedisKV) ListCursor(ctx context.Context, options *ListOptions) (*ListRe
 		default:
 		}
 	}
-
-	// Filter keys that don't match prefix (SCAN pattern is glob-style, pretty accurate, but let's be safe)
-	// And strip prefix
-	filteredKeys := make([]string, 0, len(keys))
-	for _, k := range keys {
-		if strings.HasPrefix(k, r.prefix) {
-			filteredKeys = append(filteredKeys, k[len(r.prefix):])
-		}
-	}
-
-	// Sort lexicographically
-	sort.Strings(filteredKeys)
-
-	// Apply Cursor
-	startIndex := 0
-	if opts.Cursor != "" {
-		for i, key := range filteredKeys {
-			if key > opts.Cursor {
-				startIndex = i
-				break
-			}
-		}
-		// If cursor is beyond all keys (or matches the last one), startIndex might be 0 but logic below handles it
-		// If no key > cursor, startIndex should be len
-		if startIndex == 0 && (len(filteredKeys) == 0 || filteredKeys[0] <= opts.Cursor) {
-			// Check if we actually found a key > cursor
-			found := false
-			for i, key := range filteredKeys {
-				if key > opts.Cursor {
-					startIndex = i
-					found = true
-					break
-				}
-			}
-			if !found {
-				startIndex = len(filteredKeys)
-			}
-		}
-	}
-
-	// Apply Limit
-	endIndex := startIndex + int(opts.Limit)
-	if endIndex > len(filteredKeys) {
-		endIndex = len(filteredKeys)
-	}
-
-	resultKeys := filteredKeys[startIndex:endIndex]
-
-	// Determine next cursor
-	var nextCursor string
-	hasMore := endIndex < len(filteredKeys)
-	if hasMore {
-		nextCursor = resultKeys[len(resultKeys)-1]
-	}
-
-	return &ListResponse{
-		Keys:    resultKeys,
-		Cursor:  nextCursor,
-		HasMore: hasMore,
-	}, nil
+	return keys, nil
 }
 
-// List retrieves all key-value pairs matching the prefix.
-func (r *RedisKV) List(ctx context.Context, prefix string) (map[string]string, error) {
-	fullPrefix := r.prefix + prefix
-	keys := make([]string, 0)
-	cursor := uint64(0)
-
-	for {
-		res, nextCursor, err := r.client.Scan(ctx, cursor, fullPrefix+"*", 100).Result()
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, res...)
-		if nextCursor == 0 {
-			break
-		}
-		cursor = nextCursor
+func (r *RedisKV) fetchPairs(ctx context.Context, fullKeys []string) ([]Pair, error) {
+	if len(fullKeys) == 0 {
+		return []Pair{}, nil
 	}
-
-	if len(keys) == 0 {
-		return make(map[string]string), nil
-	}
-
-	values, err := r.client.MGet(ctx, keys...).Result()
+	values, err := r.client.MGet(ctx, fullKeys...).Result()
 	if err != nil {
 		return nil, err
 	}
-
-	result := make(map[string]string, len(keys))
-	for i, fullKey := range keys {
+	pairs := make([]Pair, 0, len(fullKeys))
+	for i, fullKey := range fullKeys {
 		bizKey := fullKey[len(r.prefix):]
-		val, ok := values[i].(string)
-		if ok && val != "" {
-			result[bizKey] = val
-		}
+		val, _ := values[i].(string)
+		pairs = append(pairs, Pair{Key: bizKey, Value: val})
 	}
-
-	return result, nil
+	return pairs, nil
 }
 
-// ListCurrent returns key-value pairs at the current level (excluding children).
-func (r *RedisKV) ListCurrent(ctx context.Context, prefix string) (map[string]string, error) {
-	fullPrefix := r.prefix + prefix
-	keys := make([]string, 0)
-	cursor := uint64(0)
-
-	for {
-		res, nextCursor, err := r.client.Scan(ctx, cursor, fullPrefix+"*", 100).Result()
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, res...)
-		if nextCursor == 0 {
-			break
-		}
-		cursor = nextCursor
+// ListCursor implements cursor-based pagination.
+func (r *RedisKV) ListCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+	opts := &ListOptions{}
+	if options != nil {
+		opts = options
 	}
-
-	if len(keys) == 0 {
-		return make(map[string]string), nil
+	if opts.Limit <= 0 {
+		opts.Limit = 1000
 	}
-
-	values, err := r.client.MGet(ctx, keys...).Result()
+	keys, err := r.scanKeys(ctx, r.prefix+"*")
 	if err != nil {
 		return nil, err
-	}
-
-	result := make(map[string]string)
-	for i, fullKey := range keys {
-		bizKey := fullKey[len(r.prefix):]
-		val, ok := values[i].(string)
-
-		if !ok || val == "" {
-			continue
-		}
-
-		if !strings.HasPrefix(bizKey, prefix) {
-			continue
-		}
-
-		check := bizKey[len(prefix):]
-		check = strings.TrimPrefix(check, "/")
-		if strings.Contains(check, "/") {
-			continue
-		}
-		if check == "" {
-			continue
-		}
-
-		result[bizKey] = val
-	}
-
-	return result, nil
-}
-
-func (r *RedisKV) listPageInternal(fullList map[string]string, pageIndex uint64, pageSize uint) (map[string]string, error) {
-	keys := make([]string, 0, len(fullList))
-	for k := range fullList {
-		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
-	start := pageIndex * uint64(pageSize)
-	if start >= uint64(len(keys)) {
-		return make(map[string]string), nil
-	}
-	end := start + uint64(pageSize)
-	if end > uint64(len(keys)) {
-		end = uint64(len(keys))
+	pairs := make([]Pair, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, Pair{Key: k[len(r.prefix):]})
 	}
 
-	pageKeys := keys[start:end]
-	pageResult := make(map[string]string, len(pageKeys))
-	for _, k := range pageKeys {
-		pageResult[k] = fullList[k]
+	start := listCursorStartIndex(pairs, opts.Cursor)
+	end := start + int(opts.Limit)
+	if end > len(pairs) {
+		end = len(pairs)
 	}
-	return pageResult, nil
+
+	p := pairs[start:end]
+	fullKeys := make([]string, 0, len(p))
+	for _, item := range p {
+		fullKeys = append(fullKeys, r.prefix+item.Key)
+	}
+
+	resPairs, err := r.fetchPairs(ctx, fullKeys)
+	if err != nil {
+		return nil, err
+	}
+
+	hasMore := end < len(pairs)
+	var nextCursor string
+	if hasMore {
+		nextCursor = resPairs[len(resPairs)-1].Key
+	}
+	return &ListResponse{Pairs: resPairs, Cursor: nextCursor, HasMore: hasMore}, nil
+}
+
+// List retrieves all key-value pairs matching the prefix.
+func (r *RedisKV) List(ctx context.Context, prefix string) ([]Pair, error) {
+	keys, err := r.scanKeys(ctx, r.prefix+prefix+"*")
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(keys)
+	return r.fetchPairs(ctx, keys)
+}
+
+// ListCurrent returns key-value pairs at the current level.
+func (r *RedisKV) ListCurrent(ctx context.Context, prefix string) ([]Pair, error) {
+	keys, err := r.scanKeys(ctx, r.prefix+prefix+"*")
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(keys)
+	filtered := make([]string, 0)
+	for _, k := range keys {
+		if isCurrentLevel(k[len(r.prefix):], prefix) {
+			filtered = append(filtered, k)
+		}
+	}
+	return r.fetchPairs(ctx, filtered)
 }
 
 // ListPage retrieves paginated key-value pairs matching the prefix.
-func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
-	fullList, err := r.List(ctx, prefix)
+func (r *RedisKV) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
+	all, err := r.List(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
-	return r.listPageInternal(fullList, pageIndex, pageSize)
+	start, end := listPageRange(len(all), pageIndex, pageSize)
+	return all[start:end], nil
 }
 
-// ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
-func (r *RedisKV) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
-	fullList, err := r.ListCurrent(ctx, prefix)
+// ListCurrentPage returns a page of key-value pairs at the current level.
+func (r *RedisKV) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
+	all, err := r.ListCurrent(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
-	return r.listPageInternal(fullList, pageIndex, pageSize)
+	start, end := listPageRange(len(all), pageIndex, pageSize)
+	return all[start:end], nil
 }
 
 // ListCurrentCursor implements cursor-based pagination for current level.
@@ -452,91 +347,44 @@ func (r *RedisKV) ListCurrentCursor(ctx context.Context, options *ListOptions) (
 	if options != nil {
 		opts = options
 	}
-	if opts.Limit == 0 {
+	if opts.Limit <= 0 {
 		opts.Limit = 1000
 	}
-
-	// Fetch all to filter
-	fullPrefix := r.prefix
-	keys := make([]string, 0)
-	cursor := uint64(0)
-
-	for {
-		res, nextCursor, err := r.client.Scan(ctx, cursor, fullPrefix+"*", 1000).Result()
-		if err != nil {
-			return nil, fmt.Errorf("scan keys failed: %w", err)
-		}
-		keys = append(keys, res...)
-		if nextCursor == 0 {
-			break
-		}
-		cursor = nextCursor
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
+	keys, err := r.scanKeys(ctx, r.prefix+"*")
+	if err != nil {
+		return nil, err
 	}
+	sort.Strings(keys)
 
-	filteredKeys := make([]string, 0)
+	pairs := make([]Pair, 0)
 	for _, k := range keys {
-		if !strings.HasPrefix(k, r.prefix) {
-			continue
-		}
-		relKey := k[len(r.prefix):]
-
-		if strings.Contains(relKey, "/") {
-			continue
-		}
-		if relKey == "" {
-			continue
-		}
-		filteredKeys = append(filteredKeys, relKey)
-	}
-
-	sort.Strings(filteredKeys)
-
-	// Apply Cursor
-	startIndex := 0
-	if opts.Cursor != "" {
-		for i, key := range filteredKeys {
-			if key > opts.Cursor {
-				startIndex = i
-				break
-			}
-		}
-		if startIndex == 0 && (len(filteredKeys) == 0 || filteredKeys[0] <= opts.Cursor) {
-			found := false
-			for i, key := range filteredKeys {
-				if key > opts.Cursor {
-					startIndex = i
-					found = true
-					break
-				}
-			}
-			if !found {
-				startIndex = len(filteredKeys)
-			}
+		rel := k[len(r.prefix):]
+		if isCurrentLevel(rel, "") {
+			pairs = append(pairs, Pair{Key: rel})
 		}
 	}
 
-	// Apply Limit
-	endIndex := startIndex + int(opts.Limit)
-	if endIndex > len(filteredKeys) {
-		endIndex = len(filteredKeys)
+	start := listCursorStartIndex(pairs, opts.Cursor)
+	end := start + int(opts.Limit)
+	if end > len(pairs) {
+		end = len(pairs)
 	}
 
-	resultKeys := filteredKeys[startIndex:endIndex]
+	p := pairs[start:end]
+	fullKeys := make([]string, 0, len(p))
+	for _, item := range p {
+		fullKeys = append(fullKeys, r.prefix+item.Key)
+	}
 
+	resPairs, err := r.fetchPairs(ctx, fullKeys)
+	if err != nil {
+		return nil, err
+	}
+
+	hasMore := end < len(pairs)
 	var nextCursor string
-	hasMore := endIndex < len(filteredKeys)
 	if hasMore {
-		nextCursor = resultKeys[len(resultKeys)-1]
+		nextCursor = resPairs[len(resPairs)-1].Key
 	}
-
-	return &ListResponse{
-		Keys:    resultKeys,
-		Cursor:  nextCursor,
-		HasMore: hasMore,
-	}, nil
+	return &ListResponse{Pairs: resPairs, Cursor: nextCursor, HasMore: hasMore}, nil
 }

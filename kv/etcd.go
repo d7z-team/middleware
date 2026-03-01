@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -65,163 +64,55 @@ func (e *Etcd) extractKey(fullKey string) string {
 }
 
 // List returns all key-value pairs matching the prefix.
-func (e *Etcd) List(ctx context.Context, prefix string) (map[string]string, error) {
+func (e *Etcd) List(ctx context.Context, prefix string) ([]Pair, error) {
 	fullPrefix := e.prefix + prefix
-	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix())
+	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
 	if err != nil {
 		return nil, fmt.Errorf("list keys failed: %w", err)
 	}
 
-	result := make(map[string]string, len(resp.Kvs))
+	result := make([]Pair, 0, len(resp.Kvs))
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
 		relKey := e.extractKey(key)
-		result[relKey] = string(kv.Value)
+		result = append(result, Pair{Key: relKey, Value: string(kv.Value)})
 	}
 	return result, nil
 }
 
 // ListCurrent returns key-value pairs at the current level (excluding children).
-func (e *Etcd) ListCurrent(ctx context.Context, prefix string) (map[string]string, error) {
-	fullPrefix := e.prefix + prefix
-	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix())
+func (e *Etcd) ListCurrent(ctx context.Context, prefix string) ([]Pair, error) {
+	all, err := e.List(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("list current keys failed: %w", err)
+		return nil, err
 	}
-
-	result := make(map[string]string)
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
-		relKey := e.extractKey(key)
-
-		// Logic similar to Memory
-		if !strings.HasPrefix(relKey, prefix) {
-			continue
+	filtered := make([]Pair, 0)
+	for _, p := range all {
+		if isCurrentLevel(p.Key, prefix) {
+			filtered = append(filtered, p)
 		}
-
-		check := relKey[len(prefix):]
-		check = strings.TrimPrefix(check, "/")
-		if strings.Contains(check, "/") {
-			continue
-		}
-		if check == "" {
-			continue
-		}
-
-		result[relKey] = string(kv.Value)
 	}
-	return result, nil
+	return filtered, nil
 }
 
 // ListPage returns a page of key-value pairs matching the prefix.
-func (e *Etcd) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
-	// For Etcd, efficient pagination requires using the key from the previous page as a starting point (cursor).
-	// Since ListPage uses numeric index, we have to fetch all keys or use a very inefficient skip.
-	// For consistency with other implementations and the interface, we fetch all (keys only first?) then slice.
-	// But ListPage returns values too.
-	// Optimization: Fetch only keys first, determine the range, then fetch values.
-	// Or just fetch everything if dataset is small.
-	// Given typical use of ListPage implies small datasets or bad design, let's do the safe implementation:
-	// Fetch all matching keys, sort, slice.
-
-	fullPrefix := e.prefix + prefix
-	// Get all keys with prefix
-	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix())
+func (e *Etcd) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
+	all, err := e.List(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("list page failed: %w", err)
+		return nil, err
 	}
-
-	// Collect and sort
-	type kvPair struct {
-		key string
-		val string
-	}
-	kvs := make([]kvPair, 0, len(resp.Kvs))
-	for _, item := range resp.Kvs {
-		kvs = append(kvs, kvPair{key: string(item.Key), val: string(item.Value)})
-	}
-
-	// Sort by key (lexicographically)
-	sort.Slice(kvs, func(i, j int) bool {
-		return kvs[i].key < kvs[j].key
-	})
-
-	start := uint64(pageSize) * pageIndex
-	end := start + uint64(pageSize)
-
-	result := make(map[string]string)
-	if start >= uint64(len(kvs)) {
-		return result, nil
-	}
-	if end > uint64(len(kvs)) {
-		end = uint64(len(kvs))
-	}
-
-	for _, item := range kvs[start:end] {
-		relKey := e.extractKey(item.key)
-		result[relKey] = item.val
-	}
-
-	return result, nil
+	start, end := listPageRange(len(all), pageIndex, pageSize)
+	return all[start:end], nil
 }
 
 // ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
-func (e *Etcd) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error) {
-	// Fetch all to filter (inefficient but safe for "current level" semantics)
-	fullPrefix := e.prefix + prefix
-	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix())
+func (e *Etcd) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
+	all, err := e.ListCurrent(ctx, prefix)
 	if err != nil {
-		return nil, fmt.Errorf("list current page failed: %w", err)
+		return nil, err
 	}
-
-	type kvPair struct {
-		key string
-		val string
-	}
-	kvs := make([]kvPair, 0)
-
-	for _, item := range resp.Kvs {
-		key := string(item.Key)
-		relKey := e.extractKey(key)
-
-		// Filter
-		if !strings.HasPrefix(relKey, prefix) {
-			continue
-		}
-
-		check := relKey[len(prefix):]
-		check = strings.TrimPrefix(check, "/")
-		if strings.Contains(check, "/") {
-			continue
-		}
-		if check == "" {
-			continue
-		}
-
-		kvs = append(kvs, kvPair{key: relKey, val: string(item.Value)})
-	}
-
-	// Sort by Key (consistent with Etcd ListPage)
-	sort.Slice(kvs, func(i, j int) bool {
-		return kvs[i].key < kvs[j].key
-	})
-
-	start := uint64(pageSize) * pageIndex
-	end := start + uint64(pageSize)
-
-	result := make(map[string]string)
-	if start >= uint64(len(kvs)) {
-		return result, nil
-	}
-	if end > uint64(len(kvs)) {
-		end = uint64(len(kvs))
-	}
-
-	for _, item := range kvs[start:end] {
-		result[item.key] = item.val
-	}
-
-	return result, nil
+	start, end := listPageRange(len(all), pageIndex, pageSize)
+	return all[start:end], nil
 }
 
 // ListCurrentCursor implements cursor-based pagination for current level.
@@ -234,70 +125,26 @@ func (e *Etcd) ListCurrentCursor(ctx context.Context, options *ListOptions) (*Li
 		opts.Limit = 1000
 	}
 
-	// Scan/Get all to filter correctly.
-	// Optimizing with WithFromKey is risky if many children exist between cursor and next sibling.
-	// We'll use the safe "Get All" approach for consistency with ListCurrent logic.
-
-	resp, err := e.client.Get(ctx, e.prefix, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	all, err := e.ListCurrent(ctx, "")
 	if err != nil {
-		return nil, fmt.Errorf("cursor list current failed: %w", err)
+		return nil, err
 	}
 
-	filteredKeys := make([]string, 0)
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
-		relKey := e.extractKey(key)
-
-		if strings.Contains(relKey, "/") {
-			continue
-		}
-		if relKey == "" {
-			continue
-		}
-		filteredKeys = append(filteredKeys, relKey)
-	}
-
-	// Apply Cursor
-	startIndex := 0
-	if opts.Cursor != "" {
-		for i, key := range filteredKeys {
-			if key > opts.Cursor {
-				startIndex = i
-				break
-			}
-		}
-		// If cursor > all or not found logic
-		if startIndex == 0 && (len(filteredKeys) == 0 || filteredKeys[0] <= opts.Cursor) {
-			found := false
-			for i, key := range filteredKeys {
-				if key > opts.Cursor {
-					startIndex = i
-					found = true
-					break
-				}
-			}
-			if !found {
-				startIndex = len(filteredKeys)
-			}
-		}
-	}
-
-	// Apply Limit
+	startIndex := listCursorStartIndex(all, opts.Cursor)
 	endIndex := startIndex + int(opts.Limit)
-	if endIndex > len(filteredKeys) {
-		endIndex = len(filteredKeys)
+	if endIndex > len(all) {
+		endIndex = len(all)
 	}
 
-	resultKeys := filteredKeys[startIndex:endIndex]
-
+	resultPairs := all[startIndex:endIndex]
 	var nextCursor string
-	hasMore := endIndex < len(filteredKeys)
+	hasMore := endIndex < len(all)
 	if hasMore {
-		nextCursor = resultKeys[len(resultKeys)-1]
+		nextCursor = resultPairs[len(resultPairs)-1].Key
 	}
 
 	return &ListResponse{
-		Keys:    resultKeys,
+		Pairs:   resultPairs,
 		Cursor:  nextCursor,
 		HasMore: hasMore,
 	}, nil
@@ -463,7 +310,6 @@ func (e *Etcd) ListCursor(ctx context.Context, options *ListOptions) (*ListRespo
 	}
 
 	etcdOpts := []clientv3.OpOption{
-		clientv3.WithKeysOnly(),
 		clientv3.WithLimit(opts.Limit + 1),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
 	}
@@ -482,7 +328,7 @@ func (e *Etcd) ListCursor(ctx context.Context, options *ListOptions) (*ListRespo
 	}
 
 	result := &ListResponse{
-		Keys: make([]string, 0, len(resp.Kvs)),
+		Pairs: make([]Pair, 0, len(resp.Kvs)),
 	}
 
 	count := int64(0)
@@ -496,12 +342,15 @@ func (e *Etcd) ListCursor(ctx context.Context, options *ListOptions) (*ListRespo
 			result.HasMore = true
 			break
 		}
-		result.Keys = append(result.Keys, e.extractKey(key))
+		result.Pairs = append(result.Pairs, Pair{
+			Key:   e.extractKey(key),
+			Value: string(kv.Value),
+		})
 		count++
 	}
 
-	if result.HasMore && len(result.Keys) > 0 {
-		result.Cursor = result.Keys[len(result.Keys)-1]
+	if result.HasMore && len(result.Pairs) > 0 {
+		result.Cursor = result.Pairs[len(result.Pairs)-1].Key
 	}
 
 	return result, nil

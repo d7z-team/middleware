@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.d7z.net/middleware/connects"
@@ -14,6 +15,12 @@ import (
 
 // TTLKeep indicates that the TTL should not be modified.
 const TTLKeep = -1
+
+// Pair represents a key-value pair.
+type Pair struct {
+	Key   string
+	Value string
+}
 
 // KV defines the basic key-value storage interface.
 type KV interface {
@@ -35,16 +42,16 @@ type KV interface {
 	CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error)
 
 	// List returns all key-value pairs matching the prefix.
-	List(ctx context.Context, prefix string) (map[string]string, error)
+	List(ctx context.Context, prefix string) ([]Pair, error)
 	// ListCurrent returns key-value pairs at the current level (excluding children).
-	ListCurrent(ctx context.Context, prefix string) (map[string]string, error)
+	ListCurrent(ctx context.Context, prefix string) ([]Pair, error)
 	// ListPage returns a page of key-value pairs matching the prefix.
-	ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error)
+	ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error)
 	// ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
-	ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) (map[string]string, error)
-	// ListCursor returns a list of keys based on cursor and limit.
+	ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error)
+	// ListCursor returns a list of key-value pairs based on cursor and limit.
 	ListCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error)
-	// ListCurrentCursor returns a list of keys at the current level based on cursor and limit.
+	// ListCurrentCursor returns a list of key-value pairs at the current level based on cursor and limit.
 	ListCurrentCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 }
 
@@ -80,9 +87,45 @@ type ListOptions struct {
 
 // ListResponse contains the results of a list operation.
 type ListResponse struct {
-	Keys    []string // Matched keys (relative to prefix, without root prefix)
-	Cursor  string   // Cursor for the next page (empty if no more data)
-	HasMore bool     // Indicates if there is more data available
+	Pairs   []Pair // Matched key-value pairs (relative to prefix, without root prefix)
+	Cursor  string // Cursor for the next page (empty if no more data)
+	HasMore bool   // Indicates if there is more data available
+}
+
+// listPageRange calculates the start and end indices for pagination.
+func listPageRange(totalLen int, pageIndex uint64, pageSize uint) (int, int) {
+	start := int(pageIndex * uint64(pageSize))
+	if start >= totalLen {
+		return totalLen, totalLen
+	}
+	end := start + int(pageSize)
+	if end > totalLen {
+		end = totalLen
+	}
+	return start, end
+}
+
+// listCursorStartIndex finds the starting index for cursor-based pagination.
+func listCursorStartIndex(pairs []Pair, cursor string) int {
+	if cursor == "" {
+		return 0
+	}
+	for i, p := range pairs {
+		if p.Key > cursor {
+			return i
+		}
+	}
+	return len(pairs)
+}
+
+// isCurrentLevel checks if the relative key is at the current level for the given prefix.
+func isCurrentLevel(relKey, prefix string) bool {
+	if !strings.HasPrefix(relKey, prefix) {
+		return false
+	}
+	rest := relKey[len(prefix):]
+	rest = strings.TrimPrefix(rest, "/")
+	return rest != "" && !strings.Contains(rest, "/")
 }
 
 // NewKVFromURL creates a new KV instance from a URL string.

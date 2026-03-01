@@ -7,8 +7,13 @@ import (
 	"gopkg.d7z.net/middleware/kv"
 )
 
+type IDValue[ID comparable, Data any] struct {
+	ID   ID
+	Data Data
+}
+
 type ID2KVI[ID comparable, Data any] interface {
-	List(ctx context.Context, page uint64, size uint) (map[ID]Data, error)
+	List(ctx context.Context, page uint64, size uint) ([]IDValue[ID, Data], error)
 	Get(ctx context.Context, id ID) (Data, error)
 	Put(ctx context.Context, id ID, value Data) error
 	PutIfNotExists(ctx context.Context, id ID, value Data) (bool, error)
@@ -25,24 +30,24 @@ func NewID2KV[Data any](kv kv.KV, prefix string) ID2KVI[string, Data] {
 	}
 }
 
-func (d *ID2KV[Data]) List(ctx context.Context, page uint64, size uint) (map[string]Data, error) {
+func (d *ID2KV[Data]) List(ctx context.Context, page uint64, size uint) ([]IDValue[string, Data], error) {
 	listPage, err := d.kv.ListPage(ctx, "", page, size)
 	if err != nil {
 		return nil, err
 	}
-	ret := make(map[string]Data, size)
-	for k, v := range listPage {
+	ret := make([]IDValue[string, Data], 0, len(listPage))
+	for _, p := range listPage {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 		var value Data
-		err = json.Unmarshal([]byte(v), &value)
+		err = json.Unmarshal([]byte(p.Value), &value)
 		if err != nil {
 			return nil, err
 		}
-		ret[k] = value
+		ret = append(ret, IDValue[string, Data]{ID: p.Key, Data: value})
 	}
 	return ret, nil
 }
