@@ -55,6 +55,13 @@ type KV interface {
 	ListCurrentCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 	// Scan performs a prefix scan with pagination support.
 	Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error)
+
+	// PutBatch stores multiple key-value pairs with the same TTL.
+	PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) error
+	// GetBatch retrieves values for multiple keys.
+	GetBatch(ctx context.Context, keys []string) ([]string, error)
+	// DeleteBatch removes multiple keys.
+	DeleteBatch(ctx context.Context, keys []string) error
 }
 
 // RawKV interface allows access to the underlying KV implementation.

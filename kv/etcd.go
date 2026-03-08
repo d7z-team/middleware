@@ -369,3 +369,82 @@ func (e *Etcd) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error
 
 	return res, nil
 }
+
+// PutBatch stores multiple key-value pairs using a transaction.
+func (e *Etcd) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) error {
+	// Special handling for TTLKeep: Etcd requires complex conditional logic (If key exists then update else put)
+	// which cannot be easily batched in a single Txn for multiple distinct keys.
+	// We fall back to sequential/parallel execution for this specific case to ensure correctness.
+	if ttl == TTLKeep {
+		for _, p := range pairs {
+			if err := e.Put(ctx, p.Key, p.Value, ttl); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	var leaseID clientv3.LeaseID
+	ttlSeconds := int64(ttl / time.Second)
+	if ttlSeconds < 1 {
+		ttlSeconds = 1
+	}
+	resp, err := e.client.Grant(ctx, ttlSeconds)
+	if err != nil {
+		return err
+	}
+	leaseID = resp.ID
+
+	ops := make([]clientv3.Op, 0, len(pairs))
+	for _, p := range pairs {
+		fk, err := e.buildKey(p.Key)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, clientv3.OpPut(fk, p.Value, clientv3.WithLease(leaseID)))
+	}
+
+	_, err = e.client.Txn(ctx).Then(ops...).Commit()
+	return err
+}
+
+// GetBatch retrieves values for multiple keys using a transaction.
+func (e *Etcd) GetBatch(ctx context.Context, keys []string) ([]string, error) {
+	ops := make([]clientv3.Op, 0, len(keys))
+	for _, k := range keys {
+		fk, err := e.buildKey(k)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, clientv3.OpGet(fk))
+	}
+
+	resp, err := e.client.Txn(ctx).Then(ops...).Commit()
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]string, len(keys))
+	for i, r := range resp.Responses {
+		getResp := r.GetResponseRange()
+		if getResp.Count == 0 {
+			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, keys[i])
+		}
+		res[i] = string(getResp.Kvs[0].Value)
+	}
+	return res, nil
+}
+
+// DeleteBatch removes multiple keys using a transaction.
+func (e *Etcd) DeleteBatch(ctx context.Context, keys []string) error {
+	ops := make([]clientv3.Op, 0, len(keys))
+	for _, k := range keys {
+		fk, err := e.buildKey(k)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, clientv3.OpDelete(fk))
+	}
+	_, err := e.client.Txn(ctx).Then(ops...).Commit()
+	return err
+}

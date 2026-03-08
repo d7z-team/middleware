@@ -771,6 +771,39 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		_, err = sKV.Scan(cCtx, ScanOptions{Limit: 10})
 		assert.Error(t, err)
 	})
+
+	// Batch Operations
+	t.Run("Batch_Operations", func(t *testing.T) {
+		prefix := uniquePrefix + "batch/"
+		bKV := kvClient.Child(prefix)
+
+		pairs := []Pair{
+			{Key: "k1", Value: "v1"},
+			{Key: "k2", Value: "v2"},
+			{Key: "k3", Value: "v3"},
+		}
+
+		// 1. PutBatch
+		err := bKV.PutBatch(ctx, pairs, TTLKeep)
+		assert.NoError(t, err)
+
+		// 2. GetBatch
+		keys := []string{"k1", "k2", "k3"}
+		vals, err := bKV.GetBatch(ctx, keys)
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"v1", "v2", "v3"}, vals)
+
+		// 3. GetBatch with missing key
+		_, err = bKV.GetBatch(ctx, []string{"k1", "missing"})
+		assert.ErrorIs(t, err, ErrKeyNotFound)
+
+		// 4. DeleteBatch
+		err = bKV.DeleteBatch(ctx, []string{"k1", "k2"})
+		assert.NoError(t, err)
+
+		count, _ := bKV.Count(ctx)
+		assert.Equal(t, int64(1), count) // Only k3 remains
+	})
 }
 
 func TestCloserKV_Raw(t *testing.T) {
@@ -861,6 +894,7 @@ func TestMemoryKV(t *testing.T) {
 		kv, err := NewMemory("")
 		require.NoError(t, err)
 		testKVConsistency(t, kv)
+		testKVExtended(t, kv)
 	})
 
 	// 2. File Persistence
@@ -871,6 +905,7 @@ func TestMemoryKV(t *testing.T) {
 		require.NoError(t, err)
 
 		testKVConsistency(t, kv)
+		testKVExtended(t, kv)
 
 		// Verify persistence
 		key := "persist_key"
@@ -897,6 +932,7 @@ func TestRedisKV(t *testing.T) {
 
 	kv := NewRedis(client, "test_kv_redis/")
 	testKVConsistency(t, kv)
+	testKVExtended(t, kv)
 }
 
 func TestEtcdKV(t *testing.T) {
@@ -910,4 +946,79 @@ func TestEtcdKV(t *testing.T) {
 
 	kv := NewEtcd(etcdClient, "test_kv_etcd/")
 	testKVConsistency(t, kv)
+	testKVExtended(t, kv)
+}
+
+func testKVExtended(t *testing.T, kvClient KV) {
+	t.Helper()
+	ctx := t.Context()
+	uniquePrefix := "kv_ext_" + time.Now().Format("20060102150405.000") + "_"
+
+	t.Run("Large_Value_Support", func(t *testing.T) {
+		// 512KB Value (safe for Etcd Txn which doubles payload)
+		size := 512 * 1024
+		largeVal := make([]byte, size)
+		for i := 0; i < size; i++ {
+			largeVal[i] = 'a'
+		}
+		strVal := string(largeVal)
+
+		key := uniquePrefix + "large"
+		err := kvClient.Put(ctx, key, strVal, TTLKeep)
+		assert.NoError(t, err)
+
+		got, err := kvClient.Get(ctx, key)
+		assert.NoError(t, err)
+		assert.Equal(t, len(strVal), len(got))
+		assert.Equal(t, strVal, got)
+	})
+
+	t.Run("Batch_Edge_Cases", func(t *testing.T) {
+		prefix := uniquePrefix + "batch_edge/"
+		bKV := kvClient.Child(prefix)
+
+		// 1. DeleteBatch non-existent
+		err := bKV.DeleteBatch(ctx, []string{"missing1", "missing2"})
+		assert.NoError(t, err)
+
+		// 2. PutBatch empty
+		err = bKV.PutBatch(ctx, []Pair{}, TTLKeep)
+		assert.NoError(t, err)
+
+		// 3. GetBatch empty
+		vals, err := bKV.GetBatch(ctx, []string{})
+		assert.NoError(t, err)
+		assert.Empty(t, vals)
+
+		// 4. GetBatch duplicates
+		_ = bKV.Put(ctx, "k1", "v1", TTLKeep)
+		vals, err = bKV.GetBatch(ctx, []string{"k1", "k1"})
+		assert.NoError(t, err)
+		assert.Equal(t, []string{"v1", "v1"}, vals)
+	})
+
+	t.Run("Scan_Edge_Cases", func(t *testing.T) {
+		prefix := uniquePrefix + "scan_edge/"
+		sKV := kvClient.Child(prefix)
+		for i := 0; i < 5; i++ {
+			_ = sKV.Put(ctx, fmt.Sprintf("k%d", i), "v", TTLKeep)
+		}
+
+		// 1. Limit 0 (Default to 100 or implementation specific, but shouldn't fail)
+		resp, err := sKV.Scan(ctx, ScanOptions{Limit: 0})
+		assert.NoError(t, err)
+		assert.NotEmpty(t, resp.Pairs)
+
+		// 2. Limit 1
+		resp, err = sKV.Scan(ctx, ScanOptions{Limit: 1})
+		assert.NoError(t, err)
+		assert.Len(t, resp.Pairs, 1)
+		assert.True(t, resp.HasMore)
+
+		// 3. Scan non-existent prefix
+		resp, err = sKV.Scan(ctx, ScanOptions{Prefix: "missing/"})
+		assert.NoError(t, err)
+		assert.Empty(t, resp.Pairs)
+		assert.False(t, resp.HasMore)
+	})
 }

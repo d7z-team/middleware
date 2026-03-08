@@ -384,7 +384,7 @@ func (r *RedisKV) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, er
 	// This ensures lexicographical order which is expected by some users.
 	// Note: For extremely large datasets, this could be a bottleneck.
 	// A more advanced implementation would use SCAN directly but it doesn't guarantee order.
-	
+
 	fullPattern := r.prefix + opts.Prefix + "*"
 	keys, err := r.scanKeys(ctx, fullPattern)
 	if err != nil {
@@ -425,4 +425,71 @@ func (r *RedisKV) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, er
 		NextCursor: nextCursor,
 		HasMore:    hasMore,
 	}, nil
+}
+
+// PutBatch stores multiple key-value pairs using a pipeline.
+func (r *RedisKV) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) error {
+	pipe := r.client.Pipeline()
+	for _, p := range pairs {
+		fullKey, err := r.buildKey(p.Key)
+		if err != nil {
+			return err
+		}
+		if ttl == TTLKeep {
+			pipe.Set(ctx, fullKey, p.Value, redis.KeepTTL)
+		} else {
+			pipe.Set(ctx, fullKey, p.Value, ttl)
+		}
+	}
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// GetBatch retrieves values for multiple keys using MGET.
+func (r *RedisKV) GetBatch(ctx context.Context, keys []string) ([]string, error) {
+	if len(keys) == 0 {
+		return []string{}, nil
+	}
+	fullKeys := make([]string, len(keys))
+	for i, k := range keys {
+		fk, err := r.buildKey(k)
+		if err != nil {
+			return nil, err
+		}
+		fullKeys[i] = fk
+	}
+
+	vals, err := r.client.MGet(ctx, fullKeys...).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]string, len(vals))
+	for i, v := range vals {
+		if v == nil {
+			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, keys[i])
+		}
+		s, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("unexpected value type for key %s", keys[i])
+		}
+		res[i] = s
+	}
+	return res, nil
+}
+
+// DeleteBatch removes multiple keys using a single DEL command.
+func (r *RedisKV) DeleteBatch(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	fullKeys := make([]string, len(keys))
+	for i, k := range keys {
+		fk, err := r.buildKey(k)
+		if err != nil {
+			return err
+		}
+		fullKeys[i] = fk
+	}
+	return r.client.Del(ctx, fullKeys...).Err()
 }
