@@ -203,30 +203,27 @@ func (m *Memory) listSorted(ctx context.Context, prefix string, sortByTime bool)
 
 // ListCursor implements cursor-based pagination.
 func (m *Memory) ListCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
-	all, err := m.listSorted(ctx, "", false)
+	limit := 1000
+	if opts.Limit > 0 {
+		limit = int(opts.Limit)
+	}
+	res, err := m.Scan(ctx, ScanOptions{
+		Cursor: opts.Cursor,
+		Limit:  limit,
+	})
 	if err != nil {
 		return nil, err
 	}
-	start := listCursorStartIndex(all, opts.Cursor)
-	limit := int(opts.Limit)
-	if limit <= 0 {
-		limit = len(all)
-	}
-	endIndex := start + limit
-	if endIndex > len(all) {
-		endIndex = len(all)
-	}
-	pairs := all[start:endIndex]
-	hasMore := endIndex < len(all)
-	var nextCursor string
-	if hasMore {
-		nextCursor = pairs[len(pairs)-1].Key
-	}
-	return &ListResponse{Pairs: pairs, Cursor: nextCursor, HasMore: hasMore}, nil
+	return &ListResponse{
+		Pairs:   res.Pairs,
+		Cursor:  res.NextCursor,
+		HasMore: res.HasMore,
+	}, nil
 }
 
 // ListCurrentCursor implements cursor-based pagination for current level.
 func (m *Memory) ListCurrentCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
+	// For Memory, we still need to fetch all and filter because Scan returns sorted items
 	all, err := m.listSorted(ctx, "", false)
 	if err != nil {
 		return nil, err
@@ -257,7 +254,7 @@ func (m *Memory) ListCurrentCursor(ctx context.Context, opts *ListOptions) (*Lis
 
 // ListPage retrieves paginated key-value pairs matching the prefix.
 func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
-	all, err := m.listSorted(ctx, prefix, true)
+	all, err := m.List(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
@@ -267,18 +264,12 @@ func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, 
 
 // ListCurrentPage returns a page of key-value pairs at the current level.
 func (m *Memory) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
-	all, err := m.listSorted(ctx, prefix, true)
+	all, err := m.ListCurrent(ctx, prefix)
 	if err != nil {
 		return nil, err
 	}
-	filtered := make([]Pair, 0)
-	for _, p := range all {
-		if isCurrentLevel(p.Key, prefix) {
-			filtered = append(filtered, p)
-		}
-	}
-	start, end := listPageRange(len(filtered), pageIndex, pageSize)
-	return filtered[start:end], nil
+	start, end := listPageRange(len(all), pageIndex, pageSize)
+	return all[start:end], nil
 }
 
 // List retrieves all key-value pairs matching the prefix.
@@ -299,6 +290,37 @@ func (m *Memory) ListCurrent(ctx context.Context, prefix string) ([]Pair, error)
 		}
 	}
 	return filtered, nil
+}
+
+// Scan performs a prefix scan with pagination support.
+func (m *Memory) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 100
+	}
+	// Memory listSorted already handles m.prefix and sorting by key
+	all, err := m.listSorted(ctx, opts.Prefix, false)
+	if err != nil {
+		return nil, err
+	}
+
+	startIndex := listCursorStartIndex(all, opts.Cursor)
+	endIndex := startIndex + opts.Limit
+	if endIndex > len(all) {
+		endIndex = len(all)
+	}
+
+	resultPairs := all[startIndex:endIndex]
+	var nextCursor string
+	hasMore := endIndex < len(all)
+	if hasMore {
+		nextCursor = resultPairs[len(resultPairs)-1].Key
+	}
+
+	return &ScanResponse{
+		Pairs:      resultPairs,
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
+	}, nil
 }
 
 func (m *Memory) listInternal(ctx context.Context, prefix string) (map[string]memoryContent, error) {

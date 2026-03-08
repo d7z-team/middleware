@@ -256,53 +256,36 @@ func (r *RedisKV) ListCursor(ctx context.Context, options *ListOptions) (*ListRe
 	if options != nil {
 		opts = options
 	}
-	if opts.Limit <= 0 {
-		opts.Limit = 1000
+	limit := 1000
+	if opts.Limit > 0 {
+		limit = int(opts.Limit)
 	}
-	keys, err := r.scanKeys(ctx, r.prefix+"*")
+	res, err := r.Scan(ctx, ScanOptions{
+		Cursor: opts.Cursor,
+		Limit:  limit,
+	})
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(keys)
-
-	pairs := make([]Pair, 0, len(keys))
-	for _, k := range keys {
-		pairs = append(pairs, Pair{Key: k[len(r.prefix):]})
-	}
-
-	start := listCursorStartIndex(pairs, opts.Cursor)
-	end := start + int(opts.Limit)
-	if end > len(pairs) {
-		end = len(pairs)
-	}
-
-	p := pairs[start:end]
-	fullKeys := make([]string, 0, len(p))
-	for _, item := range p {
-		fullKeys = append(fullKeys, r.prefix+item.Key)
-	}
-
-	resPairs, err := r.fetchPairs(ctx, fullKeys)
-	if err != nil {
-		return nil, err
-	}
-
-	hasMore := end < len(pairs)
-	var nextCursor string
-	if hasMore {
-		nextCursor = resPairs[len(resPairs)-1].Key
-	}
-	return &ListResponse{Pairs: resPairs, Cursor: nextCursor, HasMore: hasMore}, nil
+	return &ListResponse{
+		Pairs:   res.Pairs,
+		Cursor:  res.NextCursor,
+		HasMore: res.HasMore,
+	}, nil
 }
 
 // List retrieves all key-value pairs matching the prefix.
 func (r *RedisKV) List(ctx context.Context, prefix string) ([]Pair, error) {
-	keys, err := r.scanKeys(ctx, r.prefix+prefix+"*")
+	// For small to medium datasets, we can use Scan with a large limit.
+	// This ensures we use the batching logic of Scan.
+	res, err := r.Scan(ctx, ScanOptions{
+		Prefix: prefix,
+		Limit:  1000000,
+	})
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(keys)
-	return r.fetchPairs(ctx, keys)
+	return res.Pairs, nil
 }
 
 // ListCurrent returns key-value pairs at the current level.
@@ -387,4 +370,59 @@ func (r *RedisKV) ListCurrentCursor(ctx context.Context, options *ListOptions) (
 		nextCursor = resPairs[len(resPairs)-1].Key
 	}
 	return &ListResponse{Pairs: resPairs, Cursor: nextCursor, HasMore: hasMore}, nil
+}
+
+// Scan performs a prefix scan with pagination support.
+func (r *RedisKV) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 100
+	}
+	// For Redis, the cursor from opts.Cursor is our business key.
+	// But Redis SCAN uses its own uint64 cursor.
+	// To provide a consistent experience across Memory/Etcd/Redis,
+	// we will fetch all keys matching the prefix, sort them, and then paginate.
+	// This ensures lexicographical order which is expected by some users.
+	// Note: For extremely large datasets, this could be a bottleneck.
+	// A more advanced implementation would use SCAN directly but it doesn't guarantee order.
+	
+	fullPattern := r.prefix + opts.Prefix + "*"
+	keys, err := r.scanKeys(ctx, fullPattern)
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(keys)
+
+	pairs := make([]Pair, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, Pair{Key: k[len(r.prefix):]})
+	}
+
+	start := listCursorStartIndex(pairs, opts.Cursor)
+	end := start + opts.Limit
+	if end > len(pairs) {
+		end = len(pairs)
+	}
+
+	resultPairs := pairs[start:end]
+	fullKeys := make([]string, 0, len(resultPairs))
+	for _, p := range resultPairs {
+		fullKeys = append(fullKeys, r.prefix+p.Key)
+	}
+
+	resPairs, err := r.fetchPairs(ctx, fullKeys)
+	if err != nil {
+		return nil, err
+	}
+
+	hasMore := end < len(pairs)
+	var nextCursor string
+	if hasMore {
+		nextCursor = resPairs[len(resPairs)-1].Key
+	}
+
+	return &ScanResponse{
+		Pairs:      resPairs,
+		NextCursor: nextCursor,
+		HasMore:    hasMore,
+	}, nil
 }

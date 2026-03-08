@@ -719,6 +719,58 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.NoError(t, err)
 		assert.Empty(t, lc)
 	})
+
+	// Scan
+	t.Run("Scan", func(t *testing.T) {
+		prefix := uniquePrefix + "scan/"
+		sKV := kvClient.Child(prefix)
+
+		// Insert 5 items: k1, k2, k3, k4, k5
+		for i := 1; i <= 5; i++ {
+			_ = sKV.Put(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf("v%d", i), TTLKeep)
+		}
+
+		// 1. Scan all with large limit
+		resp, err := sKV.Scan(ctx, ScanOptions{Limit: 10})
+		assert.NoError(t, err)
+		assert.Len(t, resp.Pairs, 5)
+		assert.False(t, resp.HasMore)
+		assert.Empty(t, resp.NextCursor)
+
+		// 2. Scan with sub-prefix
+		_ = sKV.Child("sub").Put(ctx, "sk1", "sv1", TTLKeep)
+		respSub, err := sKV.Scan(ctx, ScanOptions{Prefix: "sub/", Limit: 10})
+		assert.NoError(t, err)
+		assert.Len(t, respSub.Pairs, 1)
+		assert.Equal(t, "sub/sk1", respSub.Pairs[0].Key)
+
+		// 3. Paginated Scan
+		// Page 1 (Limit 2) -> k1, k2
+		respP1, err := sKV.Scan(ctx, ScanOptions{Limit: 2})
+		assert.NoError(t, err)
+		assert.Len(t, respP1.Pairs, 2)
+		assert.True(t, respP1.HasMore)
+		assert.NotEmpty(t, respP1.NextCursor)
+
+		// Page 2 (Limit 2) -> k3, k4
+		respP2, err := sKV.Scan(ctx, ScanOptions{Cursor: respP1.NextCursor, Limit: 2})
+		assert.NoError(t, err)
+		assert.Len(t, respP2.Pairs, 2)
+		assert.True(t, respP2.HasMore)
+
+		// Page 3 (Limit 2) -> k5, sub/sk1
+		respP3, err := sKV.Scan(ctx, ScanOptions{Cursor: respP2.NextCursor, Limit: 2})
+		assert.NoError(t, err)
+		assert.Len(t, respP3.Pairs, 2)
+		assert.Equal(t, "k5", respP3.Pairs[0].Key)
+		assert.Equal(t, "sub/sk1", respP3.Pairs[1].Key)
+
+		// 4. Scan context cancel
+		cCtx, cancel := context.WithCancel(ctx)
+		cancel()
+		_, err = sKV.Scan(cCtx, ScanOptions{Limit: 10})
+		assert.Error(t, err)
+	})
 }
 
 func TestCloserKV_Raw(t *testing.T) {

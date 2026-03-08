@@ -65,19 +65,14 @@ func (e *Etcd) extractKey(fullKey string) string {
 
 // List returns all key-value pairs matching the prefix.
 func (e *Etcd) List(ctx context.Context, prefix string) ([]Pair, error) {
-	fullPrefix := e.prefix + prefix
-	resp, err := e.client.Get(ctx, fullPrefix, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	res, err := e.Scan(ctx, ScanOptions{
+		Prefix: prefix,
+		Limit:  1000000,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("list keys failed: %w", err)
+		return nil, err
 	}
-
-	result := make([]Pair, 0, len(resp.Kvs))
-	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
-		relKey := e.extractKey(key)
-		result = append(result, Pair{Key: relKey, Value: string(kv.Value)})
-	}
-	return result, nil
+	return res.Pairs, nil
 }
 
 // ListCurrent returns key-value pairs at the current level (excluding children).
@@ -305,53 +300,72 @@ func (e *Etcd) ListCursor(ctx context.Context, options *ListOptions) (*ListRespo
 	if options != nil {
 		opts = options
 	}
-	if opts.Limit == 0 {
-		opts.Limit = 1000
+	limit := 1000
+	if opts.Limit > 0 {
+		limit = int(opts.Limit)
 	}
 
-	etcdOpts := []clientv3.OpOption{
-		clientv3.WithLimit(opts.Limit + 1),
+	res, err := e.Scan(ctx, ScanOptions{
+		Cursor: opts.Cursor,
+		Limit:  limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &ListResponse{
+		Pairs:   res.Pairs,
+		Cursor:  res.NextCursor,
+		HasMore: res.HasMore,
+	}, nil
+}
+
+// Scan performs a prefix scan with pagination support.
+func (e *Etcd) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 100
+	}
+
+	fullPrefix := e.prefix + opts.Prefix
+	rangeEnd := clientv3.GetPrefixRangeEnd(fullPrefix)
+
+	getOpts := []clientv3.OpOption{
+		clientv3.WithRange(rangeEnd),
+		clientv3.WithLimit(int64(opts.Limit + 1)),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
 	}
 
-	key := e.prefix
+	key := fullPrefix
 	if opts.Cursor != "" {
-		etcdOpts = append(etcdOpts, clientv3.WithFromKey())
-		key += opts.Cursor + "\x00"
-	} else {
-		etcdOpts = append(etcdOpts, clientv3.WithPrefix())
+		// Start from the next key after the cursor
+		key = e.prefix + opts.Cursor + "\x00"
 	}
 
-	resp, err := e.client.Get(ctx, key, etcdOpts...)
+	resp, err := e.client.Get(ctx, key, getOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("list keys failed: %w", err)
+		return nil, fmt.Errorf("scan keys failed: %w", err)
 	}
 
-	result := &ListResponse{
+	res := &ScanResponse{
 		Pairs: make([]Pair, 0, len(resp.Kvs)),
 	}
 
-	count := int64(0)
+	count := 0
 	for _, kv := range resp.Kvs {
-		key := string(kv.Key)
-		if !strings.HasPrefix(key, e.prefix) {
-			break
-		}
-
 		if count >= opts.Limit {
-			result.HasMore = true
+			res.HasMore = true
 			break
 		}
-		result.Pairs = append(result.Pairs, Pair{
-			Key:   e.extractKey(key),
+		res.Pairs = append(res.Pairs, Pair{
+			Key:   e.extractKey(string(kv.Key)),
 			Value: string(kv.Value),
 		})
 		count++
 	}
 
-	if result.HasMore && len(result.Pairs) > 0 {
-		result.Cursor = result.Pairs[len(result.Pairs)-1].Key
+	if res.HasMore && len(res.Pairs) > 0 {
+		res.NextCursor = res.Pairs[len(res.Pairs)-1].Key
 	}
 
-	return result, nil
+	return res, nil
 }

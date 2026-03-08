@@ -53,6 +53,8 @@ type KV interface {
 	ListCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 	// ListCurrentCursor returns a list of key-value pairs at the current level based on cursor and limit.
 	ListCurrentCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error)
+	// Scan performs a prefix scan with pagination support.
+	Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error)
 }
 
 // RawKV interface allows access to the underlying KV implementation.
@@ -90,6 +92,27 @@ type ListResponse struct {
 	Pairs   []Pair // Matched key-value pairs (relative to prefix, without root prefix)
 	Cursor  string // Cursor for the next page (empty if no more data)
 	HasMore bool   // Indicates if there is more data available
+}
+
+// ScanOptions defines parameters for the scan operation.
+type ScanOptions struct {
+	// Prefix is the search prefix relative to the current KV instance's root path.
+	Prefix string
+	// Cursor is the pagination cursor. Empty for the first page.
+	Cursor string
+	// Limit restricts the maximum number of pairs returned in a single call.
+	Limit int
+}
+
+// ScanResponse defines the result of a scan operation.
+type ScanResponse struct {
+	// Pairs contains the matched key-value pairs.
+	// Keys are relative to the current KV instance's root prefix.
+	Pairs []Pair
+	// NextCursor is the cursor for the next page. Empty if the scan is finished.
+	NextCursor string
+	// HasMore indicates if there is more data available to scan.
+	HasMore bool
 }
 
 // listPageRange calculates the start and end indices for pagination.
