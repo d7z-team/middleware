@@ -844,3 +844,50 @@ func TestCloseBehavior(t *testing.T) {
 		})
 	}
 }
+
+func TestNewSubscriberFromURL_EtcdCloseClosesSubscriber(t *testing.T) {
+	subscriber, err := NewSubscriberFromURL("etcd://127.0.0.1:2379?prefix=test-close-subscriber")
+	if err != nil {
+		t.Skipf("skipping etcd close test: %v", err)
+	}
+
+	closer, ok := subscriber.(*closerSubscriber)
+	require.True(t, ok)
+	impl, ok := closer.Subscriber.(*EtcdSubscriber)
+	require.True(t, ok)
+	assert.False(t, impl.closed)
+
+	require.NoError(t, subscriber.Close())
+	assert.True(t, impl.closed)
+}
+
+func TestParentCloseInvalidatesMemoryChild(t *testing.T) {
+	parent := NewMemorySubscriber()
+	child, ok := parent.Child("child").(*MemorySubscriber)
+	require.True(t, ok)
+
+	ctx := context.Background()
+	childCh, err := child.Subscribe(ctx, "topic")
+	require.NoError(t, err)
+
+	require.NoError(t, parent.Close())
+
+	select {
+	case _, open := <-childCh:
+		assert.False(t, open, "child channel should be closed when parent closes")
+	case <-time.After(time.Second):
+		t.Fatal("child channel was not closed after parent close")
+	}
+
+	err = child.Publish(ctx, "topic", "after-close")
+	require.NoError(t, err)
+
+	closedCh, err := child.Subscribe(ctx, "another-topic")
+	require.NoError(t, err)
+	select {
+	case _, open := <-closedCh:
+		assert.False(t, open, "subscribe after parent close should return a closed channel")
+	case <-time.After(time.Second):
+		t.Fatal("subscribe after parent close should return immediately closed channel")
+	}
+}

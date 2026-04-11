@@ -18,6 +18,11 @@ type RedisCache struct {
 	prefix string
 }
 
+// NewRedisCache creates a Redis-backed cache view.
+//
+// Example:
+//
+//	cache := NewRedisCache(client, "assets")
 func NewRedisCache(client *redis.Client, prefix string) *RedisCache {
 	if prefix != "" {
 		prefix = strings.Trim(prefix, "/") + "/"
@@ -72,17 +77,14 @@ func (rc *RedisCache) Put(ctx context.Context, key string, metadata map[string]s
 		return fmt.Errorf("marshal meta: %w", err)
 	}
 
-	// 使用事务管道保证原子性
 	pipe := rc.client.TxPipeline()
 	dataKey := rc.dataKey(key)
 	metaKey := rc.metaKey(key)
 
 	if ttl == TTLKeep {
-		// 保持原有TTL - 只设置值，不设置过期时间
 		pipe.Set(ctx, dataKey, data, 0)
 		pipe.Set(ctx, metaKey, metaJSON, 0)
 	} else {
-		// 设置新的TTL - 直接在Set命令中设置过期时间
 		pipe.Set(ctx, dataKey, data, ttl)
 		pipe.Set(ctx, metaKey, metaJSON, ttl)
 	}
@@ -99,7 +101,6 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 	metaKey := rc.metaKey(key)
 	dataKey := rc.dataKey(key)
 
-	// 使用事务同时获取元数据和数据，确保一致性
 	pipe := rc.client.TxPipeline()
 	metaCmd := pipe.Get(ctx, metaKey)
 	dataCmd := pipe.Get(ctx, dataKey)
@@ -112,7 +113,6 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 		return nil, fmt.Errorf("redis get: %w", err)
 	}
 
-	// 处理元数据
 	metaJSON, err := metaCmd.Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
@@ -123,16 +123,13 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 
 	var meta map[string]string
 	if err := json.Unmarshal(metaJSON, &meta); err != nil {
-		// 元数据损坏，删除对应的数据键以保持一致性
 		go rc.cleanupCorruptedData(context.Background(), dataKey, metaKey)
 		return nil, fmt.Errorf("unmarshal meta: %w", err)
 	}
 
-	// 处理数据
 	data, err := dataCmd.Bytes()
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
-			// 数据不存在但元数据存在，删除元数据以保持一致性
 			go rc.cleanupCorruptedData(context.Background(), dataKey, metaKey)
 			return nil, ErrCacheMiss
 		}
@@ -146,7 +143,6 @@ func (rc *RedisCache) Get(ctx context.Context, key string) (*Content, error) {
 	}, nil
 }
 
-// cleanupCorruptedData 清理损坏的数据，用于后台修复数据不一致
 func (rc *RedisCache) cleanupCorruptedData(ctx context.Context, dataKey, metaKey string) {
 	_, _ = rc.client.Del(ctx, dataKey, metaKey).Result()
 }

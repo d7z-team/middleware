@@ -46,7 +46,7 @@ func ConnectEtcd(endpoints []string, opts ...EtcdOption) (*clientv3.Client, erro
 
 	cfg := clientv3.Config{
 		Endpoints:   endpoints,
-		DialTimeout: 5 * time.Second, // Default timeout
+		DialTimeout: 5 * time.Second,
 	}
 
 	for _, opt := range opts {

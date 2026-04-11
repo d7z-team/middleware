@@ -84,6 +84,9 @@ func (r *RedisKV) buildKey(key string) (string, error) {
 
 // Put stores a key-value pair.
 func (r *RedisKV) Put(ctx context.Context, key, value string, ttl time.Duration) error {
+	if invalidTTL(ttl) {
+		return ErrInvalidTTL
+	}
 	fullKey, err := r.buildKey(key)
 	if err != nil {
 		return err
@@ -155,6 +158,9 @@ func (r *RedisKV) DeleteAll(ctx context.Context) error {
 
 // PutIfNotExists sets the value only if the key does not exist.
 func (r *RedisKV) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if invalidTTL(ttl) {
+		return false, ErrInvalidTTL
+	}
 	fullKey, err := r.buildKey(key)
 	if err != nil {
 		return false, err
@@ -252,17 +258,10 @@ func (r *RedisKV) fetchPairs(ctx context.Context, fullKeys []string) ([]Pair, er
 
 // ListCursor implements cursor-based pagination.
 func (r *RedisKV) ListCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
-	opts := &ListOptions{}
-	if options != nil {
-		opts = options
-	}
-	limit := 1000
-	if opts.Limit > 0 {
-		limit = int(opts.Limit)
-	}
+	opts := normalizeListOptions(options)
 	res, err := r.Scan(ctx, ScanOptions{
 		Cursor: opts.Cursor,
-		Limit:  limit,
+		Limit:  int(opts.Limit),
 	})
 	if err != nil {
 		return nil, err
@@ -326,13 +325,7 @@ func (r *RedisKV) ListCurrentPage(ctx context.Context, prefix string, pageIndex 
 
 // ListCurrentCursor implements cursor-based pagination for current level.
 func (r *RedisKV) ListCurrentCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
-	opts := &ListOptions{}
-	if options != nil {
-		opts = options
-	}
-	if opts.Limit <= 0 {
-		opts.Limit = 1000
-	}
+	opts := normalizeListOptions(options)
 	keys, err := r.scanKeys(ctx, r.prefix+"*")
 	if err != nil {
 		return nil, err
@@ -377,14 +370,6 @@ func (r *RedisKV) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, er
 	if opts.Limit <= 0 {
 		opts.Limit = 100
 	}
-	// For Redis, the cursor from opts.Cursor is our business key.
-	// But Redis SCAN uses its own uint64 cursor.
-	// To provide a consistent experience across Memory/Etcd/Redis,
-	// we will fetch all keys matching the prefix, sort them, and then paginate.
-	// This ensures lexicographical order which is expected by some users.
-	// Note: For extremely large datasets, this could be a bottleneck.
-	// A more advanced implementation would use SCAN directly but it doesn't guarantee order.
-
 	fullPattern := r.prefix + opts.Prefix + "*"
 	keys, err := r.scanKeys(ctx, fullPattern)
 	if err != nil {
@@ -429,6 +414,9 @@ func (r *RedisKV) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, er
 
 // PutBatch stores multiple key-value pairs using a pipeline.
 func (r *RedisKV) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) error {
+	if invalidTTL(ttl) {
+		return ErrInvalidTTL
+	}
 	pipe := r.client.Pipeline()
 	for _, p := range pairs {
 		fullKey, err := r.buildKey(p.Key)

@@ -11,13 +11,11 @@ const (
 	defaultShardCount = 4096
 )
 
-// lockEntry represents a single lock instance with reference counting.
 type lockEntry struct {
-	ch       chan struct{} // semaphore channel, buffer size 1
-	refCount int           // reference count of active waiters/holders
+	ch       chan struct{}
+	refCount int
 }
 
-// entryPool reuses lockEntry objects to reduce allocations.
 var entryPool = sync.Pool{
 	New: func() interface{} {
 		return &lockEntry{
@@ -26,12 +24,6 @@ var entryPool = sync.Pool{
 	},
 }
 
-// MemoryLocker 基于内存的分段锁实现
-// 通过分段降低竞争，并使用对象池复用锁资源。
-// 采用 hash/maphash 提供的安全哈希算法，有效防止针对哈希碰撞的拒绝服务攻击 (Hash DoS)。
-// MemoryLocker is a sharded memory locker implementation.
-// It reduces contention through sharding and reuses lock resources using a pool.
-// It uses the secure hashing from hash/maphash to prevent Hash DoS attacks.
 type MemoryLocker struct {
 	shards     []*shard
 	maxLocks   int32
@@ -44,18 +36,20 @@ type shard struct {
 	locks map[string]*lockEntry
 }
 
-// NewMemoryLocker 创建一个新的本地锁实例，使用默认配置。
-// NewMemoryLocker creates a new memory locker instance with default configuration.
+// NewMemoryLocker creates a memory locker with default settings.
+//
+// Example:
+//
+//	locker := NewMemoryLocker()
 func NewMemoryLocker() *MemoryLocker {
 	return NewMemoryLockerWithConfig(defaultShardCount, 0)
 }
 
-// NewMemoryLockerWithConfig 创建一个带有自定义分段数和最大锁数量限制的本地锁实例。
-// shards: 分段数量，推荐为 2 的幂次。
-// maxLocks: 全局最大允许的并发锁数量，0 表示不限制。
-// NewMemoryLockerWithConfig creates a memory locker with custom shard count and max locks limit.
-// shards: Number of shards to reduce contention.
-// maxLocks: Maximum allowed concurrent locks globally, 0 for unlimited.
+// NewMemoryLockerWithConfig creates a memory locker with custom shard and limit settings.
+//
+// Example:
+//
+//	locker := NewMemoryLockerWithConfig(1024, 10000)
 func NewMemoryLockerWithConfig(shards, maxLocks int) *MemoryLocker {
 	if shards <= 0 {
 		shards = defaultShardCount
@@ -73,7 +67,10 @@ func NewMemoryLockerWithConfig(shards, maxLocks int) *MemoryLocker {
 	return l
 }
 
-// hash returns a collision-resistant hash of the string
+func (l *MemoryLocker) Close() error {
+	return nil
+}
+
 func (l *MemoryLocker) hash(s string) uint64 {
 	return maphash.String(l.seed, s)
 }
@@ -92,8 +89,6 @@ func (l *MemoryLocker) getEntry(id string) *lockEntry {
 		return entry
 	}
 
-	// 检查最大锁数量限制
-	// Check max locks limit
 	if l.maxLocks > 0 && l.totalLocks.Load() >= l.maxLocks {
 		return nil
 	}
@@ -119,8 +114,6 @@ func (l *MemoryLocker) putEntry(id string) {
 	if entry.refCount <= 0 {
 		delete(s.locks, id)
 		l.totalLocks.Add(-1)
-		// 确保通道状态正确（理论上释放后应该是空的）
-		// Ensure channel is empty before pooling
 		select {
 		case <-entry.ch:
 		default:
@@ -129,10 +122,6 @@ func (l *MemoryLocker) putEntry(id string) {
 	}
 }
 
-// TryLock 尝试获取锁，非阻塞
-// 如果成功获取锁，返回解锁函数；否则返回nil（包括达到最大锁限制的情况）
-// TryLock tries to acquire the lock without blocking.
-// Returns an unlock function if successful, otherwise returns nil.
 func (l *MemoryLocker) TryLock(ctx context.Context, id string) func() {
 	if ctx.Err() != nil {
 		return nil
@@ -158,10 +147,6 @@ func (l *MemoryLocker) TryLock(ctx context.Context, id string) func() {
 	}
 }
 
-// Lock 阻塞直到获取锁或上下文被取消
-// 如果成功获取锁，返回解锁函数；否则返回nil（包括达到最大锁限制的情况）
-// Lock blocks until the lock is acquired or the context is canceled.
-// Returns an unlock function if successful, otherwise returns nil.
 func (l *MemoryLocker) Lock(ctx context.Context, id string) func() {
 	if ctx.Err() != nil {
 		return nil

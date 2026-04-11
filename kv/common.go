@@ -88,41 +88,29 @@ func (receiver closerKV) Raw() KV {
 	return receiver.KV
 }
 
-// ListOptions defines options for list operations.
 type ListOptions struct {
-	Limit  int64  // Maximum number of items to return
-	Cursor string // Cursor for pagination (last key of previous page)
-}
-
-// ListResponse contains the results of a list operation.
-type ListResponse struct {
-	Pairs   []Pair // Matched key-value pairs (relative to prefix, without root prefix)
-	Cursor  string // Cursor for the next page (empty if no more data)
-	HasMore bool   // Indicates if there is more data available
-}
-
-// ScanOptions defines parameters for the scan operation.
-type ScanOptions struct {
-	// Prefix is the search prefix relative to the current KV instance's root path.
-	Prefix string
-	// Cursor is the pagination cursor. Empty for the first page.
+	Limit  int64
 	Cursor string
-	// Limit restricts the maximum number of pairs returned in a single call.
-	Limit int
 }
 
-// ScanResponse defines the result of a scan operation.
-type ScanResponse struct {
-	// Pairs contains the matched key-value pairs.
-	// Keys are relative to the current KV instance's root prefix.
-	Pairs []Pair
-	// NextCursor is the cursor for the next page. Empty if the scan is finished.
-	NextCursor string
-	// HasMore indicates if there is more data available to scan.
+type ListResponse struct {
+	Pairs   []Pair
+	Cursor  string
 	HasMore bool
 }
 
-// listPageRange calculates the start and end indices for pagination.
+type ScanOptions struct {
+	Prefix string
+	Cursor string
+	Limit  int
+}
+
+type ScanResponse struct {
+	Pairs      []Pair
+	NextCursor string
+	HasMore    bool
+}
+
 func listPageRange(totalLen int, pageIndex uint64, pageSize uint) (int, int) {
 	start := int(pageIndex * uint64(pageSize))
 	if start >= totalLen {
@@ -135,7 +123,6 @@ func listPageRange(totalLen int, pageIndex uint64, pageSize uint) (int, int) {
 	return start, end
 }
 
-// listCursorStartIndex finds the starting index for cursor-based pagination.
 func listCursorStartIndex(pairs []Pair, cursor string) int {
 	if cursor == "" {
 		return 0
@@ -148,7 +135,6 @@ func listCursorStartIndex(pairs []Pair, cursor string) int {
 	return len(pairs)
 }
 
-// isCurrentLevel checks if the relative key is at the current level for the given prefix.
 func isCurrentLevel(relKey, prefix string) bool {
 	if !strings.HasPrefix(relKey, prefix) {
 		return false
@@ -212,4 +198,20 @@ var (
 	ErrKeyNotFound = errors.Join(os.ErrNotExist, errors.New("key not found"))
 	ErrCASFailed   = errors.New("compare and swap failed")
 	ErrInvalidKey  = errors.New("key must not contain '/'")
+	ErrInvalidTTL  = errors.New("ttl must be TTLKeep or greater than 0")
 )
+
+func invalidTTL(ttl time.Duration) bool {
+	return ttl == 0 || ttl < TTLKeep
+}
+
+func normalizeListOptions(options *ListOptions) ListOptions {
+	opts := ListOptions{Limit: 1000}
+	if options != nil {
+		opts = *options
+		if opts.Limit <= 0 {
+			opts.Limit = 1000
+		}
+	}
+	return opts
+}

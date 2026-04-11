@@ -31,9 +31,9 @@ type MemoryCache struct {
 	lruCache   *lru.Cache[string, *internalValue]
 	cleanupInt time.Duration
 
-	mu     sync.RWMutex
+	mu     *sync.RWMutex
 	closed *atomic.Bool
-	stopWG sync.WaitGroup
+	stopWG *sync.WaitGroup
 
 	prefix string
 }
@@ -43,6 +43,11 @@ type MemoryCacheConfig struct {
 	CleanupInt  time.Duration
 }
 
+// NewMemoryCache creates an in-memory cache with LRU eviction.
+//
+// Example:
+//
+//	cache, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 1024})
 func NewMemoryCache(config MemoryCacheConfig) (*MemoryCache, error) {
 	if config.MaxCapacity <= 0 {
 		return nil, ErrInvalidCapacity
@@ -60,7 +65,9 @@ func NewMemoryCache(config MemoryCacheConfig) (*MemoryCache, error) {
 	mc := &MemoryCache{
 		lruCache:   lruCache,
 		cleanupInt: config.CleanupInt,
+		mu:         &sync.RWMutex{},
 		closed:     new(atomic.Bool),
+		stopWG:     &sync.WaitGroup{},
 		prefix:     "/",
 	}
 
@@ -88,7 +95,9 @@ func (mc *MemoryCache) Child(paths ...string) Cache {
 
 	return &MemoryCache{
 		lruCache: mc.lruCache,
+		mu:       mc.mu,
 		closed:   mc.closed,
+		stopWG:   mc.stopWG,
 		prefix:   mc.prefix + strings.Join(keys, "/") + "/",
 	}
 }
@@ -147,8 +156,8 @@ func (mc *MemoryCache) Get(ctx context.Context, key string) (*Content, error) {
 	}
 
 	key = mc.prefix + key
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
+	mc.mu.Lock()
+	defer mc.mu.Unlock()
 
 	internalVal, exists := mc.lruCache.Get(key)
 	if !exists {

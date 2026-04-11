@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"gopkg.d7z.net/middleware/kv"
@@ -20,18 +21,21 @@ func NewCache[Data any](kv kv.KV, prefix string, ttl time.Duration) *KVCache[Dat
 	}
 }
 
-func (c *KVCache[Data]) Load(ctx context.Context, key string) (Data, bool) {
+func (c *KVCache[Data]) Load(ctx context.Context, key string) (Data, bool, error) {
 	var zero Data
 	valStr, err := c.kv.Get(ctx, key)
 	if err != nil {
-		return zero, false
+		if errors.Is(err, kv.ErrKeyNotFound) {
+			return zero, false, nil
+		}
+		return zero, false, err
 	}
 	var data Data
 	if err := json.Unmarshal([]byte(valStr), &data); err != nil {
-		return zero, false
+		return zero, false, err
 	}
 
-	return data, true
+	return data, true, nil
 }
 
 func (c *KVCache[Data]) Store(ctx context.Context, key string, value Data) error {
@@ -43,7 +47,7 @@ func (c *KVCache[Data]) Store(ctx context.Context, key string, value Data) error
 	return c.kv.Put(ctx, key, string(valBytes), c.ttl)
 }
 
-// Delete 从缓存中删除指定键
-func (c *KVCache[Data]) Delete(ctx context.Context, key string) {
-	_, _ = c.kv.Delete(ctx, key)
+func (c *KVCache[Data]) Delete(ctx context.Context, key string) error {
+	_, err := c.kv.Delete(ctx, key)
+	return err
 }

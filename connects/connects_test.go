@@ -70,6 +70,23 @@ func TestNewRedis_QueryParams(t *testing.T) {
 	_, _ = NewRedis(u)
 }
 
+func TestNewRedis_InvalidQueryParams(t *testing.T) {
+	tests := []string{
+		"redis://localhost:6379/0?pool_size=abc",
+		"redis://localhost:6379/0?pool_size=0",
+		"redis://localhost:6379/0?min_idle=-1",
+		"redis://localhost:6379/0?dial_timeout=bad",
+		"redis://localhost:6379/0?read_timeout=bad",
+		"redis://localhost:6379/0?write_timeout=bad",
+	}
+
+	for _, raw := range tests {
+		u, _ := url.Parse(raw)
+		_, err := NewRedis(u)
+		assert.Error(t, err, raw)
+	}
+}
+
 func TestNewEtcd_QueryParams(t *testing.T) {
 	// Test query parameters parsing
 	u, _ := url.Parse("etcd://localhost:2379?endpoints=127.0.0.1:2379,127.0.0.1:2380&dial_timeout=10s")

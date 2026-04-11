@@ -63,6 +63,14 @@ func (e *Etcd) extractKey(fullKey string) string {
 	return strings.TrimPrefix(fullKey, e.prefix)
 }
 
+func ttlToSeconds(ttl time.Duration) int64 {
+	ttlSeconds := int64(ttl / time.Second)
+	if ttlSeconds < 1 {
+		ttlSeconds = 1
+	}
+	return ttlSeconds
+}
+
 // List returns all key-value pairs matching the prefix.
 func (e *Etcd) List(ctx context.Context, prefix string) ([]Pair, error) {
 	res, err := e.Scan(ctx, ScanOptions{
@@ -112,13 +120,7 @@ func (e *Etcd) ListCurrentPage(ctx context.Context, prefix string, pageIndex uin
 
 // ListCurrentCursor implements cursor-based pagination for current level.
 func (e *Etcd) ListCurrentCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
-	opts := &ListOptions{}
-	if options != nil {
-		opts = options
-	}
-	if opts.Limit == 0 {
-		opts.Limit = 1000
-	}
+	opts := normalizeListOptions(options)
 
 	all, err := e.ListCurrent(ctx, "")
 	if err != nil {
@@ -145,8 +147,10 @@ func (e *Etcd) ListCurrentCursor(ctx context.Context, options *ListOptions) (*Li
 	}, nil
 }
 
-// Put stores a key-value pair. If ttl is not TTLKeep, it sets a lease.
 func (e *Etcd) Put(ctx context.Context, key, value string, ttl time.Duration) error {
+	if invalidTTL(ttl) {
+		return ErrInvalidTTL
+	}
 	fullKey, err := e.buildKey(key)
 	if err != nil {
 		return err
@@ -163,24 +167,14 @@ func (e *Etcd) Put(ctx context.Context, key, value string, ttl time.Duration) er
 		return nil
 	}
 
-	var opts []clientv3.OpOption
-	ttlSeconds := int64(ttl / time.Second)
-	if ttlSeconds < 1 {
-		ttlSeconds = 1
-	}
-	resp, err := e.client.Grant(ctx, ttlSeconds)
+	resp, err := e.client.Grant(ctx, ttlToSeconds(ttl))
 	if err != nil {
 		return fmt.Errorf("create lease failed: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			_, _ = e.client.Revoke(context.Background(), resp.ID)
-		}
-	}()
-	opts = append(opts, clientv3.WithLease(resp.ID))
 
-	_, err = e.client.Put(ctx, fullKey, value, opts...)
+	_, err = e.client.Put(ctx, fullKey, value, clientv3.WithLease(resp.ID))
 	if err != nil {
+		_, _ = e.client.Revoke(context.Background(), resp.ID)
 		return fmt.Errorf("put key %s failed: %w", fullKey, err)
 	}
 	return nil
@@ -230,6 +224,9 @@ func (e *Etcd) DeleteAll(ctx context.Context) error {
 
 // PutIfNotExists sets the value only if the key does not exist.
 func (e *Etcd) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if invalidTTL(ttl) {
+		return false, ErrInvalidTTL
+	}
 	fullKey, err := e.buildKey(key)
 	if err != nil {
 		return false, err
@@ -238,23 +235,27 @@ func (e *Etcd) PutIfNotExists(ctx context.Context, key, value string, ttl time.D
 	cmp := clientv3.Compare(clientv3.Version(fullKey), "=", 0)
 
 	var putOp clientv3.Op
+	var leaseID clientv3.LeaseID
 	if ttl != TTLKeep {
-		ttlSeconds := int64(ttl / time.Second)
-		if ttlSeconds < 1 {
-			ttlSeconds = 1
-		}
-		resp, err := e.client.Grant(ctx, ttlSeconds)
+		resp, err := e.client.Grant(ctx, ttlToSeconds(ttl))
 		if err != nil {
 			return false, fmt.Errorf("create lease failed: %w", err)
 		}
-		putOp = clientv3.OpPut(fullKey, value, clientv3.WithLease(resp.ID))
+		leaseID = resp.ID
+		putOp = clientv3.OpPut(fullKey, value, clientv3.WithLease(leaseID))
 	} else {
 		putOp = clientv3.OpPut(fullKey, value)
 	}
 
 	txnResp, err := e.client.Txn(ctx).If(cmp).Then(putOp).Commit()
 	if err != nil {
+		if leaseID != 0 {
+			_, _ = e.client.Revoke(context.Background(), leaseID)
+		}
 		return false, fmt.Errorf("put if not exists failed: %w", err)
+	}
+	if leaseID != 0 && !txnResp.Succeeded {
+		_, _ = e.client.Revoke(context.Background(), leaseID)
 	}
 
 	return txnResp.Succeeded, nil
@@ -296,18 +297,11 @@ func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue strin
 
 // ListCursor implements cursor-based pagination.
 func (e *Etcd) ListCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
-	opts := &ListOptions{}
-	if options != nil {
-		opts = options
-	}
-	limit := 1000
-	if opts.Limit > 0 {
-		limit = int(opts.Limit)
-	}
+	opts := normalizeListOptions(options)
 
 	res, err := e.Scan(ctx, ScanOptions{
 		Cursor: opts.Cursor,
-		Limit:  limit,
+		Limit:  int(opts.Limit),
 	})
 	if err != nil {
 		return nil, err
@@ -372,9 +366,9 @@ func (e *Etcd) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error
 
 // PutBatch stores multiple key-value pairs using a transaction.
 func (e *Etcd) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) error {
-	// Special handling for TTLKeep: Etcd requires complex conditional logic (If key exists then update else put)
-	// which cannot be easily batched in a single Txn for multiple distinct keys.
-	// We fall back to sequential/parallel execution for this specific case to ensure correctness.
+	if invalidTTL(ttl) {
+		return ErrInvalidTTL
+	}
 	if ttl == TTLKeep {
 		for _, p := range pairs {
 			if err := e.Put(ctx, p.Key, p.Value, ttl); err != nil {
@@ -385,11 +379,7 @@ func (e *Etcd) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) er
 	}
 
 	var leaseID clientv3.LeaseID
-	ttlSeconds := int64(ttl / time.Second)
-	if ttlSeconds < 1 {
-		ttlSeconds = 1
-	}
-	resp, err := e.client.Grant(ctx, ttlSeconds)
+	resp, err := e.client.Grant(ctx, ttlToSeconds(ttl))
 	if err != nil {
 		return err
 	}
@@ -399,12 +389,16 @@ func (e *Etcd) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) er
 	for _, p := range pairs {
 		fk, err := e.buildKey(p.Key)
 		if err != nil {
+			_, _ = e.client.Revoke(context.Background(), leaseID)
 			return err
 		}
 		ops = append(ops, clientv3.OpPut(fk, p.Value, clientv3.WithLease(leaseID)))
 	}
 
 	_, err = e.client.Txn(ctx).Then(ops...).Commit()
+	if err != nil {
+		_, _ = e.client.Revoke(context.Background(), leaseID)
+	}
 	return err
 }
 

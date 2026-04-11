@@ -13,6 +13,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"gopkg.d7z.net/middleware/connects"
 )
 
@@ -126,6 +127,21 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		got, err = kvClient.Get(ctx, keyNewKeep)
 		assert.NoError(t, err)
 		assert.Equal(t, "val_new_keep", got)
+	})
+
+	// TTL Validation
+	t.Run("TTL_Validation", func(t *testing.T) {
+		key := uniquePrefix + "ttl_zero"
+
+		err := kvClient.Put(ctx, key, "v", 0)
+		assert.ErrorIs(t, err, ErrInvalidTTL)
+
+		ok, err := kvClient.PutIfNotExists(ctx, key+"_nx", "v", 0)
+		assert.ErrorIs(t, err, ErrInvalidTTL)
+		assert.False(t, ok)
+
+		err = kvClient.PutBatch(ctx, []Pair{{Key: key + "_b1", Value: "v1"}}, 0)
+		assert.ErrorIs(t, err, ErrInvalidTTL)
 	})
 
 	// Put If Not Exists
@@ -949,6 +965,53 @@ func TestEtcdKV(t *testing.T) {
 	testKVExtended(t, kv)
 }
 
+func leaseCount(t *testing.T, client *clientv3.Client) int {
+	t.Helper()
+	resp, err := client.Leases(t.Context())
+	require.NoError(t, err)
+	return len(resp.Leases)
+}
+
+func TestEtcdKV_LeaseCleanupOnFailure(t *testing.T) {
+	u, _ := url.Parse("etcd://127.0.0.1:2379")
+	etcdClient, err := connects.NewEtcd(u)
+	if err != nil {
+		t.Skipf("Etcd not available: %v", err)
+	}
+	defer etcdClient.Close()
+
+	prefix := "test_kv_etcd_lease_cleanup_" + time.Now().Format("20060102150405.000") + "/"
+	kv := NewEtcd(etcdClient, prefix)
+	ctx := t.Context()
+
+	t.Run("PutIfNotExists_Conflict", func(t *testing.T) {
+		require.NoError(t, kv.Put(ctx, "exists", "v1", TTLKeep))
+		before := leaseCount(t, etcdClient)
+
+		ok, err := kv.PutIfNotExists(ctx, "exists", "v2", 30*time.Second)
+		require.NoError(t, err)
+		require.False(t, ok)
+
+		require.Eventually(t, func() bool {
+			return leaseCount(t, etcdClient) == before
+		}, 5*time.Second, 200*time.Millisecond, "lease should be revoked when txn does not succeed")
+	})
+
+	t.Run("PutBatch_InvalidKey", func(t *testing.T) {
+		before := leaseCount(t, etcdClient)
+
+		err := kv.PutBatch(ctx, []Pair{
+			{Key: "ok", Value: "v1"},
+			{Key: "bad/key", Value: "v2"},
+		}, 30*time.Second)
+		require.ErrorIs(t, err, ErrInvalidKey)
+
+		require.Eventually(t, func() bool {
+			return leaseCount(t, etcdClient) == before
+		}, 5*time.Second, 200*time.Millisecond, "lease should be revoked when building batch ops fails")
+	})
+}
+
 func testKVExtended(t *testing.T, kvClient KV) {
 	t.Helper()
 	ctx := t.Context()
@@ -969,7 +1032,7 @@ func testKVExtended(t *testing.T, kvClient KV) {
 
 		got, err := kvClient.Get(ctx, key)
 		assert.NoError(t, err)
-		assert.Equal(t, len(strVal), len(got))
+		assert.Len(t, got, len(strVal))
 		assert.Equal(t, strVal, got)
 	})
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // LockerFactory creates a locker instance for testing
@@ -194,6 +195,8 @@ func TestEtcdLocker(t *testing.T) {
 		// testLockerCommon generates IDs.
 		return locker
 	})
+
+	require.NoError(t, locker.Close())
 }
 
 func TestNewLocker_Factory(t *testing.T) {
@@ -225,4 +228,17 @@ func TestNewLocker_Factory(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestEtcdLockerPathFormatting(t *testing.T) {
+	locker := NewEtcdLocker(nil, "/test-lock/")
+	assert.Equal(t, "/test-lock/resource", locker.getLockPath("resource"))
+	assert.Equal(t, "/test-lock/", locker.getLockPath(""))
+}
+
+func TestNewLocker_ReturnsClosableLocker(t *testing.T) {
+	locker, err := NewLocker("memory://")
+	assert.NoError(t, err)
+	assert.NotNil(t, locker)
+	assert.NoError(t, locker.Close())
 }

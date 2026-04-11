@@ -297,6 +297,18 @@ func TestMemoryImplementation(t *testing.T) {
 		defer root.Close()
 		testCacheConsistency(t, root.Child("a/b"))
 	})
+
+	t.Run("ChildSharesSynchronization", func(t *testing.T) {
+		root, err := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 100})
+		require.NoError(t, err)
+		defer root.Close()
+
+		child, ok := root.Child("nested").(*MemoryCache)
+		require.True(t, ok)
+		assert.Same(t, root.mu, child.mu)
+		assert.Same(t, root.stopWG, child.stopWG)
+		assert.Same(t, root.closed, child.closed)
+	})
 }
 
 func TestRedisImplementation(t *testing.T) {

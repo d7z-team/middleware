@@ -48,9 +48,7 @@ func NewMemory(store string) (*Memory, error) {
 
 	if store != "" {
 		if err := m.load(); err != nil {
-			// If file doesn't exist or is invalid, we start empty, unless it's a permission error
 			if !os.IsNotExist(err) {
-				// Try to verify if we can create the directory
 				if mkErr := os.MkdirAll(filepath.Dir(store), 0o755); mkErr != nil {
 					return nil, mkErr
 				}
@@ -100,40 +98,32 @@ func (m *Memory) putLocked(fullKey string, it item) {
 	curr.values[leaf] = it
 }
 
-// Child returns a new Memory instance scoped to the given path.
 func (m *Memory) Child(paths ...string) KV {
-	// Construct new prefix.
-	// We do NOT modify the existing m.prefix, we append to it.
 	newPrefix := m.prefix
+	var newPrefixSb103 strings.Builder
 	for _, p := range paths {
 		p = strings.Trim(p, "/")
 		if p != "" {
-			newPrefix += p + "/"
+			newPrefixSb103.WriteString(p + "/")
 		}
 	}
+	newPrefix += newPrefixSb103.String()
 	return &Memory{
 		mu:     m.mu,
 		root:   m.root,
 		prefix: newPrefix,
-		store:  "", // Children generally don't handle sync directly
+		store:  "",
 	}
 }
 
-// resolve returns the full absolute path for a given key relative to m.prefix.
 func (m *Memory) resolve(key string) string {
-	// m.prefix is like "users/" or ""
-	// key is like "dragon" or "sub/dragon"
-	// result "users/dragon" or "users/sub/dragon"
-	cleanKey := strings.Trim(key, "/")
-	return m.prefix + cleanKey
+	return m.prefix + strings.Trim(key, "/")
 }
 
-// find traverses to the directory node containing the key, and returns the node + leaf name.
-// key is the FULL absolute key.
 func (m *Memory) find(fullKey string, createDirs bool) (*node, string) {
 	fullKey = strings.Trim(fullKey, "/")
 	if fullKey == "" {
-		return m.root, "" // Root doesn't have a leaf name
+		return m.root, ""
 	}
 	parts := strings.Split(fullKey, "/")
 	curr := m.root
@@ -158,15 +148,11 @@ func (m *Memory) Put(ctx context.Context, key, value string, ttl time.Duration) 
 		return ctx.Err()
 	default:
 	}
+	if invalidTTL(ttl) {
+		return ErrInvalidTTL
+	}
 
 	fullKey := m.resolve(key)
-	// Edge case: empty key?
-	// If key is empty string, resolve returns m.prefix (e.g. "root/").
-	// We cannot store a value at a directory.
-	// But common_test might Put("a", ...).
-	// If user calls Put("", val), fullKey = "root/". Split -> ["root"]. Leaf="root".
-	// Node is parent of root? No.
-	// Let's rely on standard Trim.
 	if strings.Trim(key, "/") == "" {
 		return ErrInvalidKey
 	}
@@ -175,13 +161,11 @@ func (m *Memory) Put(ctx context.Context, key, value string, ttl time.Duration) 
 	defer m.mu.Unlock()
 
 	node, leaf := m.find(fullKey, true)
-	// node should not be nil if createDirs=true
 
 	now := time.Now()
 	var expire *time.Time
 	createAt := now
 
-	// Handle TTLKeep
 	if ttl == TTLKeep {
 		if existing, ok := node.values[leaf]; ok {
 			if existing.TTL == nil || now.Before(*existing.TTL) {
@@ -285,9 +269,7 @@ func (m *Memory) DeleteAll(ctx context.Context) error {
 	// If we just delete child from parent, the Child instance still points to the same root,
 	// but the path is gone. Future Puts will recreate it. Correct.
 
-	if _, ok := parent.children[leafDir]; ok {
-		delete(parent.children, leafDir)
-	}
+	delete(parent.children, leafDir)
 	return nil
 }
 
@@ -332,9 +314,6 @@ func (m *Memory) countRecursive(n *node) int64 {
 	return c
 }
 
-// Scan/List support.
-// We need to return keys RELATIVE to m.prefix.
-
 func (m *Memory) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error) {
 	select {
 	case <-ctx.Done():
@@ -345,8 +324,6 @@ func (m *Memory) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, err
 		opts.Limit = 100
 	}
 
-	// Since sorting is required for consistent pagination, we use List logic
-	// which collects and sorts, then we slice.
 	pairs, err := m.List(ctx, opts.Prefix)
 	if err != nil {
 		return nil, err
@@ -371,7 +348,6 @@ func (m *Memory) Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, err
 	}, nil
 }
 
-// List returns all items matching prefix (relative to m.prefix).
 func (m *Memory) List(ctx context.Context, prefix string) ([]Pair, error) {
 	select {
 	case <-ctx.Done():
@@ -382,10 +358,6 @@ func (m *Memory) List(ctx context.Context, prefix string) ([]Pair, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Full prefix to search = m.prefix + prefix
-	// This might point to a directory OR a partial file match.
-	// E.g. m.prefix="a/", prefix="b" -> keys starting with "a/b"
-
 	fullPrefix := m.prefix + strings.TrimLeft(prefix, "/")
 	searchPath := strings.Trim(fullPrefix, "/")
 
@@ -394,7 +366,6 @@ func (m *Memory) List(ctx context.Context, prefix string) ([]Pair, error) {
 		parts = strings.Split(searchPath, "/")
 	}
 
-	// Traverse as deep as possible
 	node := m.root
 	depth := 0
 	for _, p := range parts {
@@ -407,9 +378,6 @@ func (m *Memory) List(ctx context.Context, prefix string) ([]Pair, error) {
 	}
 
 	var res []Pair
-	// Case 1: Exact directory match (depth == len(parts))
-	// We scan everything under 'node'.
-	// The prefix for these keys relative to root is "parts/"
 	if depth == len(parts) {
 		base := ""
 		if len(parts) > 0 {
@@ -417,9 +385,6 @@ func (m *Memory) List(ctx context.Context, prefix string) ([]Pair, error) {
 		}
 		m.collect(node, base, &res)
 	} else if depth == len(parts)-1 {
-		// Case 2: Partial match on the last segment.
-		// node is the parent directory.
-		// We only look at values/children in 'node' that start with parts[last].
 		match := parts[len(parts)-1]
 		base := ""
 		if depth > 0 {
@@ -427,13 +392,8 @@ func (m *Memory) List(ctx context.Context, prefix string) ([]Pair, error) {
 		}
 		m.collectMatch(node, base, match, &res)
 	} else {
-		// No match
 		return []Pair{}, nil
 	}
-
-	// Now we have keys relative to ROOT (e.g. "a/b/key").
-	// We need to return keys relative to m.prefix.
-	// m.prefix is "a/". Result "b/key".
 
 	finalRes := make([]Pair, 0, len(res))
 	prefixLen := len(m.prefix)
@@ -464,7 +424,7 @@ func (m *Memory) collect(n *node, basePath string, res *[]Pair) {
 	}
 }
 
-func (m *Memory) collectMatch(n *node, basePath string, match string, res *[]Pair) {
+func (m *Memory) collectMatch(n *node, basePath, match string, res *[]Pair) {
 	now := time.Now()
 	for k, v := range n.values {
 		if strings.HasPrefix(k, match) {
@@ -480,7 +440,6 @@ func (m *Memory) collectMatch(n *node, basePath string, match string, res *[]Pai
 	}
 }
 
-// ListCurrent returns items in the specified directory (relative to m.prefix).
 func (m *Memory) ListCurrent(ctx context.Context, prefix string) ([]Pair, error) {
 	select {
 	case <-ctx.Done():
@@ -491,7 +450,6 @@ func (m *Memory) ListCurrent(ctx context.Context, prefix string) ([]Pair, error)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	// Logic similar to List but we don't recurse.
 	fullPrefix := m.prefix + strings.TrimLeft(prefix, "/")
 	searchPath := strings.Trim(fullPrefix, "/")
 
@@ -514,15 +472,7 @@ func (m *Memory) ListCurrent(ctx context.Context, prefix string) ([]Pair, error)
 	var res []Pair
 	now := time.Now()
 
-	// Helper to add
 	add := func(k, val string) {
-		// Key must be relative to m.prefix.
-		// We are currently at 'basePath' relative to root.
-		// This is tricky. Let's construct full key then strip.
-
-		// Wait, we need the full path to this key.
-		// If we are at depth N, the path is parts[:depth].
-
 		pathStr := ""
 		if depth > 0 {
 			pathStr = strings.Join(parts[:depth], "/") + "/"
@@ -535,14 +485,12 @@ func (m *Memory) ListCurrent(ctx context.Context, prefix string) ([]Pair, error)
 	}
 
 	if depth == len(parts) {
-		// Exact match of directory. List its content.
 		for k, v := range node.values {
 			if v.TTL == nil || now.Before(*v.TTL) {
 				add(k, v.Value)
 			}
 		}
 	} else if depth == len(parts)-1 {
-		// Partial match.
 		match := parts[len(parts)-1]
 		for k, v := range node.values {
 			if strings.HasPrefix(k, match) {
@@ -559,8 +507,10 @@ func (m *Memory) ListCurrent(ctx context.Context, prefix string) ([]Pair, error)
 	return res, nil
 }
 
-// Batch Ops
 func (m *Memory) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) error {
+	if invalidTTL(ttl) {
+		return ErrInvalidTTL
+	}
 	for _, p := range pairs {
 		if err := m.Put(ctx, p.Key, p.Value, ttl); err != nil {
 			return err
@@ -583,7 +533,9 @@ func (m *Memory) GetBatch(ctx context.Context, keys []string) ([]string, error) 
 
 func (m *Memory) DeleteBatch(ctx context.Context, keys []string) error {
 	for _, k := range keys {
-		m.Delete(ctx, k)
+		if _, err := m.Delete(ctx, k); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -614,13 +566,9 @@ func (m *Memory) flatten(n *node, prefix string, res map[string]item) {
 	}
 }
 
-// Helpers
 func (m *Memory) ListCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error) {
-	limit := 1000
-	if opts.Limit > 0 {
-		limit = int(opts.Limit)
-	}
-	res, err := m.Scan(ctx, ScanOptions{Cursor: opts.Cursor, Limit: limit})
+	normalized := normalizeListOptions(opts)
+	res, err := m.Scan(ctx, ScanOptions{Cursor: normalized.Cursor, Limit: int(normalized.Limit)})
 	if err != nil {
 		return nil, err
 	}
@@ -632,11 +580,9 @@ func (m *Memory) ListCurrentCursor(ctx context.Context, opts *ListOptions) (*Lis
 	if err != nil {
 		return nil, err
 	}
-	start := listCursorStartIndex(all, opts.Cursor)
-	limit := int(opts.Limit)
-	if limit <= 0 {
-		limit = 1000
-	}
+	normalized := normalizeListOptions(opts)
+	start := listCursorStartIndex(all, normalized.Cursor)
+	limit := int(normalized.Limit)
 	end := start + limit
 	if end > len(all) {
 		end = len(all)
@@ -666,6 +612,9 @@ func (m *Memory) ListCurrentPage(ctx context.Context, prefix string, pageIndex u
 }
 
 func (m *Memory) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	if invalidTTL(ttl) {
+		return false, ErrInvalidTTL
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	fullKey := m.resolve(key)

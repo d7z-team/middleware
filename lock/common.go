@@ -1,88 +1,26 @@
-// Package lock provides a unified distributed locking interface with multiple backend implementations.
-// It supports both in-memory local locks for single-instance applications and etcd-based distributed locks.
-//
-// The package is designed to be simple to use while providing robust locking mechanisms.
 package lock
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 
 	"gopkg.d7z.net/middleware/connects"
 )
 
-// Locker defines the interface for lock operations.
-// It provides both non-blocking (TryLock) and blocking (Lock) lock acquisition methods.
-//
-// Both methods return a release function that should be called to release the lock.
-// It's recommended to use defer to ensure the lock is always released:
-//
-//	release := locker.Lock(ctx, "my-resource")
-//	defer release()
 type Locker interface {
-	// TryLock attempts to acquire a lock non-blockingly.
-	// If the lock is successfully acquired, it returns a release function.
-	// If the lock is not available, it returns nil.
-	//
-	// Parameters:
-	//   - ctx: Context for cancellation and timeout
-	//   - id: The unique identifier for the resource to lock
-	//
-	// Returns:
-	//   - release function: Call this function to release the lock, or nil if lock not acquired
-	//
-	// Example:
-	//   release := locker.TryLock(ctx, "user-123")
-	//   if release != nil {
-	//       defer release()
-	//       // Critical section
-	//   } else {
-	//       // Handle lock acquisition failure
-	//   }
+	io.Closer
 	TryLock(ctx context.Context, id string) func()
-
-	// Lock acquires a lock blockingly, waiting until the lock is available.
-	// It returns a release function that must be called to release the lock.
-	//
-	// Parameters:
-	//   - ctx: Context for cancellation and timeout
-	//   - id: The unique identifier for the resource to lock
-	//
-	// Returns:
-	//   - release function: Function that must be called to release the lock
-	//
-	// Example:
-	//   release := locker.Lock(ctx, "user-123")
-	//   defer release()
-	//   // Critical section - guaranteed to have exclusive access
 	Lock(ctx context.Context, id string) func()
 }
 
-// NewLocker creates a new Locker instance based on the provided connection string.
+// NewLocker creates a locker from a connection URL.
 //
-// The connection string format:
-//   - Local/memory lock: "local://", "memory://", or "mem://"
-//   - Etcd distributed lock: "etcd://host:port?prefix=optional_prefix"
+// Example:
 //
-// Parameters:
-//   - s: Connection string specifying the lock backend and configuration
-//
-// Returns:
-//   - Locker: Configured locker instance
-//   - error: Error if the connection string is invalid or backend is unsupported
-//
-// Example usage:
-//
-//	// Local lock
-//	localLocker, err := NewLocker("memory://")
-//
-//	// Etcd lock with default prefix
-//	etcdLocker, err := NewLocker("etcd://localhost:2379")
-//
-//	// Etcd lock with custom prefix
-//	etcdLocker, err := NewLocker("etcd://localhost:2379?prefix=myapp/")
+//	locker, _ := NewLocker("memory://")
 func NewLocker(s string) (Locker, error) {
 	ur, err := url.Parse(s)
 	if err != nil {
@@ -98,7 +36,7 @@ func NewLocker(s string) (Locker, error) {
 		if err != nil {
 			return nil, err
 		}
-		return NewEtcdLocker(etcd, ur.Query().Get("prefix")), nil
+		return newEtcdLocker(etcd, ur.Query().Get("prefix"), etcd.Close), nil
 	default:
 		return nil, fmt.Errorf("unsupported scheme: %s", ur.Scheme)
 	}

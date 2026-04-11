@@ -1,10 +1,12 @@
 package tools
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.d7z.net/middleware/kv"
 )
 
@@ -27,7 +29,8 @@ func TestKVCache_StoreAndLoad(t *testing.T) {
 	err = cache.Store(t.Context(), "key", value)
 	assert.NoError(t, err)
 
-	load, found := cache.Load(t.Context(), "key")
+	load, found, err := cache.Load(t.Context(), "key")
+	assert.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, value, load)
 }
@@ -39,7 +42,8 @@ func TestKVCache_LoadNonExistentKey(t *testing.T) {
 	cache := NewCache[testStruct](memory, "cache", time.Second)
 
 	// Test loading non-existent key
-	_, found := cache.Load(t.Context(), "key1")
+	_, found, err := cache.Load(t.Context(), "key1")
+	assert.NoError(t, err)
 	assert.False(t, found)
 }
 
@@ -58,14 +62,16 @@ func TestKVCache_Expiration(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Key should exist before expiration
-	_, found := cache.Load(t.Context(), "key")
+	_, found, err := cache.Load(t.Context(), "key")
+	assert.NoError(t, err)
 	assert.True(t, found)
 
 	// Wait for expiration
 	time.Sleep(time.Second)
 
 	// Key should not exist after expiration
-	_, found = cache.Load(t.Context(), "key")
+	_, found, err = cache.Load(t.Context(), "key")
+	assert.NoError(t, err)
 	assert.False(t, found)
 }
 
@@ -84,15 +90,18 @@ func TestKVCache_Delete(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Key should exist before deletion
-	load, found := cache.Load(t.Context(), "key2")
+	load, found, err := cache.Load(t.Context(), "key2")
+	assert.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, value, load)
 
 	// Delete the key
-	cache.Delete(t.Context(), "key2")
+	err = cache.Delete(t.Context(), "key2")
+	assert.NoError(t, err)
 
 	// Key should not exist after deletion
-	_, found = cache.Load(t.Context(), "key2")
+	_, found, err = cache.Load(t.Context(), "key2")
+	assert.NoError(t, err)
 	assert.False(t, found)
 }
 
@@ -112,7 +121,45 @@ func TestKVCache_PointerType(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Test loading
-	load, found := cache.Load(t.Context(), "key")
+	load, found, err := cache.Load(t.Context(), "key")
+	assert.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, value, load)
+}
+
+func TestKVCache_LoadInvalidJSON(t *testing.T) {
+	memory, err := kv.NewMemory("")
+	require.NoError(t, err)
+	cache := NewCache[testStruct](memory, "cache", time.Second)
+
+	require.NoError(t, memory.Child("cache").Put(t.Context(), "broken", "not-json", kv.TTLKeep))
+
+	_, found, err := cache.Load(t.Context(), "broken")
+	assert.Error(t, err)
+	assert.False(t, found)
+}
+
+func TestKVCache_LoadContextError(t *testing.T) {
+	memory, err := kv.NewMemory("")
+	require.NoError(t, err)
+	cache := NewCache[testStruct](memory, "cache", time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, found, err := cache.Load(ctx, "key")
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.False(t, found)
+}
+
+func TestKVCache_DeleteContextError(t *testing.T) {
+	memory, err := kv.NewMemory("")
+	require.NoError(t, err)
+	cache := NewCache[testStruct](memory, "cache", time.Second)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = cache.Delete(ctx, "key")
+	assert.ErrorIs(t, err, context.Canceled)
 }

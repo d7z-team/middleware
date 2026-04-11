@@ -129,28 +129,44 @@ func NewRedis(ur *url.URL) (*redis.Client, error) {
 	// Additional options from query
 	query := ur.Query()
 	if sizeStr := query.Get("pool_size"); sizeStr != "" {
-		if size, err := strconv.Atoi(sizeStr); err == nil {
-			parsedOpts = append(parsedOpts, func(o *redis.Options) { o.PoolSize = size })
+		size, err := strconv.Atoi(sizeStr)
+		if err != nil || size <= 0 {
+			return nil, errors.New("invalid redis pool_size: " + sizeStr)
 		}
+		parsedOpts = append(parsedOpts, func(o *redis.Options) { o.PoolSize = size })
 	}
 	if idleStr := query.Get("min_idle"); idleStr != "" {
-		if idle, err := strconv.Atoi(idleStr); err == nil {
-			parsedOpts = append(parsedOpts, func(o *redis.Options) { o.MinIdleConns = idle })
+		idle, err := strconv.Atoi(idleStr)
+		if err != nil || idle < 0 {
+			return nil, errors.New("invalid redis min_idle: " + idleStr)
 		}
+		parsedOpts = append(parsedOpts, func(o *redis.Options) { o.MinIdleConns = idle })
 	}
 
 	// Timeouts from query
-	parseDuration := func(key string) time.Duration {
+	parseDuration := func(key string) (time.Duration, error) {
 		if val := query.Get(key); val != "" {
-			d, _ := time.ParseDuration(val)
-			return d
+			d, err := time.ParseDuration(val)
+			if err != nil {
+				return 0, errors.New("invalid redis " + key + ": " + val)
+			}
+			return d, nil
 		}
-		return 0
+		return 0, nil
 	}
 
-	dialTimeout := parseDuration("dial_timeout")
-	readTimeout := parseDuration("read_timeout")
-	writeTimeout := parseDuration("write_timeout")
+	dialTimeout, err := parseDuration("dial_timeout")
+	if err != nil {
+		return nil, err
+	}
+	readTimeout, err := parseDuration("read_timeout")
+	if err != nil {
+		return nil, err
+	}
+	writeTimeout, err := parseDuration("write_timeout")
+	if err != nil {
+		return nil, err
+	}
 	if dialTimeout > 0 || readTimeout > 0 || writeTimeout > 0 {
 		parsedOpts = append(parsedOpts, WithRedisTimeouts(dialTimeout, readTimeout, writeTimeout))
 	}
