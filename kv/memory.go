@@ -408,6 +408,9 @@ func (m *Memory) List(ctx context.Context, prefix string) ([]Pair, error) {
 	sort.Slice(finalRes, func(i, j int) bool {
 		return finalRes[i].Key < finalRes[j].Key
 	})
+	if err := ensureListSize(int64(len(finalRes))); err != nil {
+		return nil, err
+	}
 
 	return finalRes, nil
 }
@@ -504,6 +507,9 @@ func (m *Memory) ListCurrent(ctx context.Context, prefix string) ([]Pair, error)
 	sort.Slice(res, func(i, j int) bool {
 		return res[i].Key < res[j].Key
 	})
+	if err := ensureListSize(int64(len(res))); err != nil {
+		return nil, err
+	}
 	return res, nil
 }
 
@@ -597,18 +603,6 @@ func (m *Memory) ListCurrentCursor(ctx context.Context, opts *ListOptions) (*Lis
 		}(),
 		HasMore: end < len(all),
 	}, nil
-}
-
-func (m *Memory) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
-	all, _ := m.List(ctx, prefix)
-	s, e := listPageRange(len(all), pageIndex, pageSize)
-	return all[s:e], nil
-}
-
-func (m *Memory) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
-	all, _ := m.ListCurrent(ctx, prefix)
-	s, e := listPageRange(len(all), pageIndex, pageSize)
-	return all[s:e], nil
 }
 
 func (m *Memory) PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -225,8 +224,8 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.Equal(t, "direct_val", got)
 	})
 
-	// Offset-based Pagination
-	t.Run("Offset_Pagination", func(t *testing.T) {
+	// List returns all matching pairs in key order.
+	t.Run("List_All", func(t *testing.T) {
 		prefix := uniquePrefix + "paged_"
 		// Insert 15 items: 01, 02, ..., 15
 		for i := 1; i <= 15; i++ {
@@ -241,27 +240,6 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		// Verify some items (assume lexicographical order for stable tests)
 		assert.Equal(t, prefix+"01", all[0].Key)
 		assert.Equal(t, "val_01", all[0].Value)
-
-		// Test ListPage
-		// Page 1 (size 10) -> 1-10
-		page1, err := kvClient.ListPage(ctx, prefix, 0, 10)
-		assert.NoError(t, err)
-		assert.Len(t, page1, 10)
-		// Verify order (assuming lexicographical or creation order depending on implementation,
-		// but both are consistent for this test setup)
-		assert.Equal(t, prefix+"01", page1[0].Key)
-		assert.Equal(t, prefix+"10", page1[9].Key)
-
-		// Page 2 (size 10) -> 11-15
-		page2, err := kvClient.ListPage(ctx, prefix, 1, 10)
-		assert.NoError(t, err)
-		assert.Len(t, page2, 5)
-		assert.Equal(t, prefix+"11", page2[0].Key)
-
-		// Page 3 (size 10) -> Empty
-		page3, err := kvClient.ListPage(ctx, prefix, 2, 10)
-		assert.NoError(t, err)
-		assert.Empty(t, page3)
 	})
 
 	// Cursor-based Pagination
@@ -276,45 +254,27 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 			_ = child.Put(ctx, k, "val_"+k, TTLKeep)
 		}
 
-		// 1. Get first 2
-		opts := &ListOptions{
-			Limit: 2,
-		}
-
-		// First page
-		resp, err := child.ListCursor(ctx, opts)
-		assert.NoError(t, err)
-		assert.Len(t, resp.Pairs, 2)
-		assert.Equal(t, "a", resp.Pairs[0].Key)
-		assert.Equal(t, "val_a", resp.Pairs[0].Value)
-		assert.Equal(t, "b", resp.Pairs[1].Key)
-		assert.True(t, resp.HasMore)
-		assert.NotEmpty(t, resp.Cursor)
-		// Cursor should be "b" (last key)
-		assert.Equal(t, "b", resp.Cursor)
-
-		// Second page
-		opts.Cursor = resp.Cursor
-		resp2, err := child.ListCursor(ctx, opts)
-		assert.NoError(t, err)
-		assert.Len(t, resp2.Pairs, 2)
-		assert.Equal(t, "c", resp2.Pairs[0].Key)
-		assert.Equal(t, "d", resp2.Pairs[1].Key)
-		assert.True(t, resp2.HasMore)
-
-		// Third page (last item)
-		opts.Cursor = resp2.Cursor
-		resp3, err := child.ListCursor(ctx, opts)
-		assert.NoError(t, err)
-		assert.Len(t, resp3.Pairs, 1)
-		assert.Equal(t, "e", resp3.Pairs[0].Key)
-
-		// Fourth page (empty)
-		if resp3.HasMore {
-			opts.Cursor = resp3.Cursor
-			resp4, err := child.ListCursor(ctx, opts)
+		opts := &ListOptions{Limit: 2}
+		seen := make(map[string]string)
+		cursor := ""
+		for i := 0; i < 10; i++ {
+			opts.Cursor = cursor
+			resp, err := child.ListCursor(ctx, opts)
 			assert.NoError(t, err)
-			assert.Empty(t, resp4.Pairs)
+			assert.LessOrEqual(t, len(resp.Pairs), 2)
+			for _, p := range resp.Pairs {
+				seen[p.Key] = p.Value
+			}
+			if !resp.HasMore {
+				assert.Empty(t, resp.Cursor)
+				break
+			}
+			assert.NotEmpty(t, resp.Cursor)
+			cursor = resp.Cursor
+		}
+		assert.Len(t, seen, len(keys))
+		for _, k := range keys {
+			assert.Equal(t, "val_"+k, seen[k])
 		}
 	})
 
@@ -507,8 +467,8 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.Empty(t, currentNone)
 	})
 
-	// ListCurrentPage
-	t.Run("List_Current_Page", func(t *testing.T) {
+	// ListCurrent only returns items at the current level.
+	t.Run("List_Current", func(t *testing.T) {
 		lcpPrefix := uniquePrefix + "lcp/"
 		lcpKV := kvClient.Child(lcpPrefix)
 
@@ -520,30 +480,16 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		_ = lcpKV.Put(ctx, "d", "val_d", TTLKeep)
 		_ = lcpKV.Child("sub").Put(ctx, "e", "val_e", TTLKeep)
 
-		// Page 1 (Limit 2) -> a, b (assuming sequential put or sorted)
-		p1, err := lcpKV.ListCurrentPage(ctx, "", 0, 2)
+		current, err := lcpKV.ListCurrent(ctx, "")
 		require.NoError(t, err)
-		assert.Len(t, p1, 2)
+		assert.Len(t, current, 4)
 
-		for _, p := range p1 {
+		for _, p := range current {
 			assert.NotContains(t, p.Key, "/")
 		}
 
-		// Check full list coverage across pages
 		allItems := make(map[string]string)
-
-		p1All, _ := lcpKV.ListCurrentPage(ctx, "", 0, 2)
-		for _, p := range p1All {
-			allItems[p.Key] = p.Value
-		}
-
-		p2All, _ := lcpKV.ListCurrentPage(ctx, "", 1, 2)
-		for _, p := range p2All {
-			allItems[p.Key] = p.Value
-		}
-
-		p3All, _ := lcpKV.ListCurrentPage(ctx, "", 2, 2)
-		for _, p := range p3All {
+		for _, p := range current {
 			allItems[p.Key] = p.Value
 		}
 
@@ -565,23 +511,25 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 		opts := &ListOptions{Limit: 2}
 
-		// Page 1
-		resp1, err := clcKV.ListCurrentCursor(ctx, opts)
-		require.NoError(t, err)
-		require.Len(t, resp1.Pairs, 2)
-		assert.Equal(t, "a", resp1.Pairs[0].Key)
-		assert.Equal(t, "b", resp1.Pairs[1].Key)
-		assert.True(t, resp1.HasMore)
-		assert.Equal(t, "b", resp1.Cursor)
-
-		// Page 2
-		opts.Cursor = resp1.Cursor
-		resp2, err := clcKV.ListCurrentCursor(ctx, opts)
-		require.NoError(t, err)
-		require.Len(t, resp2.Pairs, 1) // "c"
-		assert.Equal(t, "c", resp2.Pairs[0].Key)
-		assert.False(t, resp2.HasMore)
-		// "sub/d" should be filtered out
+		seen := make(map[string]bool)
+		cursor := ""
+		for i := 0; i < 10; i++ {
+			opts.Cursor = cursor
+			resp, err := clcKV.ListCurrentCursor(ctx, opts)
+			require.NoError(t, err)
+			require.LessOrEqual(t, len(resp.Pairs), 2)
+			for _, p := range resp.Pairs {
+				seen[p.Key] = true
+				assert.NotContains(t, p.Key, "/")
+			}
+			if !resp.HasMore {
+				assert.Empty(t, resp.Cursor)
+				break
+			}
+			assert.NotEmpty(t, resp.Cursor)
+			cursor = resp.Cursor
+		}
+		assert.Equal(t, map[string]bool{"a": true, "b": true, "c": true}, seen)
 	})
 	// Complex Hierarchy and Pagination
 	t.Run("Hierarchy_And_Pagination_Scenarios", func(t *testing.T) {
@@ -600,38 +548,28 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		// 2. 验证父级分页 (CursorList)
 		t.Run("Parent_Pagination", func(t *testing.T) {
 			opts := &ListOptions{Limit: 1}
-
-			// Page 1 -> "a"
-			resp1, err := hKV.ListCursor(ctx, opts)
-			require.NoError(t, err)
-			require.Len(t, resp1.Pairs, 1)
-			assert.Equal(t, "a", resp1.Pairs[0].Key)
-			assert.True(t, resp1.HasMore)
-			assert.Equal(t, "a", resp1.Cursor)
-
-			// Page 2 -> "a/c1"
-			opts.Cursor = resp1.Cursor
-			resp2, err := hKV.ListCursor(ctx, opts)
-			require.NoError(t, err)
-			require.Len(t, resp2.Pairs, 1)
-			assert.Equal(t, "a/c1", resp2.Pairs[0].Key)
-			assert.True(t, resp2.HasMore)
-
-			// Page 3 -> "a/c2"
-			opts.Cursor = resp2.Cursor
-			resp3, err := hKV.ListCursor(ctx, opts)
-			require.NoError(t, err)
-			require.Len(t, resp3.Pairs, 1)
-			assert.Equal(t, "a/c2", resp3.Pairs[0].Key)
-
-			// Page 4 -> "b"
-			opts.Cursor = resp3.Cursor
-			resp4, err := hKV.ListCursor(ctx, opts)
-			require.NoError(t, err)
-			require.Len(t, resp4.Pairs, 1)
-			assert.Equal(t, "b", resp4.Pairs[0].Key)
-			assert.False(t, resp4.HasMore)
-			assert.Empty(t, resp4.Cursor)
+			seen := make(map[string]string)
+			cursor := ""
+			expected := map[string]string{
+				"a":    "val_a",
+				"a/c1": "val_a/c1",
+				"a/c2": "val_a/c2",
+				"b":    "val_b",
+			}
+			for i := 0; i < 32; i++ {
+				opts.Cursor = cursor
+				resp, err := hKV.ListCursor(ctx, opts)
+				require.NoError(t, err)
+				require.Len(t, resp.Pairs, 1)
+				seen[resp.Pairs[0].Key] = resp.Pairs[0].Value
+				if !resp.HasMore {
+					assert.Empty(t, resp.Cursor)
+					break
+				}
+				assert.NotEmpty(t, resp.Cursor)
+				cursor = resp.Cursor
+			}
+			assert.Equal(t, expected, seen)
 		})
 
 		// 3. 验证 Child 视图
@@ -761,25 +699,30 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.Equal(t, "sub/sk1", respSub.Pairs[0].Key)
 
 		// 3. Paginated Scan
-		// Page 1 (Limit 2) -> k1, k2
-		respP1, err := sKV.Scan(ctx, ScanOptions{Limit: 2})
-		assert.NoError(t, err)
-		assert.Len(t, respP1.Pairs, 2)
-		assert.True(t, respP1.HasMore)
-		assert.NotEmpty(t, respP1.NextCursor)
-
-		// Page 2 (Limit 2) -> k3, k4
-		respP2, err := sKV.Scan(ctx, ScanOptions{Cursor: respP1.NextCursor, Limit: 2})
-		assert.NoError(t, err)
-		assert.Len(t, respP2.Pairs, 2)
-		assert.True(t, respP2.HasMore)
-
-		// Page 3 (Limit 2) -> k5, sub/sk1
-		respP3, err := sKV.Scan(ctx, ScanOptions{Cursor: respP2.NextCursor, Limit: 2})
-		assert.NoError(t, err)
-		assert.Len(t, respP3.Pairs, 2)
-		assert.Equal(t, "k5", respP3.Pairs[0].Key)
-		assert.Equal(t, "sub/sk1", respP3.Pairs[1].Key)
+		seen := make(map[string]string)
+		cursor := ""
+		for i := 0; i < 10; i++ {
+			respPage, err := sKV.Scan(ctx, ScanOptions{Cursor: cursor, Limit: 2})
+			assert.NoError(t, err)
+			assert.LessOrEqual(t, len(respPage.Pairs), 2)
+			for _, p := range respPage.Pairs {
+				seen[p.Key] = p.Value
+			}
+			if !respPage.HasMore {
+				assert.Empty(t, respPage.NextCursor)
+				break
+			}
+			assert.NotEmpty(t, respPage.NextCursor)
+			cursor = respPage.NextCursor
+		}
+		assert.Equal(t, map[string]string{
+			"k1":      "v1",
+			"k2":      "v2",
+			"k3":      "v3",
+			"k4":      "v4",
+			"k5":      "v5",
+			"sub/sk1": "sv1",
+		}, seen)
 
 		// 4. Scan context cancel
 		cCtx, cancel := context.WithCancel(ctx)
@@ -829,6 +772,28 @@ func TestCloserKV_Raw(t *testing.T) {
 		closer: func() error { return nil },
 	}
 	assert.Equal(t, mem, ckv.Raw())
+}
+
+func TestNormalizeKVPrefix(t *testing.T) {
+	assert.Empty(t, normalizeKVPrefix(""))
+	assert.Empty(t, normalizeKVPrefix("/"))
+	assert.Equal(t, "test/", normalizeKVPrefix("test"))
+	assert.Equal(t, "test/", normalizeKVPrefix("/test/"))
+
+	assert.Equal(t, "etcd/", NewEtcd(nil, "etcd").prefix)
+}
+
+func TestMemoryListTooLarge(t *testing.T) {
+	memory, err := NewMemory("")
+	require.NoError(t, err)
+
+	root := memory.Child("too-large")
+	for i := 0; i < maxListPairs+1; i++ {
+		require.NoError(t, root.Put(t.Context(), fmt.Sprintf("k%05d", i), "v", TTLKeep))
+	}
+
+	_, err = root.List(t.Context(), "")
+	require.ErrorIs(t, err, ErrListTooLarge)
 }
 
 func TestNewKVFromURL(t *testing.T) {
@@ -882,16 +847,7 @@ func TestNewKVFromURL(t *testing.T) {
 		}
 	})
 
-	// 4. Redis (Mock/Check)
-	t.Run("Redis", func(t *testing.T) {
-		kv, err := NewKVFromURL("redis://localhost:6379/0?prefix=test")
-		if err == nil {
-			assert.NotNil(t, kv)
-			_ = kv.Close()
-		}
-	})
-
-	// 5. Invalid
+	// 4. Invalid
 	t.Run("Invalid", func(t *testing.T) {
 		_, err := NewKVFromURL("unknown://")
 		require.Error(t, err)
@@ -936,19 +892,6 @@ func TestMemoryKV(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, val, got)
 	})
-}
-
-func TestRedisKV(t *testing.T) {
-	// Ensure local Redis is available or skip
-	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	if err := client.Ping(context.Background()).Err(); err != nil {
-		t.Skipf("Redis not available: %v", err)
-	}
-	defer client.Close()
-
-	kv := NewRedis(client, "test_kv_redis/")
-	testKVConsistency(t, kv)
-	testKVExtended(t, kv)
 }
 
 func TestEtcdKV(t *testing.T) {

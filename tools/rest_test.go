@@ -43,11 +43,11 @@ func TestID2KV(t *testing.T) {
 	assert.True(t, ok)
 
 	// List
-	list, err := id2kv.List(t.Context(), 0, 10)
+	list, err := id2kv.List(t.Context(), &kv.ListOptions{Limit: 10})
 	assert.NoError(t, err)
-	assert.Len(t, list, 2)
-	assert.Equal(t, "1", list[0].ID)
-	assert.Equal(t, user1, list[0].Data)
+	assert.Len(t, list.Items, 2)
+	assert.Equal(t, "1", list.Items[0].ID)
+	assert.Equal(t, user1, list.Items[0].Data)
 
 	// Delete
 	ok, err = id2kv.Delete(t.Context(), "1")

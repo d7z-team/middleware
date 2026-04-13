@@ -16,11 +16,13 @@ type Etcd struct {
 	prefix string // key prefix
 }
 
+const etcdMaxTxnOps = 128
+
 // NewEtcd creates a new etcd KV instance.
 func NewEtcd(client *clientv3.Client, prefix string) *Etcd {
 	return &Etcd{
 		client: client,
-		prefix: strings.Trim(prefix, "/") + "/",
+		prefix: normalizeKVPrefix(prefix),
 	}
 }
 
@@ -73,9 +75,17 @@ func ttlToSeconds(ttl time.Duration) int64 {
 
 // List returns all key-value pairs matching the prefix.
 func (e *Etcd) List(ctx context.Context, prefix string) ([]Pair, error) {
+	count, err := e.countMatchingPrefix(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureListSize(count); err != nil {
+		return nil, err
+	}
+
 	res, err := e.Scan(ctx, ScanOptions{
 		Prefix: prefix,
-		Limit:  1000000,
+		Limit:  maxListPairs,
 	})
 	if err != nil {
 		return nil, err
@@ -85,65 +95,86 @@ func (e *Etcd) List(ctx context.Context, prefix string) ([]Pair, error) {
 
 // ListCurrent returns key-value pairs at the current level (excluding children).
 func (e *Etcd) ListCurrent(ctx context.Context, prefix string) ([]Pair, error) {
-	all, err := e.List(ctx, prefix)
-	if err != nil {
-		return nil, err
-	}
-	filtered := make([]Pair, 0)
-	for _, p := range all {
-		if isCurrentLevel(p.Key, prefix) {
-			filtered = append(filtered, p)
+	all := make([]Pair, 0)
+	cursor := ""
+	for {
+		resp, err := e.listCurrentCursorForPrefix(ctx, prefix, &ListOptions{
+			Limit:  1000,
+			Cursor: cursor,
+		})
+		if err != nil {
+			return nil, err
 		}
+		all = append(all, resp.Pairs...)
+		if err := ensureListSize(int64(len(all))); err != nil {
+			return nil, err
+		}
+		if !resp.HasMore {
+			break
+		}
+		cursor = resp.Cursor
 	}
-	return filtered, nil
-}
-
-// ListPage returns a page of key-value pairs matching the prefix.
-func (e *Etcd) ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
-	all, err := e.List(ctx, prefix)
-	if err != nil {
-		return nil, err
-	}
-	start, end := listPageRange(len(all), pageIndex, pageSize)
-	return all[start:end], nil
-}
-
-// ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
-func (e *Etcd) ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error) {
-	all, err := e.ListCurrent(ctx, prefix)
-	if err != nil {
-		return nil, err
-	}
-	start, end := listPageRange(len(all), pageIndex, pageSize)
-	return all[start:end], nil
+	return all, nil
 }
 
 // ListCurrentCursor implements cursor-based pagination for current level.
 func (e *Etcd) ListCurrentCursor(ctx context.Context, options *ListOptions) (*ListResponse, error) {
+	return e.listCurrentCursorForPrefix(ctx, "", options)
+}
+
+func (e *Etcd) listCurrentCursorForPrefix(ctx context.Context, prefix string, options *ListOptions) (*ListResponse, error) {
 	opts := normalizeListOptions(options)
-
-	all, err := e.ListCurrent(ctx, "")
-	if err != nil {
-		return nil, err
+	fullPrefix := e.prefix + prefix
+	rangeEnd := clientv3.GetPrefixRangeEnd(fullPrefix)
+	batchLimit := opts.Limit + 32
+	if batchLimit < 128 {
+		batchLimit = 128
 	}
 
-	startIndex := listCursorStartIndex(all, opts.Cursor)
-	endIndex := startIndex + int(opts.Limit)
-	if endIndex > len(all) {
-		endIndex = len(all)
+	startKey := fullPrefix
+	if opts.Cursor != "" {
+		startKey = e.prefix + opts.Cursor + "\x00"
 	}
 
-	resultPairs := all[startIndex:endIndex]
-	var nextCursor string
-	hasMore := endIndex < len(all)
-	if hasMore {
-		nextCursor = resultPairs[len(resultPairs)-1].Key
+	needed := int(opts.Limit) + 1
+	pairs := make([]Pair, 0, needed)
+	for len(pairs) < needed {
+		resp, err := e.client.Get(ctx, startKey,
+			clientv3.WithRange(rangeEnd),
+			clientv3.WithLimit(batchLimit),
+			clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("list current cursor failed: %w", err)
+		}
+		if len(resp.Kvs) == 0 {
+			return &ListResponse{Pairs: pairs, Cursor: "", HasMore: false}, nil
+		}
+
+		for _, kv := range resp.Kvs {
+			relKey := e.extractKey(string(kv.Key))
+			if isCurrentLevel(relKey, prefix) {
+				pairs = append(pairs, Pair{Key: relKey, Value: string(kv.Value)})
+				if len(pairs) == needed {
+					return &ListResponse{
+						Pairs:   pairs[:opts.Limit],
+						Cursor:  pairs[opts.Limit-1].Key,
+						HasMore: true,
+					}, nil
+				}
+			}
+			startKey = string(kv.Key) + "\x00"
+		}
+
+		if !resp.More {
+			break
+		}
 	}
 
 	return &ListResponse{
-		Pairs:   resultPairs,
-		Cursor:  nextCursor,
-		HasMore: hasMore,
+		Pairs:   pairs,
+		Cursor:  "",
+		HasMore: false,
 	}, nil
 }
 
@@ -369,6 +400,9 @@ func (e *Etcd) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) er
 	if invalidTTL(ttl) {
 		return ErrInvalidTTL
 	}
+	if len(pairs) == 0 {
+		return nil
+	}
 	if ttl == TTLKeep {
 		for _, p := range pairs {
 			if err := e.Put(ctx, p.Key, p.Value, ttl); err != nil {
@@ -385,60 +419,111 @@ func (e *Etcd) PutBatch(ctx context.Context, pairs []Pair, ttl time.Duration) er
 	}
 	leaseID = resp.ID
 
-	ops := make([]clientv3.Op, 0, len(pairs))
-	for _, p := range pairs {
+	ops := make([]clientv3.Op, 0, minInt(len(pairs), etcdMaxTxnOps))
+	for i, p := range pairs {
 		fk, err := e.buildKey(p.Key)
 		if err != nil {
 			_, _ = e.client.Revoke(context.Background(), leaseID)
 			return err
 		}
 		ops = append(ops, clientv3.OpPut(fk, p.Value, clientv3.WithLease(leaseID)))
+		if len(ops) == etcdMaxTxnOps || i == len(pairs)-1 {
+			_, err = e.client.Txn(ctx).Then(ops...).Commit()
+			if err != nil {
+				_, _ = e.client.Revoke(context.Background(), leaseID)
+				return err
+			}
+			ops = ops[:0]
+		}
 	}
-
-	_, err = e.client.Txn(ctx).Then(ops...).Commit()
-	if err != nil {
-		_, _ = e.client.Revoke(context.Background(), leaseID)
-	}
-	return err
+	return nil
 }
 
 // GetBatch retrieves values for multiple keys using a transaction.
 func (e *Etcd) GetBatch(ctx context.Context, keys []string) ([]string, error) {
-	ops := make([]clientv3.Op, 0, len(keys))
-	for _, k := range keys {
+	if len(keys) == 0 {
+		return []string{}, nil
+	}
+
+	fullKeys := make([]string, len(keys))
+	for i, k := range keys {
 		fk, err := e.buildKey(k)
 		if err != nil {
 			return nil, err
 		}
-		ops = append(ops, clientv3.OpGet(fk))
-	}
-
-	resp, err := e.client.Txn(ctx).Then(ops...).Commit()
-	if err != nil {
-		return nil, err
+		fullKeys[i] = fk
 	}
 
 	res := make([]string, len(keys))
-	for i, r := range resp.Responses {
-		getResp := r.GetResponseRange()
-		if getResp.Count == 0 {
-			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, keys[i])
+	for start := 0; start < len(fullKeys); start += etcdMaxTxnOps {
+		end := start + etcdMaxTxnOps
+		if end > len(fullKeys) {
+			end = len(fullKeys)
 		}
-		res[i] = string(getResp.Kvs[0].Value)
+
+		ops := make([]clientv3.Op, 0, end-start)
+		for _, fk := range fullKeys[start:end] {
+			ops = append(ops, clientv3.OpGet(fk))
+		}
+
+		resp, err := e.client.Txn(ctx).Then(ops...).Commit()
+		if err != nil {
+			return nil, err
+		}
+
+		for i, r := range resp.Responses {
+			getResp := r.GetResponseRange()
+			if getResp.Count == 0 {
+				return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, keys[start+i])
+			}
+			res[start+i] = string(getResp.Kvs[0].Value)
+		}
 	}
 	return res, nil
 }
 
 // DeleteBatch removes multiple keys using a transaction.
 func (e *Etcd) DeleteBatch(ctx context.Context, keys []string) error {
-	ops := make([]clientv3.Op, 0, len(keys))
-	for _, k := range keys {
-		fk, err := e.buildKey(k)
-		if err != nil {
+	for start := 0; start < len(keys); start += etcdMaxTxnOps {
+		end := start + etcdMaxTxnOps
+		if end > len(keys) {
+			end = len(keys)
+		}
+
+		ops := make([]clientv3.Op, 0, end-start)
+		for _, k := range keys[start:end] {
+			fk, err := e.buildKey(k)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, clientv3.OpDelete(fk))
+		}
+		if len(ops) == 0 {
+			continue
+		}
+		if _, err := e.client.Txn(ctx).Then(ops...).Commit(); err != nil {
 			return err
 		}
-		ops = append(ops, clientv3.OpDelete(fk))
 	}
-	_, err := e.client.Txn(ctx).Then(ops...).Commit()
-	return err
+	return nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (e *Etcd) countMatchingPrefix(ctx context.Context, prefix string) (int64, error) {
+	fullPrefix := e.prefix + prefix
+	rangeEnd := clientv3.GetPrefixRangeEnd(fullPrefix)
+	resp, err := e.client.Get(ctx, fullPrefix,
+		clientv3.WithRange(rangeEnd),
+		clientv3.WithCountOnly(),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("count list keys failed: %w", err)
+	}
+	return resp.Count, nil
 }

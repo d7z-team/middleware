@@ -16,6 +16,8 @@ import (
 // TTLKeep indicates that the TTL should not be modified.
 const TTLKeep = -1
 
+const maxListPairs = 10000
+
 // Pair represents a key-value pair.
 type Pair struct {
 	Key   string
@@ -42,18 +44,25 @@ type KV interface {
 	CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error)
 
 	// List returns all key-value pairs matching the prefix.
+	// This is a small-dataset convenience API and may scan the full range in memory.
 	List(ctx context.Context, prefix string) ([]Pair, error)
 	// ListCurrent returns key-value pairs at the current level (excluding children).
+	// This is a small-dataset convenience API and may scan the full range in memory.
 	ListCurrent(ctx context.Context, prefix string) ([]Pair, error)
-	// ListPage returns a page of key-value pairs matching the prefix.
-	ListPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error)
-	// ListCurrentPage returns a page of key-value pairs at the current level (excluding children).
-	ListCurrentPage(ctx context.Context, prefix string, pageIndex uint64, pageSize uint) ([]Pair, error)
 	// ListCursor returns a list of key-value pairs based on cursor and limit.
+	// Cursor is an opaque backend-specific token and should be treated as such.
+	// Redis uses SCAN-based pagination here, so item order is not guaranteed to be stable
+	// across pages, and the cursor must not be interpreted as the last returned key.
 	ListCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 	// ListCurrentCursor returns a list of key-value pairs at the current level based on cursor and limit.
+	// Cursor is an opaque backend-specific token and should be treated as such.
+	// Redis uses SCAN-based pagination here, so item order is not guaranteed to be stable
+	// across pages, and the cursor must not be interpreted as the last returned key.
 	ListCurrentCursor(ctx context.Context, opts *ListOptions) (*ListResponse, error)
 	// Scan performs a prefix scan with pagination support.
+	// Cursor is an opaque backend-specific token and should be treated as such.
+	// Redis uses SCAN-based pagination here, so item order is not guaranteed to be stable
+	// across pages, and the cursor must not be interpreted as the last returned key.
 	Scan(ctx context.Context, opts ScanOptions) (*ScanResponse, error)
 
 	// PutBatch stores multiple key-value pairs with the same TTL.
@@ -89,7 +98,9 @@ func (receiver closerKV) Raw() KV {
 }
 
 type ListOptions struct {
-	Limit  int64
+	Limit int64
+	// Cursor is an opaque token returned by a previous list call.
+	// For Redis-backed implementations this is a SCAN continuation token, not a business key.
 	Cursor string
 }
 
@@ -101,6 +112,8 @@ type ListResponse struct {
 
 type ScanOptions struct {
 	Prefix string
+	// Cursor is an opaque token returned by a previous scan call.
+	// For Redis-backed implementations this is a SCAN continuation token, not a business key.
 	Cursor string
 	Limit  int
 }
@@ -109,18 +122,6 @@ type ScanResponse struct {
 	Pairs      []Pair
 	NextCursor string
 	HasMore    bool
-}
-
-func listPageRange(totalLen int, pageIndex uint64, pageSize uint) (int, int) {
-	start := int(pageIndex * uint64(pageSize))
-	if start >= totalLen {
-		return totalLen, totalLen
-	}
-	end := start + int(pageSize)
-	if end > totalLen {
-		end = totalLen
-	}
-	return start, end
 }
 
 func listCursorStartIndex(pairs []Pair, cursor string) int {
@@ -144,8 +145,16 @@ func isCurrentLevel(relKey, prefix string) bool {
 	return rest != "" && !strings.Contains(rest, "/")
 }
 
+func normalizeKVPrefix(prefix string) string {
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" {
+		return ""
+	}
+	return prefix + "/"
+}
+
 // NewKVFromURL creates a new KV instance from a URL string.
-// Supported schemes: memory, storage, local, etcd, redis.
+// Supported schemes: memory, storage, local, etcd.
 func NewKVFromURL(s string) (CloserKV, error) {
 	parse, err := url.Parse(s)
 	if err != nil {
@@ -179,15 +188,6 @@ func NewKVFromURL(s string) (CloserKV, error) {
 			KV:     NewEtcd(etcd, parse.Query().Get("prefix")),
 			closer: etcd.Close,
 		}, nil
-	case "redis":
-		redis, err := connects.NewRedis(parse)
-		if err != nil {
-			return nil, err
-		}
-		return closerKV{
-			KV:     NewRedis(redis, parse.Query().Get("prefix")),
-			closer: redis.Close,
-		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported scheme: %s", parse.Scheme)
 	}
@@ -195,10 +195,11 @@ func NewKVFromURL(s string) (CloserKV, error) {
 
 // Common error definitions.
 var (
-	ErrKeyNotFound = errors.Join(os.ErrNotExist, errors.New("key not found"))
-	ErrCASFailed   = errors.New("compare and swap failed")
-	ErrInvalidKey  = errors.New("key must not contain '/'")
-	ErrInvalidTTL  = errors.New("ttl must be TTLKeep or greater than 0")
+	ErrKeyNotFound  = errors.Join(os.ErrNotExist, errors.New("key not found"))
+	ErrCASFailed    = errors.New("compare and swap failed")
+	ErrInvalidKey   = errors.New("key must not contain '/'")
+	ErrInvalidTTL   = errors.New("ttl must be TTLKeep or greater than 0")
+	ErrListTooLarge = fmt.Errorf("list exceeds maximum size of %d", maxListPairs)
 )
 
 func invalidTTL(ttl time.Duration) bool {
@@ -214,4 +215,11 @@ func normalizeListOptions(options *ListOptions) ListOptions {
 		}
 	}
 	return opts
+}
+
+func ensureListSize(count int64) error {
+	if count > maxListPairs {
+		return ErrListTooLarge
+	}
+	return nil
 }

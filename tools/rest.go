@@ -12,8 +12,14 @@ type IDValue[ID comparable, Data any] struct {
 	Data Data
 }
 
+type IDPage[ID comparable, Data any] struct {
+	Items   []IDValue[ID, Data]
+	Cursor  string
+	HasMore bool
+}
+
 type ID2KVI[ID comparable, Data any] interface {
-	List(ctx context.Context, page uint64, size uint) ([]IDValue[ID, Data], error)
+	List(ctx context.Context, options *kv.ListOptions) (*IDPage[ID, Data], error)
 	Get(ctx context.Context, id ID) (Data, error)
 	Put(ctx context.Context, id ID, value Data) error
 	PutIfNotExists(ctx context.Context, id ID, value Data) (bool, error)
@@ -30,13 +36,13 @@ func NewID2KV[Data any](kv kv.KV, prefix string) ID2KVI[string, Data] {
 	}
 }
 
-func (d *ID2KV[Data]) List(ctx context.Context, page uint64, size uint) ([]IDValue[string, Data], error) {
-	listPage, err := d.kv.ListPage(ctx, "", page, size)
+func (d *ID2KV[Data]) List(ctx context.Context, options *kv.ListOptions) (*IDPage[string, Data], error) {
+	resp, err := d.kv.ListCursor(ctx, options)
 	if err != nil {
 		return nil, err
 	}
-	ret := make([]IDValue[string, Data], 0, len(listPage))
-	for _, p := range listPage {
+	ret := make([]IDValue[string, Data], 0, len(resp.Pairs))
+	for _, p := range resp.Pairs {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -49,7 +55,11 @@ func (d *ID2KV[Data]) List(ctx context.Context, page uint64, size uint) ([]IDVal
 		}
 		ret = append(ret, IDValue[string, Data]{ID: p.Key, Data: value})
 	}
-	return ret, nil
+	return &IDPage[string, Data]{
+		Items:   ret,
+		Cursor:  resp.Cursor,
+		HasMore: resp.HasMore,
+	}, nil
 }
 
 func (d *ID2KV[Data]) Get(ctx context.Context, id string) (Data, error) {
