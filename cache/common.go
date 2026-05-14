@@ -1,3 +1,4 @@
+// Package cache provides in-memory and Redis-backed blob caching helpers.
 package cache
 
 import (
@@ -15,6 +16,24 @@ import (
 
 const TTLKeep = -1
 
+// Cache stores binary content with metadata and TTL support.
+//
+// Example:
+//
+//	cache, _ := NewCacheFromURL("memory://")
+//	defer cache.Close()
+//
+//	avatars := cache.Child("avatars")
+//	_ = avatars.Put(ctx, "user-1", map[string]string{
+//		"content-type": "text/plain",
+//	}, strings.NewReader("hello"), time.Minute)
+//
+//	content, _ := avatars.Get(ctx, "user-1")
+//	defer content.Close()
+//	body, _ := content.ReadToString()
+//	_ = body
+//
+//	_ = avatars.Delete(ctx, "user-1")
 type Cache interface {
 	Child(paths ...string) Cache
 	Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error
@@ -68,6 +87,16 @@ var (
 // Example:
 //
 //	cache, _ := NewCacheFromURL("memory://?max_capacity=1000&cleanup_interval=5m")
+//	defer cache.Close()
+//
+//	session := cache.Child("sessions")
+//	_ = session.Put(ctx, "token-1", map[string]string{
+//		"kind": "access-token",
+//	}, strings.NewReader("payload"), 15*time.Minute)
+//
+//	content, _ := session.Get(ctx, "token-1")
+//	defer content.Close()
+//	_, _ = content.ReadToString()
 func NewCacheFromURL(u string) (CloserCache, error) {
 	ur, err := url.Parse(u)
 	if err != nil {

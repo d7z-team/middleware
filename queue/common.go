@@ -1,3 +1,4 @@
+// Package queue provides namespaced at-least-once queue backends.
 package queue
 
 import (
@@ -16,38 +17,103 @@ import (
 type MessageID = string
 
 // Producer publishes messages into a queue namespace.
+//
+// Example:
+//
+//	ns, _ := NewQueueFromURL("memory://")
+//	defer ns.Close()
+//
+//	producer := ns.Child("billing").Producer()
+//	id, _ := producer.Publish(ctx, "jobs", "charge-user-1", &PublishOptions{
+//		Delay:         time.Second,
+//		MaxDeliveries: 5,
+//	})
+//	_ = id
 type Producer interface {
+	// Publish enqueues one message under the given topic and returns its message ID.
 	Publish(ctx context.Context, topic, body string, opts *PublishOptions) (MessageID, error)
+	// PublishBatch enqueues multiple messages under the same topic in one call.
 	PublishBatch(ctx context.Context, topic string, messages []PublishRequest) ([]MessageID, error)
 }
 
 // Consumer claims visible messages from a queue namespace.
+//
+// Example:
+//
+//	ns, _ := NewQueueFromURL("memory://")
+//	defer ns.Close()
+//
+//	consumer := ns.Child("billing").Consumer()
+//	msg, _ := consumer.Consume(ctx, "jobs", nil)
+//	if msg != nil {
+//		_ = msg.Touch(ctx, time.Minute)
+//		_ = msg.Ack(ctx)
+//	}
 type Consumer interface {
+	// Consume claims the next visible message for the topic and returns a claimed capability.
 	Consume(ctx context.Context, topic string, opts *ConsumeOptions) (*ClaimedMessage, error)
 }
 
 // Admin exposes queue inspection and management operations.
+//
+// Example:
+//
+//	ns, _ := NewQueueFromURL("memory://")
+//	defer ns.Close()
+//
+//	admin := ns.Child("billing").Admin()
+//	state, _ := admin.Get(ctx, "jobs", id)
+//	stats, _ := admin.Count(ctx, "jobs")
+//	_ = state.Status
+//	_ = stats.Total
 type Admin interface {
+	// Get returns the persisted state for the specified message ID.
 	Get(ctx context.Context, topic string, messageID MessageID) (*MessageState, error)
+	// Peek returns up to limit currently queued messages without claiming them.
 	Peek(ctx context.Context, topic string, limit int) ([]MessageState, error)
+	// Count returns aggregate queue counters for the topic.
 	Count(ctx context.Context, topic string) (*Stats, error)
 
+	// GetDead returns one dead-letter message by ID.
 	GetDead(ctx context.Context, topic string, messageID MessageID) (*DeadMessage, error)
+	// ListDead returns a paginated list of dead-letter messages for the topic.
 	ListDead(ctx context.Context, topic string, opts *ListOptions) (*DeadListResult, error)
+	// CountDead returns the number of dead-letter messages for the topic.
 	CountDead(ctx context.Context, topic string) (int64, error)
+	// RequeueDead moves one dead-letter message back into the ready queue after an optional delay.
 	RequeueDead(ctx context.Context, topic string, messageID MessageID, delay time.Duration) error
+	// RequeueAllDead requeues up to limit dead-letter messages for the topic.
 	RequeueAllDead(ctx context.Context, topic string, limit int, delay time.Duration) (int, error)
+	// DeleteDead permanently removes one dead-letter message.
 	DeleteDead(ctx context.Context, topic string, messageID MessageID) error
 
+	// Cancel requests cancellation for the specified message.
 	Cancel(ctx context.Context, topic string, messageID MessageID) error
+	// Delete permanently removes a non-inflight message.
 	Delete(ctx context.Context, topic string, messageID MessageID) error
 }
 
 // Namespace provides scoped producer, consumer, and admin views.
+//
+// Example:
+//
+//	ns, _ := NewQueueFromURL("memory://")
+//	defer ns.Close()
+//
+//	child := ns.Child("team-a")
+//	_, _ = child.Producer().Publish(ctx, "jobs", "payload", nil)
+//	msg, _ := child.Consumer().Consume(ctx, "jobs", nil)
+//	if msg != nil {
+//		_ = msg.Ack(ctx)
+//	}
 type Namespace interface {
+	// Child returns a namespaced view rooted under the provided path segments.
 	Child(paths ...string) Namespace
+	// Producer returns the publishing view for this namespace.
 	Producer() Producer
+	// Consumer returns the consuming view for this namespace.
 	Consumer() Consumer
+	// Admin returns the inspection and management view for this namespace.
 	Admin() Admin
 }
 
@@ -96,6 +162,19 @@ const (
 )
 
 // ClaimedMessage is the only public capability that can ack or retry an inflight message.
+//
+// Example:
+//
+//	ns, _ := NewQueueFromURL("memory://")
+//	defer ns.Close()
+//
+//	_, _ = ns.Producer().Publish(ctx, "jobs", "payload", nil)
+//	msg, _ := ns.Consumer().Consume(ctx, "jobs", nil)
+//	if msg != nil {
+//		canceled, _ := msg.CancelRequested(ctx)
+//		_ = canceled
+//		_ = msg.Nack(ctx, time.Second)
+//	}
 type ClaimedMessage struct {
 	ID          MessageID
 	Body        string
@@ -194,6 +273,17 @@ func (m *ClaimedMessage) CancelRequested(ctx context.Context) (bool, error) {
 	return m.cancelRequested(ctx)
 }
 
+// NewQueueFromURL creates a queue namespace from a connection URL.
+//
+// Example:
+//
+//	ns, _ := NewQueueFromURL("etcd://127.0.0.1:2379?prefix=jobs")
+//	defer ns.Close()
+//
+//	tenant := ns.Child("tenant-a")
+//	id, _ := tenant.Producer().Publish(ctx, "emails", "welcome-user", nil)
+//	state, _ := tenant.Admin().Get(ctx, "emails", id)
+//	_ = state.Status
 func NewQueueFromURL(s string) (CloserNamespace, error) {
 	parse, err := url.Parse(s)
 	if err != nil {

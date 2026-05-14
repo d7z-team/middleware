@@ -1,3 +1,4 @@
+// Package kv provides hierarchical key-value storage backends with TTL and scan support.
 package kv
 
 import (
@@ -25,6 +26,27 @@ type Pair struct {
 }
 
 // KV defines the basic key-value storage interface.
+//
+// Example:
+//
+//	kv, _ := NewKVFromURL("memory://")
+//	defer kv.Close()
+//
+//	users := kv.Child("users")
+//	_ = users.Put(ctx, "alice", "admin", time.Hour)
+//	_ = users.PutBatch(ctx, []Pair{
+//		{Key: "bob", Value: "reader"},
+//		{Key: "carol", Value: "writer"},
+//	}, time.Hour)
+//
+//	value, _ := users.Get(ctx, "alice")
+//	_ = value
+//
+//	page, _ := users.Scan(ctx, ScanOptions{Prefix: "", Limit: 100})
+//	_ = page.Pairs
+//
+//	_, _ = users.CompareAndSwap(ctx, "alice", "admin", "owner")
+//	_, _ = users.Delete(ctx, "bob")
 type KV interface {
 	// Child creates a child KV with the given path segments appended to the current prefix.
 	Child(paths ...string) KV
@@ -155,6 +177,16 @@ func normalizeKVPrefix(prefix string) string {
 
 // NewKVFromURL creates a new KV instance from a URL string.
 // Supported schemes: memory, storage, local, etcd.
+//
+// Example:
+//
+//	kv, _ := NewKVFromURL("etcd://127.0.0.1:2379?prefix=app")
+//	defer kv.Close()
+//
+//	cfg := kv.Child("config")
+//	_ = cfg.Put(ctx, "theme", "light", TTLKeep)
+//	current, _ := cfg.Get(ctx, "theme")
+//	_ = current
 func NewKVFromURL(s string) (CloserKV, error) {
 	parse, err := url.Parse(s)
 	if err != nil {
