@@ -9,31 +9,47 @@ import (
 type MemorySubscriber struct {
 	mu       *sync.RWMutex
 	prefix   string
-	channels map[string][]chan string
+	channels map[string][]*memorySubscription
 	parent   *MemorySubscriber
 
-	localChannels []struct {
-		key string
-		ch  chan string
-	}
+	localSubs []*memorySubscription
+	children  []*MemorySubscriber
 
-	children    []*MemorySubscriber
 	localClosed bool
 }
 
-// NewMemorySubscriber creates an in-memory subscriber.
-//
-// Example:
-//
-//	sub := NewMemorySubscriber()
+type memorySubscription struct {
+	key    string
+	events chan Event
+	errors chan error
+	cancel context.CancelFunc
+
+	owner *MemorySubscriber
+	once  sync.Once
+}
+
+func (s *memorySubscription) Events() <-chan Event { return s.events }
+
+func (s *memorySubscription) Errors() <-chan error { return s.errors }
+
+func (s *memorySubscription) Close() error {
+	if s == nil || s.owner == nil {
+		return nil
+	}
+	s.once.Do(func() {
+		s.cancel()
+		s.owner.mu.Lock()
+		defer s.owner.mu.Unlock()
+		s.owner.removeSubscriptionLocked(s.key, s)
+	})
+	return nil
+}
+
 func NewMemorySubscriber() *MemorySubscriber {
 	return &MemorySubscriber{
-		channels: make(map[string][]chan string),
-		mu:       &sync.RWMutex{},
-		localChannels: make([]struct {
-			key string
-			ch  chan string
-		}, 0),
+		channels:  make(map[string][]*memorySubscription),
+		mu:        &sync.RWMutex{},
+		localSubs: make([]*memorySubscription, 0),
 	}
 }
 
@@ -55,14 +71,11 @@ func (m *MemorySubscriber) Child(paths ...string) Subscriber {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	child := &MemorySubscriber{
-		prefix:   m.prefix + strings.Join(keys, "/") + "/",
-		mu:       m.mu,
-		channels: m.channels,
-		parent:   m,
-		localChannels: make([]struct {
-			key string
-			ch  chan string
-		}, 0),
+		prefix:    m.prefix + strings.Join(keys, "/") + "/",
+		mu:        m.mu,
+		channels:  m.channels,
+		parent:    m,
+		localSubs: make([]*memorySubscription, 0),
 	}
 	m.children = append(m.children, child)
 	return child
@@ -94,11 +107,13 @@ func (m *MemorySubscriber) closeLocked() {
 	for _, child := range m.children {
 		child.closeLocked()
 	}
-	for _, item := range m.localChannels {
-		m.removeChannelFromGlobal(item.key, item.ch)
-		close(item.ch)
+	for _, sub := range m.localSubs {
+		sub.once.Do(func() {
+			sub.cancel()
+			m.removeSubscriptionLocked(sub.key, sub)
+		})
 	}
-	m.localChannels = nil
+	m.localSubs = nil
 }
 
 func (m *MemorySubscriber) isClosedLocked() bool {
@@ -110,94 +125,80 @@ func (m *MemorySubscriber) isClosedLocked() bool {
 	return false
 }
 
-func (m *MemorySubscriber) removeChannelFromGlobal(key string, targetCh chan string) {
-	if channels, exists := m.channels[key]; exists {
-		for i, ch := range channels {
-			if ch == targetCh {
-				// Remove from slice
-				m.channels[key] = append(channels[:i], channels[i+1:]...)
-				break
-			}
-		}
-		if len(m.channels[key]) == 0 {
-			delete(m.channels, key)
+func (m *MemorySubscriber) removeSubscriptionLocked(key string, target *memorySubscription) {
+	subs := m.channels[key]
+	for i, sub := range subs {
+		if sub == target {
+			m.channels[key] = append(subs[:i], subs[i+1:]...)
+			break
 		}
 	}
+	if len(m.channels[key]) == 0 {
+		delete(m.channels, key)
+	}
+	for i, sub := range m.localSubs {
+		if sub == target {
+			m.localSubs = append(m.localSubs[:i], m.localSubs[i+1:]...)
+			break
+		}
+	}
+	close(target.events)
+	close(target.errors)
 }
 
 func (m *MemorySubscriber) Publish(ctx context.Context, key, data string) error {
 	key = m.buildFullKey(key)
 
 	m.mu.RLock()
-
 	if m.isClosedLocked() {
 		m.mu.RUnlock()
 		return nil
 	}
-
-	var channels []chan string
-	if existingChannels, exists := m.channels[key]; exists {
-		channels = make([]chan string, len(existingChannels))
-		copy(channels, existingChannels)
-	}
-
+	subs := append([]*memorySubscription(nil), m.channels[key]...)
 	m.mu.RUnlock()
 
-	for _, ch := range channels {
+	for _, sub := range subs {
+		event := Event{Key: key, Value: data}
 		select {
-		case ch <- data:
+		case sub.events <- event:
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 	}
-
 	return nil
 }
 
-func (m *MemorySubscriber) Subscribe(ctx context.Context, key string) (<-chan string, error) {
+func (m *MemorySubscriber) Subscribe(ctx context.Context, key string) (Subscription, error) {
 	key = m.buildFullKey(key)
-	ch := make(chan string, 1000)
+	events := make(chan Event, 1000)
+	errors := make(chan error, 16)
+
+	subCtx, cancel := context.WithCancel(ctx)
+	sub := &memorySubscription{
+		key:    key,
+		events: events,
+		errors: errors,
+		cancel: cancel,
+		owner:  m,
+	}
 
 	m.mu.Lock()
-
 	if m.isClosedLocked() {
 		m.mu.Unlock()
-		close(ch)
-		return ch, nil
+		close(events)
+		close(errors)
+		return sub, nil
 	}
-
-	m.channels[key] = append(m.channels[key], ch)
-
-	m.localChannels = append(m.localChannels, struct {
-		key string
-		ch  chan string
-	}{key, ch})
-
+	m.channels[key] = append(m.channels[key], sub)
+	m.localSubs = append(m.localSubs, sub)
 	m.mu.Unlock()
 
-	go m.monitorContext(ctx, key, ch)
-
-	return ch, nil
+	go m.monitorSubscription(subCtx, sub)
+	return sub, nil
 }
 
-func (m *MemorySubscriber) monitorContext(ctx context.Context, key string, ch chan string) {
+func (m *MemorySubscriber) monitorSubscription(ctx context.Context, sub *memorySubscription) {
 	<-ctx.Done()
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.isClosedLocked() {
-		return
-	}
-
-	m.removeChannelFromGlobal(key, ch)
-
-	for i, item := range m.localChannels {
-		if item.ch == ch {
-			m.localChannels = append(m.localChannels[:i], m.localChannels[i+1:]...)
-			close(ch)
-			break
-		}
-	}
+	_ = sub.Close()
 }

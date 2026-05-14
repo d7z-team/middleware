@@ -2,7 +2,6 @@ package queue
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,7 +35,7 @@ type memoryMessage struct {
 	VisibleAt       time.Time
 	Deadline        time.Time
 	DeadAt          time.Time
-	Receipt         string
+	ClaimTokenHash  string
 	CancelRequested bool
 	Sequence        uint64
 }
@@ -55,11 +54,7 @@ type MemoryQueue struct {
 	localClosed bool
 }
 
-var (
-	memoryMessageCounter uint64
-	memoryReceiptCounter uint64
-	memorySequence       uint64
-)
+var memorySequence uint64
 
 func NewMemoryQueue() *MemoryQueue {
 	return NewMemoryQueueWithConfig(Config{})
@@ -77,7 +72,7 @@ func NewMemoryQueueWithConfig(config Config) *MemoryQueue {
 	return queue
 }
 
-func (m *MemoryQueue) Child(paths ...string) Queue {
+func (m *MemoryQueue) Child(paths ...string) Namespace {
 	keys := normalizePaths(paths...)
 	if len(keys) == 0 {
 		return m
@@ -95,6 +90,12 @@ func (m *MemoryQueue) Child(paths ...string) Queue {
 	return child
 }
 
+func (m *MemoryQueue) Producer() Producer { return m }
+
+func (m *MemoryQueue) Consumer() Consumer { return m }
+
+func (m *MemoryQueue) Admin() Admin { return m }
+
 func (m *MemoryQueue) Close() error {
 	m.state.mu.Lock()
 	defer m.state.mu.Unlock()
@@ -103,7 +104,7 @@ func (m *MemoryQueue) Close() error {
 	return nil
 }
 
-func (m *MemoryQueue) Publish(ctx context.Context, topic, body string, opts *PublishOptions) (string, error) {
+func (m *MemoryQueue) Publish(ctx context.Context, topic, body string, opts *PublishOptions) (MessageID, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
@@ -123,12 +124,15 @@ func (m *MemoryQueue) Publish(ctx context.Context, topic, body string, opts *Pub
 	if err != nil {
 		return "", err
 	}
-	message := m.publishLocked(topicState, body, publishOpts, now)
+	message, err := m.publishLocked(topicState, body, publishOpts, now)
+	if err != nil {
+		return "", err
+	}
 	m.notifyLocked()
 	return message, nil
 }
 
-func (m *MemoryQueue) PublishBatch(ctx context.Context, topic string, messages []PublishRequest) ([]string, error) {
+func (m *MemoryQueue) PublishBatch(ctx context.Context, topic string, messages []PublishRequest) ([]MessageID, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -152,16 +156,19 @@ func (m *MemoryQueue) PublishBatch(ctx context.Context, topic string, messages [
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]string, 0, len(messages))
+	ids := make([]MessageID, 0, len(messages))
 	for i, request := range messages {
-		id := m.publishLocked(topicState, request.Body, normalized[i], now)
+		id, err := m.publishLocked(topicState, request.Body, normalized[i], now)
+		if err != nil {
+			return nil, err
+		}
 		ids = append(ids, id)
 	}
 	m.notifyLocked()
 	return ids, nil
 }
 
-func (m *MemoryQueue) Consume(ctx context.Context, topic string, opts *ConsumeOptions) (*Message, error) {
+func (m *MemoryQueue) Consume(ctx context.Context, topic string, opts *ConsumeOptions) (*ClaimedMessage, error) {
 	fullTopic, err := m.buildTopic(topic)
 	if err != nil {
 		return nil, err
@@ -184,8 +191,11 @@ func (m *MemoryQueue) Consume(ctx context.Context, topic string, opts *ConsumeOp
 
 		now := time.Now()
 		m.reapExpiredLocked(now)
-		msg := m.tryConsumeLocked(fullTopic, now, consumeOpts.AckTimeout)
+		msg, err := m.tryConsumeLocked(fullTopic, now, consumeOpts.AckTimeout)
 		m.state.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
 		if msg != nil {
 			return msg, nil
 		}
@@ -621,7 +631,7 @@ func (m *MemoryQueue) requeueLocked(topic *memoryTopic, message *memoryMessage, 
 		message.DeadAt = now
 		message.Deadline = time.Time{}
 		message.VisibleAt = time.Time{}
-		message.Receipt = ""
+		message.ClaimTokenHash = ""
 		return
 	}
 	if visibleAt.Before(now) {
@@ -646,10 +656,10 @@ func (m *MemoryQueue) enqueueLocked(topic *memoryTopic, message *memoryMessage) 
 	})
 }
 
-func (m *MemoryQueue) tryConsumeLocked(topicName string, now time.Time, ackTimeout time.Duration) *Message {
+func (m *MemoryQueue) tryConsumeLocked(topicName string, now time.Time, ackTimeout time.Duration) (*ClaimedMessage, error) {
 	topic := m.state.topics[topicName]
 	if topic == nil {
-		return nil
+		return nil, nil
 	}
 
 	for len(topic.ready) > 0 {
@@ -660,43 +670,45 @@ func (m *MemoryQueue) tryConsumeLocked(topicName string, now time.Time, ackTimeo
 			continue
 		}
 		if item.VisibleAt.After(now) {
-			return nil
+			return nil, nil
 		}
 
 		topic.ready = topic.ready[1:]
 		message.Status = StatusInflight
 		message.Attempt++
-		message.Receipt = nextReceiptID()
+		claimToken, err := nextClaimToken()
+		if err != nil {
+			return nil, err
+		}
+		message.ClaimTokenHash = claimTokenHash(claimToken)
 		message.Deadline = now.Add(ackTimeout)
 		message.CancelRequested = false
-		receipt := message.Receipt
 
 		return newClaimedMessage(
 			message.ID,
 			message.Body,
 			message.Attempt,
-			receipt,
 			message.PublishedAt,
 			message.VisibleAt,
 			message.Deadline,
 			func(ctx context.Context) error {
-				return m.ack(ctx, topicName, message.ID, receipt)
+				return m.ack(ctx, topicName, message.ID, claimToken)
 			},
 			func(ctx context.Context, delay time.Duration) error {
-				return m.nack(ctx, topicName, message.ID, receipt, delay)
+				return m.nack(ctx, topicName, message.ID, claimToken, delay)
 			},
 			func(ctx context.Context, ttl time.Duration) error {
-				return m.touch(ctx, topicName, message.ID, receipt, ttl)
+				return m.touch(ctx, topicName, message.ID, claimToken, ttl)
 			},
 			func(ctx context.Context) (bool, error) {
-				return m.cancelRequested(ctx, topicName, message.ID, receipt)
+				return m.cancelRequested(ctx, topicName, message.ID, claimToken)
 			},
-		)
+		), nil
 	}
-	return nil
+	return nil, nil
 }
 
-func (m *MemoryQueue) ack(ctx context.Context, topicName, messageID, receipt string) error {
+func (m *MemoryQueue) ack(ctx context.Context, topicName, messageID, claimToken string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -707,7 +719,7 @@ func (m *MemoryQueue) ack(ctx context.Context, topicName, messageID, receipt str
 		return ErrQueueClosed
 	}
 	topic, _ := m.lockTopicState(topicName, false)
-	message, err := m.requireInflightLocked(topic, messageID, receipt)
+	message, err := m.requireInflightLocked(topic, messageID, claimToken)
 	if err != nil {
 		return err
 	}
@@ -715,7 +727,7 @@ func (m *MemoryQueue) ack(ctx context.Context, topicName, messageID, receipt str
 	return nil
 }
 
-func (m *MemoryQueue) nack(ctx context.Context, topicName, messageID, receipt string, delay time.Duration) error {
+func (m *MemoryQueue) nack(ctx context.Context, topicName, messageID, claimToken string, delay time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -729,7 +741,7 @@ func (m *MemoryQueue) nack(ctx context.Context, topicName, messageID, receipt st
 		return ErrQueueClosed
 	}
 	topic, _ := m.lockTopicState(topicName, false)
-	message, err := m.requireInflightLocked(topic, messageID, receipt)
+	message, err := m.requireInflightLocked(topic, messageID, claimToken)
 	if err != nil {
 		return err
 	}
@@ -738,7 +750,7 @@ func (m *MemoryQueue) nack(ctx context.Context, topicName, messageID, receipt st
 	return nil
 }
 
-func (m *MemoryQueue) touch(ctx context.Context, topicName, messageID, receipt string, ttl time.Duration) error {
+func (m *MemoryQueue) touch(ctx context.Context, topicName, messageID, claimToken string, ttl time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -752,7 +764,7 @@ func (m *MemoryQueue) touch(ctx context.Context, topicName, messageID, receipt s
 		return ErrQueueClosed
 	}
 	topic, _ := m.lockTopicState(topicName, false)
-	message, err := m.requireInflightLocked(topic, messageID, receipt)
+	message, err := m.requireInflightLocked(topic, messageID, claimToken)
 	if err != nil {
 		return err
 	}
@@ -761,7 +773,7 @@ func (m *MemoryQueue) touch(ctx context.Context, topicName, messageID, receipt s
 	return nil
 }
 
-func (m *MemoryQueue) cancelRequested(ctx context.Context, topicName, messageID, receipt string) (bool, error) {
+func (m *MemoryQueue) cancelRequested(ctx context.Context, topicName, messageID, claimToken string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -772,20 +784,20 @@ func (m *MemoryQueue) cancelRequested(ctx context.Context, topicName, messageID,
 		return false, ErrQueueClosed
 	}
 	topic, _ := m.lockTopicState(topicName, false)
-	message, err := m.requireInflightLocked(topic, messageID, receipt)
+	message, err := m.requireInflightLocked(topic, messageID, claimToken)
 	if err != nil {
 		return false, err
 	}
 	return message.CancelRequested, nil
 }
 
-func (m *MemoryQueue) requireInflightLocked(topic *memoryTopic, messageID, receipt string) (*memoryMessage, error) {
+func (m *MemoryQueue) requireInflightLocked(topic *memoryTopic, messageID, claimToken string) (*memoryMessage, error) {
 	if topic == nil {
-		return nil, ErrReceiptMismatch
+		return nil, ErrClaimMismatch
 	}
 	message := topic.messages[messageID]
-	if message == nil || message.Status != StatusInflight || message.Receipt != receipt {
-		return nil, ErrReceiptMismatch
+	if message == nil || message.Status != StatusInflight || message.ClaimTokenHash != claimTokenHash(claimToken) {
+		return nil, ErrClaimMismatch
 	}
 	return message, nil
 }
@@ -870,18 +882,22 @@ func (m *MemoryQueue) requireMessageLocked(topic *memoryTopic, messageID string,
 	return message, nil
 }
 
-func (m *MemoryQueue) publishLocked(topic *memoryTopic, body string, opts PublishOptions, now time.Time) string {
+func (m *MemoryQueue) publishLocked(topic *memoryTopic, body string, opts PublishOptions, now time.Time) (MessageID, error) {
 	if opts.DedupKey != "" {
 		if existingID, ok := topic.dedup[opts.DedupKey]; ok {
 			if existing := topic.messages[existingID]; existing != nil && existing.Status != StatusDone && existing.Status != StatusCanceled {
-				return existing.ID
+				return existing.ID, nil
 			}
 			delete(topic.dedup, opts.DedupKey)
 		}
 	}
+	id, err := nextMessageID()
+	if err != nil {
+		return "", err
+	}
 
 	message := &memoryMessage{
-		ID:            nextMessageID(),
+		ID:            id,
 		Body:          body,
 		DedupKey:      opts.DedupKey,
 		MaxDeliveries: opts.MaxDeliveries,
@@ -894,13 +910,13 @@ func (m *MemoryQueue) publishLocked(topic *memoryTopic, body string, opts Publis
 		topic.dedup[message.DedupKey] = message.ID
 	}
 	m.enqueueLocked(topic, message)
-	return message.ID
+	return message.ID, nil
 }
 
 func (m *MemoryQueue) markReadyLocked(topic *memoryTopic, message *memoryMessage, visibleAt time.Time) {
 	message.DeadAt = time.Time{}
 	message.CancelRequested = false
-	message.Receipt = ""
+	message.ClaimTokenHash = ""
 	message.Deadline = time.Time{}
 	message.VisibleAt = visibleAt
 	m.enqueueLocked(topic, message)
@@ -911,7 +927,7 @@ func (m *MemoryQueue) markDoneLocked(topic *memoryTopic, message *memoryMessage)
 	message.Status = StatusDone
 	message.VisibleAt = time.Time{}
 	message.Deadline = time.Time{}
-	message.Receipt = ""
+	message.ClaimTokenHash = ""
 	message.CancelRequested = false
 }
 
@@ -921,7 +937,7 @@ func (m *MemoryQueue) markCanceledLocked(topic *memoryTopic, message *memoryMess
 	message.VisibleAt = time.Time{}
 	message.Deadline = time.Time{}
 	message.DeadAt = time.Time{}
-	message.Receipt = ""
+	message.ClaimTokenHash = ""
 	message.CancelRequested = true
 }
 
@@ -953,13 +969,11 @@ func (m *MemoryQueue) notifyLocked() {
 func stateFromMessage(message *memoryMessage) MessageState {
 	return MessageState{
 		ID:              message.ID,
-		Body:            message.Body,
 		Status:          message.Status,
 		Attempt:         message.Attempt,
 		PublishedAt:     message.PublishedAt,
 		VisibleAt:       message.VisibleAt,
 		Deadline:        message.Deadline,
-		Receipt:         message.Receipt,
 		CancelRequested: message.CancelRequested,
 		DeadAt:          message.DeadAt,
 	}
@@ -1018,14 +1032,6 @@ func countActiveLocked(topics map[string]*memoryTopic) int {
 		}
 	}
 	return total
-}
-
-func nextMessageID() string {
-	return fmt.Sprintf("msg-%d", atomic.AddUint64(&memoryMessageCounter, 1))
-}
-
-func nextReceiptID() string {
-	return fmt.Sprintf("rcpt-%d", atomic.AddUint64(&memoryReceiptCounter, 1))
 }
 
 func nextSequence() uint64 {

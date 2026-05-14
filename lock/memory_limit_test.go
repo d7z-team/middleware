@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMemoryLocker_MaxLocks(t *testing.T) {
@@ -13,25 +14,29 @@ func TestMemoryLocker_MaxLocks(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Acquire first lock
-	rel1 := locker.Lock(ctx, "id1")
+	rel1, err := locker.Lock(ctx, "id1")
+	require.NoError(t, err)
 	assert.NotNil(t, rel1)
 
 	// 2. Acquire second lock
-	rel2 := locker.Lock(ctx, "id2")
+	rel2, err := locker.Lock(ctx, "id2")
+	require.NoError(t, err)
 	assert.NotNil(t, rel2)
 
 	// 3. Try third lock (should fail)
-	rel3 := locker.TryLock(ctx, "id3")
+	rel3, err := locker.TryLock(ctx, "id3")
+	require.ErrorIs(t, err, ErrLockHeld)
 	assert.Nil(t, rel3, "Third lock should fail due to maxLocks limit")
 
 	// 4. Release one and try again
-	rel1()
-	rel4 := locker.TryLock(ctx, "id3")
+	require.NoError(t, rel1.Unlock())
+	rel4, err := locker.TryLock(ctx, "id3")
+	require.NoError(t, err)
 	assert.NotNil(t, rel4, "Should succeed after releasing one")
 
 	// 5. Cleanup
-	rel2()
-	rel4()
+	require.NoError(t, rel2.Unlock())
+	require.NoError(t, rel4.Unlock())
 }
 
 func TestMemoryLocker_ConfigFromURL(t *testing.T) {

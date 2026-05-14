@@ -9,16 +9,29 @@ import (
 	"gopkg.d7z.net/middleware/connects"
 )
 
+type Event struct {
+	Key      string
+	Value    string
+	Revision int64
+}
+
+type Subscription interface {
+	Events() <-chan Event
+	Errors() <-chan error
+	Close() error
+}
+
 type Subscriber interface {
 	Child(paths ...string) Subscriber
 	Publish(ctx context.Context, key, data string) error
-	Subscribe(ctx context.Context, key string) (<-chan string, error)
+	Subscribe(ctx context.Context, key string) (Subscription, error)
 }
 
 type CloserSubscriber interface {
 	Subscriber
 	io.Closer
 }
+
 type closerSubscriber struct {
 	Subscriber
 	closer func() error
@@ -31,11 +44,6 @@ func (c *closerSubscriber) Close() error {
 	return c.closer()
 }
 
-// NewSubscriberFromURL creates a subscriber from a connection URL.
-//
-// Example:
-//
-//	sub, _ := NewSubscriberFromURL("memory://")
 func NewSubscriberFromURL(u string) (CloserSubscriber, error) {
 	parse, err := url.Parse(u)
 	if err != nil {

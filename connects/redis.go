@@ -85,7 +85,7 @@ func ConnectRedis(addr string, opts ...RedisOption) (*redis.Client, error) {
 
 	client := redis.NewClient(options)
 	if err := client.Ping(context.Background()).Err(); err != nil {
-		return nil, errors.New("Redis connection failed: " + err.Error())
+		return nil, errors.New("Redis connection failed")
 	}
 
 	return client, nil

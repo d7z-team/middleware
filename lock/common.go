@@ -2,6 +2,7 @@ package lock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
@@ -10,17 +11,18 @@ import (
 	"gopkg.d7z.net/middleware/connects"
 )
 
-type Locker interface {
-	io.Closer
-	TryLock(ctx context.Context, id string) func()
-	Lock(ctx context.Context, id string) func()
+type Handle interface {
+	Unlock() error
 }
 
-// NewLocker creates a locker from a connection URL.
-//
-// Example:
-//
-//	locker, _ := NewLocker("memory://")
+type Locker interface {
+	io.Closer
+	TryLock(ctx context.Context, id string) (Handle, error)
+	Lock(ctx context.Context, id string) (Handle, error)
+}
+
+var ErrLockHeld = errors.New("lock already held")
+
 func NewLocker(s string) (Locker, error) {
 	ur, err := url.Parse(s)
 	if err != nil {

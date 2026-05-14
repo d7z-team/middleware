@@ -2,6 +2,7 @@ package lock
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -14,6 +15,29 @@ type EtcdLocker struct {
 	client *clientv3.Client
 	prefix string
 	closer func() error
+}
+
+type etcdLockHandle struct {
+	mutex   *concurrency.Mutex
+	session *concurrency.Session
+	once    sync.Once
+}
+
+func (h *etcdLockHandle) Unlock() error {
+	if h == nil || h.mutex == nil || h.session == nil {
+		return nil
+	}
+	var unlockErr error
+	h.once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		unlockErr = h.mutex.Unlock(ctx)
+		closeErr := h.session.Close()
+		if unlockErr == nil {
+			unlockErr = closeErr
+		}
+	})
+	return unlockErr
 }
 
 // NewEtcdLocker creates an etcd-backed locker.
@@ -50,56 +74,39 @@ func (e *EtcdLocker) getLockPath(id string) string {
 	return fmt.Sprintf("%s%s", e.prefix, id)
 }
 
-func (e *EtcdLocker) TryLock(ctx context.Context, id string) func() {
+func (e *EtcdLocker) TryLock(ctx context.Context, id string) (Handle, error) {
 	session, err := concurrency.NewSession(e.client,
 		concurrency.WithContext(ctx),
 		concurrency.WithTTL(60))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	mutex := concurrency.NewMutex(session, e.getLockPath(id))
 
 	if err := mutex.TryLock(ctx); err != nil {
 		_ = session.Close()
-		return nil
+		if errors.Is(err, concurrency.ErrLocked) {
+			return nil, ErrLockHeld
+		}
+		return nil, err
 	}
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			_ = mutex.Unlock(cleanupCtx)
-			_ = session.Close()
-		})
-	}
+	return &etcdLockHandle{mutex: mutex, session: session}, nil
 }
 
-func (e *EtcdLocker) Lock(ctx context.Context, id string) func() {
+func (e *EtcdLocker) Lock(ctx context.Context, id string) (Handle, error) {
 	session, err := concurrency.NewSession(e.client,
 		concurrency.WithContext(ctx),
 		concurrency.WithTTL(60))
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	mutex := concurrency.NewMutex(session, e.getLockPath(id))
 
 	if err := mutex.Lock(ctx); err != nil {
 		_ = session.Close()
-		return nil
+		return nil, err
 	}
-
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			_ = mutex.Unlock(cleanupCtx)
-			_ = session.Close()
-		})
-	}
+	return &etcdLockHandle{mutex: mutex, session: session}, nil
 }

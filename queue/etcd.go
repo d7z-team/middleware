@@ -31,6 +31,7 @@ type EtcdQueue struct {
 	config Config
 	mu     sync.RWMutex
 	closed bool
+	parent *EtcdQueue
 }
 
 type etcdStoredMessage struct {
@@ -44,7 +45,7 @@ type etcdStoredMessage struct {
 	VisibleAt       time.Time     `json:"visible_at"`
 	Deadline        time.Time     `json:"deadline"`
 	DeadAt          time.Time     `json:"dead_at"`
-	Receipt         string        `json:"receipt,omitempty"`
+	ClaimTokenHash  string        `json:"claim_token_hash,omitempty"`
 	CancelRequested bool          `json:"cancel_requested"`
 	Sequence        uint64        `json:"sequence"`
 	ReadyKey        string        `json:"ready_key,omitempty"`
@@ -71,7 +72,7 @@ func newEtcdQueue(client *clientv3.Client, prefix string, closer func() error, c
 	}
 }
 
-func (e *EtcdQueue) Child(paths ...string) Queue {
+func (e *EtcdQueue) Child(paths ...string) Namespace {
 	keys := normalizePaths(paths...)
 	if len(keys) == 0 {
 		return e
@@ -84,9 +85,15 @@ func (e *EtcdQueue) Child(paths ...string) Queue {
 		client: e.client,
 		prefix: e.prefix + strings.Join(keys, "/") + "/",
 		config: e.config,
-		closed: e.closed,
+		parent: e,
 	}
 }
+
+func (e *EtcdQueue) Producer() Producer { return e }
+
+func (e *EtcdQueue) Consumer() Consumer { return e }
+
+func (e *EtcdQueue) Admin() Admin { return e }
 
 func (e *EtcdQueue) Close() error {
 	e.mu.Lock()
@@ -101,15 +108,19 @@ func (e *EtcdQueue) Close() error {
 	return e.closer()
 }
 
-func (e *EtcdQueue) Publish(ctx context.Context, topic, body string, opts *PublishOptions) (string, error) {
+func (e *EtcdQueue) Publish(ctx context.Context, topic, body string, opts *PublishOptions) (MessageID, error) {
 	fullTopic, publishOpts, err := e.preparePublish(ctx, topic, opts)
 	if err != nil {
 		return "", err
 	}
 
+	id, err := nextMessageID()
+	if err != nil {
+		return "", err
+	}
 	now := time.Now()
 	message := &etcdStoredMessage{
-		ID:            nextMessageID(),
+		ID:            id,
 		Body:          body,
 		DedupKey:      publishOpts.DedupKey,
 		MaxDeliveries: publishOpts.MaxDeliveries,
@@ -120,7 +131,7 @@ func (e *EtcdQueue) Publish(ctx context.Context, topic, body string, opts *Publi
 	return e.publishOne(ctx, fullTopic, message)
 }
 
-func (e *EtcdQueue) PublishBatch(ctx context.Context, topic string, requests []PublishRequest) ([]string, error) {
+func (e *EtcdQueue) PublishBatch(ctx context.Context, topic string, requests []PublishRequest) ([]MessageID, error) {
 	fullTopic, err := e.buildTopic(topic)
 	if err != nil {
 		return nil, err
@@ -133,7 +144,7 @@ func (e *EtcdQueue) PublishBatch(ctx context.Context, topic string, requests []P
 	}
 
 	now := time.Now()
-	ids := make([]string, 0, len(requests))
+	ids := make([]MessageID, 0, len(requests))
 	batchedOps := make([]clientv3.Op, 0, len(requests)*2)
 	batchedCmp := make([]clientv3.Cmp, 0, len(requests))
 	fallback := make([]*etcdStoredMessage, 0, len(requests))
@@ -144,8 +155,12 @@ func (e *EtcdQueue) PublishBatch(ctx context.Context, topic string, requests []P
 			return nil, err
 		}
 
+		id, err := nextMessageID()
+		if err != nil {
+			return nil, err
+		}
 		message := &etcdStoredMessage{
-			ID:            nextMessageID(),
+			ID:            id,
 			Body:          request.Body,
 			DedupKey:      opts.DedupKey,
 			MaxDeliveries: opts.MaxDeliveries,
@@ -194,7 +209,7 @@ func (e *EtcdQueue) PublishBatch(ctx context.Context, topic string, requests []P
 	return ids, nil
 }
 
-func (e *EtcdQueue) Consume(ctx context.Context, topic string, opts *ConsumeOptions) (*Message, error) {
+func (e *EtcdQueue) Consume(ctx context.Context, topic string, opts *ConsumeOptions) (*ClaimedMessage, error) {
 	fullTopic, err := e.buildTopic(topic)
 	if err != nil {
 		return nil, err
@@ -499,10 +514,13 @@ func (e *EtcdQueue) ensureOpen(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	if e.closed {
-		return ErrQueueClosed
+	for current := e; current != nil; current = current.parent {
+		current.mu.RLock()
+		closed := current.closed
+		current.mu.RUnlock()
+		if closed {
+			return ErrQueueClosed
+		}
 	}
 	return nil
 }
@@ -578,7 +596,7 @@ func (e *EtcdQueue) publishOne(ctx context.Context, topic string, msg *etcdStore
 	return msg.ID, nil
 }
 
-func (e *EtcdQueue) tryConsume(ctx context.Context, topic string, ackTimeout time.Duration, now time.Time) (*Message, time.Duration, int64, error) {
+func (e *EtcdQueue) tryConsume(ctx context.Context, topic string, ackTimeout time.Duration, now time.Time) (*ClaimedMessage, time.Duration, int64, error) {
 	resp, err := e.client.Get(
 		ctx,
 		e.readyPrefix(topic),
@@ -610,9 +628,13 @@ func (e *EtcdQueue) tryConsume(ctx context.Context, topic string, ackTimeout tim
 			continue
 		}
 
+		claimToken, err := nextClaimToken()
+		if err != nil {
+			return nil, 0, 0, err
+		}
 		msg.Attempt++
 		msg.Status = StatusInflight
-		msg.Receipt = nextReceiptID()
+		msg.ClaimTokenHash = claimTokenHash(claimToken)
 		msg.CancelRequested = false
 		msg.ReadyKey = ""
 		msg.InflightKey = e.inflightKey(topic, now.Add(ackTimeout), nextEtcdSequence(), msg.ID)
@@ -640,26 +662,24 @@ func (e *EtcdQueue) tryConsume(ctx context.Context, topic string, ackTimeout tim
 			continue
 		}
 
-		receipt := msg.Receipt
 		return newClaimedMessage(
 			msg.ID,
 			msg.Body,
 			msg.Attempt,
-			receipt,
 			msg.PublishedAt,
 			msg.VisibleAt,
 			msg.Deadline,
 			func(callCtx context.Context) error {
-				return e.ack(callCtx, topic, msg.ID, receipt)
+				return e.ack(callCtx, topic, msg.ID, claimToken)
 			},
 			func(callCtx context.Context, delay time.Duration) error {
-				return e.nack(callCtx, topic, msg.ID, receipt, delay)
+				return e.nack(callCtx, topic, msg.ID, claimToken, delay)
 			},
 			func(callCtx context.Context, ttl time.Duration) error {
-				return e.touch(callCtx, topic, msg.ID, receipt, ttl)
+				return e.touch(callCtx, topic, msg.ID, claimToken, ttl)
 			},
 			func(callCtx context.Context) (bool, error) {
-				return e.cancelRequested(callCtx, topic, msg.ID, receipt)
+				return e.cancelRequested(callCtx, topic, msg.ID, claimToken)
 			},
 		), 0, resp.Header.Revision, nil
 	}
@@ -723,7 +743,7 @@ func (e *EtcdQueue) reapExpired(ctx context.Context, topic string, now time.Time
 
 			err = e.updateMessage(ctx, topic, messageID, func(current *etcdStoredMessage) error {
 				if current.Status != StatusInflight || current.InflightKey != string(kv.Key) || now.Before(current.Deadline) {
-					return ErrReceiptMismatch
+					return ErrClaimMismatch
 				}
 				if current.MaxDeliveries > 0 && current.Attempt >= current.MaxDeliveries {
 					e.markDead(current, now, topic)
@@ -732,7 +752,7 @@ func (e *EtcdQueue) reapExpired(ctx context.Context, topic string, now time.Time
 				e.markReady(topic, current, now)
 				return nil
 			})
-			if err != nil && !errors.Is(err, ErrReceiptMismatch) && !errors.Is(err, ErrMessageNotFound) {
+			if err != nil && !errors.Is(err, ErrClaimMismatch) && !errors.Is(err, ErrMessageNotFound) {
 				return err
 			}
 			processed++
@@ -744,49 +764,49 @@ func (e *EtcdQueue) reapExpired(ctx context.Context, topic string, now time.Time
 	}
 }
 
-func (e *EtcdQueue) ack(ctx context.Context, topic, messageID, receipt string) error {
-	return e.updateInflight(ctx, topic, messageID, receipt, func(msg *etcdStoredMessage) error {
+func (e *EtcdQueue) ack(ctx context.Context, topic, messageID, claimToken string) error {
+	return e.updateInflight(ctx, topic, messageID, claimToken, func(msg *etcdStoredMessage) error {
 		e.markDone(msg)
 		return nil
 	})
 }
 
-func (e *EtcdQueue) nack(ctx context.Context, topic, messageID, receipt string, delay time.Duration) error {
+func (e *EtcdQueue) nack(ctx context.Context, topic, messageID, claimToken string, delay time.Duration) error {
 	if delay < 0 {
 		return ErrInvalidDelay
 	}
-	return e.updateInflight(ctx, topic, messageID, receipt, func(msg *etcdStoredMessage) error {
+	return e.updateInflight(ctx, topic, messageID, claimToken, func(msg *etcdStoredMessage) error {
 		e.markReady(topic, msg, time.Now().Add(delay))
 		return nil
 	})
 }
 
-func (e *EtcdQueue) touch(ctx context.Context, topic, messageID, receipt string, ttl time.Duration) error {
+func (e *EtcdQueue) touch(ctx context.Context, topic, messageID, claimToken string, ttl time.Duration) error {
 	if ttl <= 0 {
 		return ErrInvalidAckTimeout
 	}
-	return e.updateInflight(ctx, topic, messageID, receipt, func(msg *etcdStoredMessage) error {
+	return e.updateInflight(ctx, topic, messageID, claimToken, func(msg *etcdStoredMessage) error {
 		msg.Deadline = time.Now().Add(ttl)
 		msg.InflightKey = e.inflightKey(topic, msg.Deadline, nextEtcdSequence(), msg.ID)
 		return nil
 	})
 }
 
-func (e *EtcdQueue) cancelRequested(ctx context.Context, topic, messageID, receipt string) (bool, error) {
+func (e *EtcdQueue) cancelRequested(ctx context.Context, topic, messageID, claimToken string) (bool, error) {
 	msg, _, err := e.getMessage(ctx, topic, messageID)
 	if err != nil {
 		return false, err
 	}
-	if msg == nil || msg.Status != StatusInflight || msg.Receipt != receipt {
-		return false, ErrReceiptMismatch
+	if msg == nil || msg.Status != StatusInflight || msg.ClaimTokenHash != claimTokenHash(claimToken) {
+		return false, ErrClaimMismatch
 	}
 	return msg.CancelRequested, nil
 }
 
-func (e *EtcdQueue) updateInflight(ctx context.Context, topic, messageID, receipt string, mutate func(*etcdStoredMessage) error) error {
+func (e *EtcdQueue) updateInflight(ctx context.Context, topic, messageID, claimToken string, mutate func(*etcdStoredMessage) error) error {
 	return e.updateMessage(ctx, topic, messageID, func(msg *etcdStoredMessage) error {
-		if msg.Status != StatusInflight || msg.Receipt != receipt {
-			return ErrReceiptMismatch
+		if msg.Status != StatusInflight || msg.ClaimTokenHash != claimTokenHash(claimToken) {
+			return ErrClaimMismatch
 		}
 		return mutate(msg)
 	})
@@ -977,7 +997,7 @@ func (e *EtcdQueue) markReady(topic string, msg *etcdStoredMessage, visibleAt ti
 	msg.VisibleAt = visibleAt
 	msg.Deadline = time.Time{}
 	msg.DeadAt = time.Time{}
-	msg.Receipt = ""
+	msg.ClaimTokenHash = ""
 	msg.CancelRequested = false
 	msg.Sequence = nextEtcdSequence()
 	msg.ReadyKey = e.readyKey(topic, visibleAt, msg.Sequence, msg.ID)
@@ -990,7 +1010,7 @@ func (e *EtcdQueue) markDead(msg *etcdStoredMessage, deadAt time.Time, topic str
 	msg.DeadAt = deadAt
 	msg.Deadline = time.Time{}
 	msg.VisibleAt = time.Time{}
-	msg.Receipt = ""
+	msg.ClaimTokenHash = ""
 	msg.CancelRequested = false
 	msg.ReadyKey = ""
 	msg.InflightKey = ""
@@ -1002,7 +1022,7 @@ func (e *EtcdQueue) markDone(msg *etcdStoredMessage) {
 	msg.VisibleAt = time.Time{}
 	msg.Deadline = time.Time{}
 	msg.DeadAt = time.Time{}
-	msg.Receipt = ""
+	msg.ClaimTokenHash = ""
 	msg.CancelRequested = false
 	msg.ReadyKey = ""
 	msg.InflightKey = ""
@@ -1014,7 +1034,7 @@ func (e *EtcdQueue) markCanceled(msg *etcdStoredMessage) {
 	msg.VisibleAt = time.Time{}
 	msg.Deadline = time.Time{}
 	msg.DeadAt = time.Time{}
-	msg.Receipt = ""
+	msg.ClaimTokenHash = ""
 	msg.CancelRequested = true
 	msg.ReadyKey = ""
 	msg.InflightKey = ""
@@ -1102,13 +1122,11 @@ func parseInt(v string) (int64, error) {
 func stateFromEtcd(msg *etcdStoredMessage) MessageState {
 	return MessageState{
 		ID:              msg.ID,
-		Body:            msg.Body,
 		Status:          msg.Status,
 		Attempt:         msg.Attempt,
 		PublishedAt:     msg.PublishedAt,
 		VisibleAt:       msg.VisibleAt,
 		Deadline:        msg.Deadline,
-		Receipt:         msg.Receipt,
 		CancelRequested: msg.CancelRequested,
 		DeadAt:          msg.DeadAt,
 	}
@@ -1129,7 +1147,7 @@ func nextEtcdSequence() uint64 {
 	return atomic.AddUint64(&etcdSequence, 1)
 }
 
-func NewEtcdQueueFromURL(s string) (CloserQueue, error) {
+func NewEtcdQueueFromURL(s string) (CloserNamespace, error) {
 	parse, err := url.Parse(s)
 	if err != nil {
 		return nil, err

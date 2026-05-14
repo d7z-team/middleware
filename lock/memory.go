@@ -16,6 +16,24 @@ type lockEntry struct {
 	refCount int
 }
 
+type memoryLockHandle struct {
+	entry *lockEntry
+	id    string
+	once  sync.Once
+	owner *MemoryLocker
+}
+
+func (h *memoryLockHandle) Unlock() error {
+	if h == nil || h.entry == nil || h.owner == nil {
+		return nil
+	}
+	h.once.Do(func() {
+		<-h.entry.ch
+		h.owner.putEntry(h.id)
+	})
+	return nil
+}
+
 var entryPool = sync.Pool{
 	New: func() interface{} {
 		return &lockEntry{
@@ -122,52 +140,40 @@ func (l *MemoryLocker) putEntry(id string) {
 	}
 }
 
-func (l *MemoryLocker) TryLock(ctx context.Context, id string) func() {
-	if ctx.Err() != nil {
-		return nil
+func (l *MemoryLocker) TryLock(ctx context.Context, id string) (Handle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	entry := l.getEntry(id)
 	if entry == nil {
-		return nil
+		return nil, ErrLockHeld
 	}
 
 	select {
 	case entry.ch <- struct{}{}:
-		var once sync.Once
-		return func() {
-			once.Do(func() {
-				<-entry.ch
-				l.putEntry(id)
-			})
-		}
+		return &memoryLockHandle{entry: entry, id: id, owner: l}, nil
 	default:
 		l.putEntry(id)
-		return nil
+		return nil, ErrLockHeld
 	}
 }
 
-func (l *MemoryLocker) Lock(ctx context.Context, id string) func() {
-	if ctx.Err() != nil {
-		return nil
+func (l *MemoryLocker) Lock(ctx context.Context, id string) (Handle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	entry := l.getEntry(id)
 	if entry == nil {
-		return nil
+		return nil, ErrLockHeld
 	}
 
 	select {
 	case entry.ch <- struct{}{}:
-		var once sync.Once
-		return func() {
-			once.Do(func() {
-				<-entry.ch
-				l.putEntry(id)
-			})
-		}
+		return &memoryLockHandle{entry: entry, id: id, owner: l}, nil
 	case <-ctx.Done():
 		l.putEntry(id)
-		return nil
+		return nil, ctx.Err()
 	}
 }
