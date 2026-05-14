@@ -28,21 +28,11 @@ func NewEtcd(client *clientv3.Client, prefix string) *Etcd {
 
 // Child creates a child KV with appended path.
 func (e *Etcd) Child(paths ...string) KV {
-	if len(paths) == 0 {
+	newPrefix := childKVPrefix(e.prefix, paths...)
+	if newPrefix == e.prefix {
 		return e
 	}
-	keys := make([]string, 0, len(paths))
-	for _, path := range paths {
-		path = strings.Trim(path, "/")
-		if path == "" {
-			continue
-		}
-		keys = append(keys, path)
-	}
-	if len(keys) == 0 {
-		return e
-	}
-	return NewEtcd(e.client, e.prefix+strings.Join(keys, "/")+"/")
+	return NewEtcd(e.client, newPrefix)
 }
 
 // Count counts the number of keys matching the prefix.

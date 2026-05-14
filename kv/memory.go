@@ -99,19 +99,10 @@ func (m *Memory) putLocked(fullKey string, it item) {
 }
 
 func (m *Memory) Child(paths ...string) KV {
-	newPrefix := m.prefix
-	var newPrefixSb103 strings.Builder
-	for _, p := range paths {
-		p = strings.Trim(p, "/")
-		if p != "" {
-			newPrefixSb103.WriteString(p + "/")
-		}
-	}
-	newPrefix += newPrefixSb103.String()
 	return &Memory{
 		mu:     m.mu,
 		root:   m.root,
-		prefix: newPrefix,
+		prefix: childKVPrefix(m.prefix, paths...),
 		store:  "",
 	}
 }

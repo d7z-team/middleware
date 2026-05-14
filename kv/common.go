@@ -175,8 +175,26 @@ func normalizeKVPrefix(prefix string) string {
 	return prefix + "/"
 }
 
+func childKVPrefix(base string, paths ...string) string {
+	if len(paths) == 0 {
+		return base
+	}
+	keys := make([]string, 0, len(paths))
+	for _, path := range paths {
+		path = strings.Trim(path, "/")
+		if path == "" {
+			continue
+		}
+		keys = append(keys, path)
+	}
+	if len(keys) == 0 {
+		return base
+	}
+	return base + strings.Join(keys, "/") + "/"
+}
+
 // NewKVFromURL creates a new KV instance from a URL string.
-// Supported schemes: memory, storage, local, etcd.
+// Supported schemes: memory, storage, local, etcd, badger.
 //
 // Example:
 //
@@ -219,6 +237,15 @@ func NewKVFromURL(s string) (CloserKV, error) {
 		return closerKV{
 			KV:     NewEtcd(etcd, parse.Query().Get("prefix")),
 			closer: etcd.Close,
+		}, nil
+	case "badger":
+		badgerKV, err := NewBadger(parse.Path, parse.Query().Get("prefix"))
+		if err != nil {
+			return nil, err
+		}
+		return closerKV{
+			KV:     badgerKV,
+			closer: badgerKV.db.Close,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported scheme: %s", parse.Scheme)

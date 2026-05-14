@@ -847,7 +847,16 @@ func TestNewKVFromURL(t *testing.T) {
 		}
 	})
 
-	// 4. Invalid
+	// 4. Badger
+	t.Run("Badger", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "badger")
+		kv, err := NewKVFromURL("badger://" + path)
+		require.NoError(t, err)
+		require.NotNil(t, kv)
+		require.NoError(t, kv.Close())
+	})
+
+	// 5. Invalid
 	t.Run("Invalid", func(t *testing.T) {
 		_, err := NewKVFromURL("unknown://")
 		require.Error(t, err)
@@ -903,7 +912,26 @@ func TestEtcdKV(t *testing.T) {
 	}
 	defer etcdClient.Close()
 
+	probeCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err = etcdClient.Get(probeCtx, "kv_test_probe")
+	if err != nil {
+		t.Skipf("etcd not reachable from test sandbox: %v", err)
+	}
+
 	kv := NewEtcd(etcdClient, "test_kv_etcd/")
+	testKVConsistency(t, kv)
+	testKVExtended(t, kv)
+}
+
+func TestBadgerKV(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "badger")
+	kv, err := NewBadger(path, "")
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, kv.db.Close())
+	}()
+
 	testKVConsistency(t, kv)
 	testKVExtended(t, kv)
 }
@@ -922,6 +950,13 @@ func TestEtcdKV_LeaseCleanupOnFailure(t *testing.T) {
 		t.Skipf("Etcd not available: %v", err)
 	}
 	defer etcdClient.Close()
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err = etcdClient.Get(probeCtx, "kv_test_probe")
+	if err != nil {
+		t.Skipf("etcd not reachable from test sandbox: %v", err)
+	}
 
 	prefix := "test_kv_etcd_lease_cleanup_" + time.Now().Format("20060102150405.000") + "/"
 	kv := NewEtcd(etcdClient, prefix)
