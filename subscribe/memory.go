@@ -2,7 +2,6 @@ package subscribe
 
 import (
 	"context"
-	"strings"
 	"sync"
 )
 
@@ -20,17 +19,16 @@ type MemorySubscriber struct {
 
 type memorySubscription struct {
 	key    string
-	events chan Event
-	errors chan error
+	state  *subscriptionState
 	cancel context.CancelFunc
 
 	owner *MemorySubscriber
 	once  sync.Once
 }
 
-func (s *memorySubscription) Events() <-chan Event { return s.events }
+func (s *memorySubscription) Events() <-chan Event { return s.state.Events() }
 
-func (s *memorySubscription) Errors() <-chan error { return s.errors }
+func (s *memorySubscription) Errors() <-chan error { return s.state.Errors() }
 
 func (s *memorySubscription) Close() error {
 	if s == nil || s.owner == nil {
@@ -38,10 +36,11 @@ func (s *memorySubscription) Close() error {
 	}
 	s.once.Do(func() {
 		s.cancel()
-		s.owner.mu.Lock()
-		defer s.owner.mu.Unlock()
-		s.owner.removeSubscriptionLocked(s.key, s)
+		s.state.closeChannels()
 	})
+	s.owner.mu.Lock()
+	s.owner.removeSubscriptionLocked(s.key, s)
+	s.owner.mu.Unlock()
 	return nil
 }
 
@@ -54,24 +53,14 @@ func NewMemorySubscriber() *MemorySubscriber {
 }
 
 func (m *MemorySubscriber) Child(paths ...string) Subscriber {
-	if len(paths) == 0 {
-		return m
-	}
-	keys := make([]string, 0, len(paths))
-	for _, path := range paths {
-		path = strings.Trim(path, "/")
-		if path == "" {
-			continue
-		}
-		keys = append(keys, path)
-	}
-	if len(keys) == 0 {
+	childPrefix := subscriberChildPrefix(m.prefix, paths...)
+	if childPrefix == m.prefix {
 		return m
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	child := &MemorySubscriber{
-		prefix:    m.prefix + strings.Join(keys, "/") + "/",
+		prefix:    childPrefix,
 		mu:        m.mu,
 		channels:  m.channels,
 		parent:    m,
@@ -79,17 +68,6 @@ func (m *MemorySubscriber) Child(paths ...string) Subscriber {
 	}
 	m.children = append(m.children, child)
 	return child
-}
-
-func (m *MemorySubscriber) buildFullKey(key string) string {
-	key = strings.TrimPrefix(key, "/")
-	if m.prefix == "" {
-		return key
-	}
-	if strings.HasSuffix(m.prefix, "/") {
-		return m.prefix + key
-	}
-	return m.prefix + "/" + key
 }
 
 func (m *MemorySubscriber) Close() error {
@@ -107,13 +85,16 @@ func (m *MemorySubscriber) closeLocked() {
 	for _, child := range m.children {
 		child.closeLocked()
 	}
-	for _, sub := range m.localSubs {
+	subs := append([]*memorySubscription(nil), m.localSubs...)
+	m.localSubs = nil
+	for _, sub := range subs {
+		sub := sub
 		sub.once.Do(func() {
 			sub.cancel()
+			sub.state.closeChannels()
 			m.removeSubscriptionLocked(sub.key, sub)
 		})
 	}
-	m.localSubs = nil
 }
 
 func (m *MemorySubscriber) isClosedLocked() bool {
@@ -142,12 +123,10 @@ func (m *MemorySubscriber) removeSubscriptionLocked(key string, target *memorySu
 			break
 		}
 	}
-	close(target.events)
-	close(target.errors)
 }
 
 func (m *MemorySubscriber) Publish(ctx context.Context, key, data string) error {
-	key = m.buildFullKey(key)
+	key = buildSubscriberKey(m.prefix, key)
 
 	m.mu.RLock()
 	if m.isClosedLocked() {
@@ -157,28 +136,21 @@ func (m *MemorySubscriber) Publish(ctx context.Context, key, data string) error 
 	subs := append([]*memorySubscription(nil), m.channels[key]...)
 	m.mu.RUnlock()
 
+	event := Event{Key: key, Value: data}
 	for _, sub := range subs {
-		event := Event{Key: key, Value: data}
-		select {
-		case sub.events <- event:
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+		if err := sub.state.trySendEvent(ctx, event); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
 func (m *MemorySubscriber) Subscribe(ctx context.Context, key string) (Subscription, error) {
-	key = m.buildFullKey(key)
-	events := make(chan Event, 1000)
-	errors := make(chan error, 16)
-
+	key = buildSubscriberKey(m.prefix, key)
 	subCtx, cancel := context.WithCancel(ctx)
 	sub := &memorySubscription{
 		key:    key,
-		events: events,
-		errors: errors,
+		state:  newSubscriptionState(),
 		cancel: cancel,
 		owner:  m,
 	}
@@ -186,8 +158,8 @@ func (m *MemorySubscriber) Subscribe(ctx context.Context, key string) (Subscript
 	m.mu.Lock()
 	if m.isClosedLocked() {
 		m.mu.Unlock()
-		close(events)
-		close(errors)
+		sub.cancel()
+		sub.state.closeChannels()
 		return sub, nil
 	}
 	m.channels[key] = append(m.channels[key], sub)

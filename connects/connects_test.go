@@ -1,111 +1,75 @@
 package connects
 
 import (
-	"crypto/tls"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestNewEtcd(t *testing.T) {
-	// Test basic connection (might fail if no etcd)
-	u, _ := url.Parse("etcd://127.0.0.1:2379")
-	etcd, err := NewEtcd(u)
-	if err == nil {
-		defer etcd.Close()
-	} else {
-		t.Logf("Skipping Etcd connection test: %v", err)
-	}
+func TestLoadTLSConfigFromFiles(t *testing.T) {
+	cfg, err := loadTLSConfigFromFiles("", "", "", "")
+	require.NoError(t, err)
+	require.Nil(t, cfg)
 
-	// Test Incomplete TLS
-	uTLS, _ := url.Parse("etcd://127.0.0.1:2379?ca-file=/tmp/ca.pem")
-	_, errTLS := NewEtcd(uTLS)
-	assert.Error(t, errTLS)
-	assert.Contains(t, errTLS.Error(), "incomplete tls configuration")
+	_, err = loadTLSConfigFromFiles("", "/tmp/cert.pem", "", "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "incomplete tls configuration")
 
-	// Test With Options
-	// Since we can't inspect the client config easily without private access,
-	// we assume the functional options pattern is correct if compilation passes
-	// and no runtime panic occurs.
-	_, _ = ConnectEtcd([]string{"127.0.0.1:2379"},
-		WithEtcdDialTimeout(1*time.Second),
-		WithEtcdAuth("user", "pass"),
-	)
+	caFile := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(caFile, []byte("not-a-certificate"), 0o644))
+
+	_, err = loadTLSConfigFromFiles(caFile, "", "", "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to add ca certificate")
 }
 
-func TestNewRedis(t *testing.T) {
-	// Test basic connection
-	u, _ := url.Parse("redis://127.0.0.1:6379")
-	r, err := NewRedis(u)
-	if err == nil {
-		defer r.Close()
-		ping := r.Ping(t.Context())
-		assert.NoError(t, ping.Err())
-	} else {
-		t.Logf("Skipping Redis connection test: %v", err)
-	}
-
-	// Test invalid DB
-	uInvalidDB, _ := url.Parse("redis://127.0.0.1:6379/abc")
-	_, errDB := NewRedis(uInvalidDB)
-	assert.Error(t, errDB)
-
-	// Test Options
-	// We verify that passing options doesn't panic.
-	// In a real scenario, we might mock the redis client or check reflected values.
-	_, _ = ConnectRedis("127.0.0.1:6379",
-		WithRedisDB(1),
-		WithRedisPool(10, 2),
-		WithRedisTimeouts(time.Second, time.Second, time.Second),
-		WithRedisTLS(&tls.Config{InsecureSkipVerify: true}),
-	)
+func TestConnectEtcdRequiresEndpoints(t *testing.T) {
+	_, err := ConnectEtcd(nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no endpoints specified")
 }
 
-func TestNewRedis_QueryParams(t *testing.T) {
-	// Test all query parameters parsing
-	u, _ := url.Parse("redis://localhost:6379/1?pool_size=20&min_idle=5&dial_timeout=5s&read_timeout=1s&write_timeout=1s")
-	// We call NewRedis. Even if connection fails, we want to ensure it doesn't panic during parsing.
-	_, _ = NewRedis(u)
-}
-
-func TestNewRedis_InvalidQueryParams(t *testing.T) {
+func TestNewEtcdValidation(t *testing.T) {
 	tests := []string{
+		"etcd://localhost:2379?dial_timeout=bad",
+		"etcd://localhost:2379?dial_timeout=0s",
+		"etcd://localhost:2379?endpoints=, ,",
+		"etcd://localhost:2379?cert-file=/tmp/cert.pem",
+	}
+
+	for _, raw := range tests {
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+
+		_, err = NewEtcd(u)
+		require.Error(t, err, raw)
+	}
+}
+
+func TestNewRedisValidation(t *testing.T) {
+	tests := []string{
+		"redis://localhost:6379/abc",
+		"redis://localhost:6379/-1",
 		"redis://localhost:6379/0?pool_size=abc",
 		"redis://localhost:6379/0?pool_size=0",
 		"redis://localhost:6379/0?min_idle=-1",
 		"redis://localhost:6379/0?dial_timeout=bad",
-		"redis://localhost:6379/0?read_timeout=bad",
-		"redis://localhost:6379/0?write_timeout=bad",
+		"redis://localhost:6379/0?read_timeout=0s",
+		"redis://localhost:6379/0?write_timeout=-1s",
+		"redis://localhost:6379/0?ca-file=/tmp/ca.pem",
+		"rediss://localhost:6379/0?insecure=true",
+		"rediss://localhost:6379/0?cert-file=/tmp/cert.pem",
 	}
 
 	for _, raw := range tests {
-		u, _ := url.Parse(raw)
-		_, err := NewRedis(u)
-		assert.Error(t, err, raw)
-	}
-}
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
 
-func TestNewEtcd_QueryParams(t *testing.T) {
-	// Test query parameters parsing
-	u, _ := url.Parse("etcd://localhost:2379?endpoints=127.0.0.1:2379,127.0.0.1:2380&dial_timeout=10s")
-	_, _ = NewEtcd(u)
-}
-
-func TestConnectRedis_AddressHandling(t *testing.T) {
-	// Test address without port
-	// This will try to connect to localhost:6379
-	_, err := ConnectRedis("localhost")
-	// It might succeed or fail depending on if redis is running,
-	// but we want to ensure it doesn't panic and handles the string manipulation.
-	if err != nil {
-		assert.Contains(t, err.Error(), "Redis connection failed")
-	}
-
-	// Test empty address -> localhost:6379
-	_, err2 := ConnectRedis("")
-	if err2 != nil {
-		assert.Contains(t, err2.Error(), "Redis connection failed")
+		_, err = NewRedis(u)
+		require.Error(t, err, raw)
 	}
 }

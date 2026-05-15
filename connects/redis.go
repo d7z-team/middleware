@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"strconv"
@@ -85,7 +86,7 @@ func ConnectRedis(addr string, opts ...RedisOption) (*redis.Client, error) {
 
 	client := redis.NewClient(options)
 	if err := client.Ping(context.Background()).Err(); err != nil {
-		return nil, errors.New("Redis connection failed")
+		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
 	return client, nil
@@ -99,6 +100,7 @@ func ConnectRedis(addr string, opts ...RedisOption) (*redis.Client, error) {
 // - dial_timeout, read_timeout, write_timeout: Timeout settings
 func NewRedis(ur *url.URL) (*redis.Client, error) {
 	addr := ur.Host
+	query := ur.Query()
 	var parsedOpts []RedisOption
 
 	// Auth
@@ -112,22 +114,40 @@ func NewRedis(ur *url.URL) (*redis.Client, error) {
 	if ur.Path != "" && ur.Path != "/" {
 		dbStr := strings.TrimPrefix(ur.Path, "/")
 		dbInt, err := strconv.Atoi(dbStr)
-		if err != nil {
+		if err != nil || dbInt < 0 {
 			return nil, errors.New("Redis DB number must be an integer: " + dbStr)
 		}
 		parsedOpts = append(parsedOpts, WithRedisDB(dbInt))
 	}
 
 	// TLS
-	if strings.EqualFold(ur.Scheme, "rediss") {
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: ur.Query().Get("insecure") == "true",
+	tlsKeys := []string{"insecure", "ca-file", "cert-file", "key-file", "server_name"}
+	if !strings.EqualFold(ur.Scheme, "rediss") {
+		for _, key := range tlsKeys {
+			if query.Get(key) != "" {
+				return nil, errors.New("tls parameters require rediss scheme")
+			}
+		}
+	} else {
+		if query.Get("insecure") == "true" {
+			return nil, errors.New("redis insecure TLS via URL is not supported")
+		}
+		tlsConfig, err := loadTLSConfigFromFiles(
+			query.Get("ca-file"),
+			query.Get("cert-file"),
+			query.Get("key-file"),
+			query.Get("server_name"),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 		}
 		parsedOpts = append(parsedOpts, WithRedisTLS(tlsConfig))
 	}
 
 	// Additional options from query
-	query := ur.Query()
 	if sizeStr := query.Get("pool_size"); sizeStr != "" {
 		size, err := strconv.Atoi(sizeStr)
 		if err != nil || size <= 0 {
@@ -147,7 +167,7 @@ func NewRedis(ur *url.URL) (*redis.Client, error) {
 	parseDuration := func(key string) (time.Duration, error) {
 		if val := query.Get(key); val != "" {
 			d, err := time.ParseDuration(val)
-			if err != nil {
+			if err != nil || d <= 0 {
 				return 0, errors.New("invalid redis " + key + ": " + val)
 			}
 			return d, nil

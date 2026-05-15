@@ -3,7 +3,6 @@ package subscribe
 import (
 	"context"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,17 +21,16 @@ type EtcdSubscriber struct {
 
 type etcdSubscription struct {
 	key    string
-	events chan Event
-	errors chan error
+	state  *subscriptionState
 	cancel context.CancelFunc
 	id     string
 	owner  *EtcdSubscriber
 	once   sync.Once
 }
 
-func (s *etcdSubscription) Events() <-chan Event { return s.events }
+func (s *etcdSubscription) Events() <-chan Event { return s.state.Events() }
 
-func (s *etcdSubscription) Errors() <-chan error { return s.errors }
+func (s *etcdSubscription) Errors() <-chan error { return s.state.Errors() }
 
 func (s *etcdSubscription) Close() error {
 	if s == nil || s.owner == nil {
@@ -40,45 +38,29 @@ func (s *etcdSubscription) Close() error {
 	}
 	s.once.Do(func() {
 		s.cancel()
-		s.owner.cleanupWatcher(s.key, s.id)
-		close(s.events)
-		close(s.errors)
+		s.state.closeChannels()
 	})
+	s.owner.cleanupWatcher(s.key, s.id)
 	return nil
 }
 
 func NewEtcdSubscriber(client *clientv3.Client, prefix string) *EtcdSubscriber {
 	return &EtcdSubscriber{
-		prefix:   strings.TrimSuffix(prefix, "/"),
+		prefix:   subscriberChildPrefix("", prefix),
 		client:   client,
 		watchers: make(map[string][]*etcdSubscription),
 	}
 }
 
 func (e *EtcdSubscriber) Child(paths ...string) Subscriber {
-	if len(paths) == 0 {
-		return e
-	}
-	keys := make([]string, 0, len(paths))
-	for _, path := range paths {
-		path = strings.Trim(path, "/")
-		if path == "" {
-			continue
-		}
-		keys = append(keys, path)
-	}
-	if len(keys) == 0 {
+	childPrefix := subscriberChildPrefix(e.prefix, paths...)
+	if childPrefix == e.prefix {
 		return e
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-
-	basePrefix := e.prefix
-	if basePrefix != "" && !strings.HasSuffix(basePrefix, "/") {
-		basePrefix += "/"
-	}
 	child := &EtcdSubscriber{
-		prefix:   basePrefix + strings.Join(keys, "/") + "/",
+		prefix:   childPrefix,
 		client:   e.client,
 		watchers: make(map[string][]*etcdSubscription),
 		parent:   e,
@@ -95,21 +77,18 @@ func (e *EtcdSubscriber) Publish(ctx context.Context, key, data string) error {
 		return nil
 	}
 
-	fullKey := e.buildFullKey(key)
+	fullKey := buildSubscriberKey(e.prefix, key)
 	_, err := e.client.Put(ctx, fullKey, data)
 	return err
 }
 
 func (e *EtcdSubscriber) Subscribe(ctx context.Context, key string) (Subscription, error) {
 	e.mu.Lock()
-	fullKey := e.buildFullKey(key)
-	events := make(chan Event, 1000)
-	errorsCh := make(chan error, 32)
+	fullKey := buildSubscriberKey(e.prefix, key)
 	watchCtx, cancel := context.WithCancel(ctx)
 	sub := &etcdSubscription{
 		key:    fullKey,
-		events: events,
-		errors: errorsCh,
+		state:  newSubscriptionState(),
 		cancel: cancel,
 		id:     generateWatcherID(),
 		owner:  e,
@@ -117,8 +96,8 @@ func (e *EtcdSubscriber) Subscribe(ctx context.Context, key string) (Subscriptio
 
 	if e.isClosedLocked() {
 		e.mu.Unlock()
-		close(events)
-		close(errorsCh)
+		sub.cancel()
+		sub.state.closeChannels()
 		return sub, nil
 	}
 	e.mu.Unlock()
@@ -129,8 +108,7 @@ func (e *EtcdSubscriber) Subscribe(ctx context.Context, key string) (Subscriptio
 	resp, err := e.client.Get(watchCtx, fullKey)
 	if err != nil {
 		cancel()
-		close(events)
-		close(errorsCh)
+		sub.state.closeChannels()
 		return nil, err
 	}
 	startRevision := resp.Header.Revision
@@ -139,8 +117,7 @@ func (e *EtcdSubscriber) Subscribe(ctx context.Context, key string) (Subscriptio
 	defer e.mu.Unlock()
 	if e.isClosedLocked() {
 		cancel()
-		close(events)
-		close(errorsCh)
+		sub.state.closeChannels()
 		return sub, nil
 	}
 	e.watchers[fullKey] = append(e.watchers[fullKey], sub)
@@ -179,10 +156,7 @@ func (e *EtcdSubscriber) watchKey(ctx context.Context, key string, startRevision
 					lastRevision = watchResp.Header.Revision
 				}
 				if err := watchResp.Err(); err != nil {
-					select {
-					case sub.errors <- err:
-					default:
-					}
+					sub.state.trySendError(err)
 					restart = true
 					break
 				}
@@ -195,12 +169,9 @@ func (e *EtcdSubscriber) watchKey(ctx context.Context, key string, startRevision
 						Value:    string(event.Kv.Value),
 						Revision: event.Kv.ModRevision,
 					}
-					select {
-					case sub.events <- payload:
-					case <-ctx.Done():
+					if err := sub.state.trySendEvent(ctx, payload); err != nil {
 						_ = sub.Close()
 						return
-					default:
 					}
 				}
 			}
@@ -237,17 +208,6 @@ func (e *EtcdSubscriber) cleanupWatcher(key, watcherID string) {
 	}
 }
 
-func (e *EtcdSubscriber) buildFullKey(key string) string {
-	key = strings.TrimPrefix(key, "/")
-	if e.prefix == "" {
-		return key
-	}
-	if strings.HasSuffix(e.prefix, "/") {
-		return e.prefix + key
-	}
-	return e.prefix + "/" + key
-}
-
 func (e *EtcdSubscriber) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -265,10 +225,10 @@ func (e *EtcdSubscriber) closeLocked() {
 	}
 	for key, watchers := range e.watchers {
 		for _, watcher := range watchers {
+			watcher := watcher
 			watcher.once.Do(func() {
 				watcher.cancel()
-				close(watcher.events)
-				close(watcher.errors)
+				watcher.state.closeChannels()
 			})
 		}
 		delete(e.watchers, key)

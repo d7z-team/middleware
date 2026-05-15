@@ -46,15 +46,17 @@ func NewMemory(store string) (*Memory, error) {
 		prefix: "",
 	}
 
-	if store != "" {
-		if err := m.load(); err != nil {
-			if !os.IsNotExist(err) {
-				if mkErr := os.MkdirAll(filepath.Dir(store), 0o755); mkErr != nil {
-					return nil, mkErr
-				}
-			}
-		}
+	if store == "" {
+		return m, nil
 	}
+
+	if err := os.MkdirAll(filepath.Dir(store), 0o755); err != nil {
+		return nil, err
+	}
+	if err := m.load(); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
 	return m, nil
 }
 
@@ -541,17 +543,51 @@ func (m *Memory) Sync() error {
 	if m.store == "" {
 		return nil
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 
+	m.mu.RLock()
 	flat := make(map[string]item)
 	m.flatten(m.root, "", flat)
+	m.mu.RUnlock()
 
 	data, err := json.Marshal(flat)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.store, data, 0o644)
+
+	if err := os.MkdirAll(filepath.Dir(m.store), 0o755); err != nil {
+		return err
+	}
+
+	file, err := os.CreateTemp(filepath.Dir(m.store), filepath.Base(m.store)+".tmp-*")
+	if err != nil {
+		return err
+	}
+
+	tempName := file.Name()
+	keepTemp := true
+	defer func() {
+		if keepTemp {
+			_ = os.Remove(tempName)
+		}
+	}()
+
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempName, m.store); err != nil {
+		return err
+	}
+
+	keepTemp = false
+	return nil
 }
 
 func (m *Memory) flatten(n *node, prefix string, res map[string]item) {

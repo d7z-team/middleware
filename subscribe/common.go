@@ -3,9 +3,12 @@ package subscribe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
+	"sync"
 
 	"gopkg.d7z.net/middleware/connects"
 )
@@ -15,6 +18,133 @@ type Event struct {
 	Key      string
 	Value    string
 	Revision int64
+}
+
+var ErrSubscriptionOverflow = errors.New("subscription event buffer full")
+
+const (
+	subscriberEventBufferSize = 1000
+	subscriberErrorBufferSize = 32
+)
+
+type subscriptionState struct {
+	mu         sync.RWMutex
+	events     chan Event
+	errors     chan error
+	closed     bool
+	overflowed bool
+}
+
+func newSubscriptionState() *subscriptionState {
+	return &subscriptionState{
+		events: make(chan Event, subscriberEventBufferSize),
+		errors: make(chan error, subscriberErrorBufferSize),
+	}
+}
+
+func (s *subscriptionState) Events() <-chan Event { return s.events }
+
+func (s *subscriptionState) Errors() <-chan error { return s.errors }
+
+func (s *subscriptionState) trySendEvent(ctx context.Context, event Event) error {
+	if s == nil {
+		return nil
+	}
+
+	s.mu.RLock()
+	if s.closed {
+		s.mu.RUnlock()
+		return nil
+	}
+
+	select {
+	case s.events <- event:
+		s.mu.RUnlock()
+		return nil
+	case <-ctx.Done():
+		s.mu.RUnlock()
+		return ctx.Err()
+	default:
+		s.mu.RUnlock()
+		s.reportOverflow()
+		return nil
+	}
+}
+
+func (s *subscriptionState) trySendError(err error) {
+	if s == nil || err == nil {
+		return
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return
+	}
+
+	select {
+	case s.errors <- err:
+	default:
+	}
+}
+
+func (s *subscriptionState) reportOverflow() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.overflowed {
+		return
+	}
+
+	s.overflowed = true
+	select {
+	case s.errors <- ErrSubscriptionOverflow:
+	default:
+	}
+}
+
+func (s *subscriptionState) closeChannels() {
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+
+	s.closed = true
+	close(s.events)
+	close(s.errors)
+}
+
+func subscriberChildPrefix(base string, paths ...string) string {
+	keys := make([]string, 0, len(paths))
+	for _, raw := range paths {
+		raw = strings.Trim(raw, "/")
+		if raw == "" {
+			continue
+		}
+		keys = append(keys, raw)
+	}
+	if len(keys) == 0 {
+		return base
+	}
+	if base != "" && !strings.HasSuffix(base, "/") {
+		base += "/"
+	}
+	return base + strings.Join(keys, "/") + "/"
+}
+
+func buildSubscriberKey(prefix, key string) string {
+	key = strings.TrimPrefix(key, "/")
+	if prefix == "" {
+		return key
+	}
+	if strings.HasSuffix(prefix, "/") {
+		return prefix + key
+	}
+	return prefix + "/" + key
 }
 
 // Subscription exposes event and error streams for one watch registration.

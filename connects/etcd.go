@@ -2,11 +2,8 @@ package connects
 
 import (
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
-	"fmt"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -69,7 +66,13 @@ func NewEtcd(u *url.URL) (*clientv3.Client, error) {
 	var endpoints []string
 
 	if endpointsStr := query.Get("endpoints"); endpointsStr != "" {
-		endpoints = strings.Split(endpointsStr, ",")
+		for _, endpoint := range strings.Split(endpointsStr, ",") {
+			endpoint = strings.TrimSpace(endpoint)
+			if endpoint == "" {
+				continue
+			}
+			endpoints = append(endpoints, endpoint)
+		}
 	} else if u.Host != "" {
 		endpoints = []string{u.Host}
 	}
@@ -80,34 +83,17 @@ func NewEtcd(u *url.URL) (*clientv3.Client, error) {
 
 	var parsedOpts []EtcdOption
 
-	// TLS Configuration
-	caFile := query.Get("ca-file")
-	certFile := query.Get("cert-file")
-	keyFile := query.Get("key-file")
-
-	if caFile != "" && certFile != "" && keyFile != "" {
-		caCert, err := os.ReadFile(caFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read ca file: %v", err)
-		}
-
-		caCertPool := x509.NewCertPool()
-		if !caCertPool.AppendCertsFromPEM(caCert) {
-			return nil, errors.New("failed to add ca certificate")
-		}
-
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load client certificate: %v", err)
-		}
-
-		tlsConfig := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			RootCAs:      caCertPool,
-		}
+	tlsConfig, err := loadTLSConfigFromFiles(
+		query.Get("ca-file"),
+		query.Get("cert-file"),
+		query.Get("key-file"),
+		query.Get("server_name"),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if tlsConfig != nil {
 		parsedOpts = append(parsedOpts, WithEtcdTLS(tlsConfig))
-	} else if caFile != "" || certFile != "" || keyFile != "" {
-		return nil, errors.New("incomplete tls configuration, need ca-file, cert-file and key-file")
 	}
 
 	// Auth (from URL userinfo)
@@ -119,9 +105,11 @@ func NewEtcd(u *url.URL) (*clientv3.Client, error) {
 
 	// Dial Timeout
 	if dtStr := query.Get("dial_timeout"); dtStr != "" {
-		if dt, err := time.ParseDuration(dtStr); err == nil {
-			parsedOpts = append(parsedOpts, WithEtcdDialTimeout(dt))
+		dt, err := time.ParseDuration(dtStr)
+		if err != nil || dt <= 0 {
+			return nil, errors.New("invalid etcd dial_timeout: " + dtStr)
 		}
+		parsedOpts = append(parsedOpts, WithEtcdDialTimeout(dt))
 	}
 
 	return ConnectEtcd(endpoints, parsedOpts...)
