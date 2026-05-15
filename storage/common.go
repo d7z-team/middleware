@@ -1,5 +1,40 @@
-// Package storage provides namespaced filesystem backends built on top of afero,
-// including in-memory, local, and overlay-style mounted storage.
+// Package storage provides namespaced filesystem backends built on top of afero.
+//
+// The package exposes a Storage interface that behaves like an afero filesystem
+// and adds Child support for creating scoped subtrees without manually joining
+// prefixes throughout the call site.
+//
+// Supported backends include:
+//   - memory:// and mem:// for in-memory storage
+//   - local:///abs/path and storage:///abs/path for local directories
+//   - overlay:// and mount:// for mounted composite views
+//   - s3://bucket/root/prefix for object-backed storage
+//
+// A typical in-memory usage looks like:
+//
+//	store, _ := NewStorageFromURL("memory://")
+//	defer store.Close()
+//
+//	tenant := store.Child("tenant-a")
+//	_ = afero.WriteFile(tenant, "docs/readme.txt", []byte("hello"), 0o644)
+//
+//	data, _ := afero.ReadFile(store, "tenant-a/docs/readme.txt")
+//	_ = data
+//
+// A local filesystem root can be opened from a URL:
+//
+//	store, _ := NewStorageFromURL("local:///var/lib/app")
+//	defer store.Close()
+//
+//	_ = store.MkdirAll("cache", 0o755)
+//
+// Overlay storage can merge a writable root with mounted subtrees:
+//
+//	store, _ := NewStorageFromURL("overlay://?upperdir=memory://&mount=/assets::memory://")
+//	defer store.Close()
+//
+//	assets := store.Child("assets")
+//	_ = afero.WriteFile(assets, "logo.txt", []byte("png"), 0o644)
 package storage
 
 import (
@@ -53,6 +88,8 @@ func (c closerStorage) Close() error {
 var (
 	// ErrInvalidPath indicates that a Child path or local root path is invalid.
 	ErrInvalidPath = errors.New("storage: invalid child path")
+	// ErrDirectoryNotEmpty indicates that Remove was called on a non-empty directory.
+	ErrDirectoryNotEmpty = errors.New("storage: directory not empty")
 	// ErrInvalidMountSpec indicates that an overlay mount definition is malformed.
 	ErrInvalidMountSpec = errors.New("storage: invalid mount spec")
 	// ErrUnsupportedScheme indicates that the storage URL scheme is not supported.
@@ -65,6 +102,7 @@ var (
 //   - memory:// and mem://
 //   - local:///abs/path and storage:///abs/path
 //   - overlay:// and mount://
+//   - s3://bucket/root/prefix
 //
 // Overlay URLs use an overlayfs-like root plus mounted subtrees:
 //
@@ -107,6 +145,15 @@ func NewStorageFromURL(raw string) (CloserStorage, error) {
 		}, nil
 	case "overlay", "mount":
 		return newOverlayStorageFromURL(parse)
+	case "s3":
+		fs, err := newS3StorageFromURL(parse)
+		if err != nil {
+			return nil, err
+		}
+		return closerStorage{
+			Storage: newStorage(fs),
+			closer:  func() error { return nil },
+		}, nil
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedScheme, parse.Scheme)
 	}

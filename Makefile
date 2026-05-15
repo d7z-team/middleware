@@ -2,7 +2,7 @@ GOPATH := $(shell go env GOPATH)
 GOARCH ?= $(shell go env GOARCH)
 
 .PHONY: deps
-deps: etcd redis
+deps: etcd redis minio
 
 .PHONY: redis
 redis:
@@ -11,6 +11,18 @@ redis:
 .PHONY: etcd
 etcd:
 	@docker kill sync-etcd ||:  && sleep 1 && docker run -d --rm --name sync-etcd --network host docker.io/rancher/etcd:v3.4.13-k3s1 etcd
+
+.PHONY: minio
+minio:
+	@docker kill sync-minio ||: && sleep 1 && docker run -d --rm --name sync-minio --network host \
+		-e MINIO_ROOT_USER=minioadmin \
+		-e MINIO_ROOT_PASSWORD=minioadmin \
+		docker.io/minio/minio server /data --address :9000 --console-address :9001
+	@until curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null; do sleep 1; done
+
+.PHONY: minio-stop
+minio-stop:
+	@docker kill sync-minio ||:
 
 .PHONY: fmt
 fmt:
@@ -31,3 +43,7 @@ lint-fix:
 .PHONY: test
 test:
 	@go test  -v -coverprofile=coverage.txt -timeout=60s ./...
+
+.PHONY: test-storage
+test-storage: minio
+	@go test -v ./storage

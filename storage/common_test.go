@@ -170,10 +170,22 @@ func TestNewStorageFromURL(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, local.Close())
 
+	s3URL := "s3://middleware-storage-test/test-prefix?access_key=minioadmin&secret_key=minioadmin&region=us-east-1&endpoint=http%3A%2F%2F127.0.0.1%3A9000&path_style=true&disable_ssl=true"
+	s3Store, err := NewStorageFromURL(s3URL)
+	require.NoError(t, err)
+	require.Equal(t, "S3FS", s3Store.Name())
+	require.NoError(t, s3Store.Close())
+
 	_, err = NewStorageFromURL("unknown://")
 	require.ErrorIs(t, err, ErrUnsupportedScheme)
 
 	_, err = NewStorageFromURL("local://")
+	require.ErrorIs(t, err, ErrInvalidPath)
+
+	_, err = NewStorageFromURL("s3:///missing-bucket")
+	require.ErrorIs(t, err, ErrInvalidPath)
+
+	_, err = NewStorageFromURL("s3://bucket/path?path_style=maybe")
 	require.ErrorIs(t, err, ErrInvalidPath)
 
 	escapedDir := filepath.Join(tempDir, "with space")
@@ -200,6 +212,13 @@ func TestLocalStorageContract(t *testing.T) {
 			Storage: fs,
 			closer:  func() error { return nil },
 		}
+	})
+}
+
+func TestS3StorageContract(t *testing.T) {
+	target := loadTestS3Target(t)
+	testStorageContract(t, func(t *testing.T) CloserStorage {
+		return newTestS3StorageAtPrefix(t, target, testS3Prefix(t, "store"))
 	})
 }
 
