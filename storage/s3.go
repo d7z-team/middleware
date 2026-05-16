@@ -10,17 +10,15 @@ import (
 	"os"
 	"path"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/spf13/afero"
+	"gopkg.d7z.net/middleware/connects"
 )
 
 type s3FS struct {
@@ -33,95 +31,22 @@ type s3FS struct {
 }
 
 func newS3StorageFromURL(parse *url.URL) (afero.Fs, error) {
-	if parse.Host == "" {
-		return nil, ErrInvalidPath
-	}
-
-	rootPrefix, err := normalizeS3Path(parse.Path)
+	target, err := connects.NewS3(parse)
 	if err != nil {
-		return nil, err
-	}
-
-	query := parse.Query()
-	pathStyle, err := parseS3Bool(query, "path_style")
-	if err != nil {
-		return nil, err
-	}
-	disableSSL, err := parseS3Bool(query, "disable_ssl")
-	if err != nil {
-		return nil, err
-	}
-
-	tempDir := firstNonEmpty(query.Get("temp_dir"), os.TempDir())
-	if err := os.MkdirAll(tempDir, 0o755); err != nil {
-		return nil, err
-	}
-
-	region := query.Get("region")
-	endpoint := strings.TrimSpace(query.Get("endpoint"))
-	if endpoint != "" && !strings.Contains(endpoint, "://") {
-		scheme := "https://"
-		if disableSSL {
-			scheme = "http://"
+		if errors.Is(err, connects.ErrInvalidS3Config) {
+			return nil, fmt.Errorf("%w: %s", ErrInvalidPath, err)
 		}
-		endpoint = scheme + endpoint
-	}
-	if endpoint != "" && region == "" {
-		region = "us-east-1"
-	}
-
-	loadOptions := make([]func(*config.LoadOptions) error, 0, 3)
-	if region != "" {
-		loadOptions = append(loadOptions, config.WithRegion(region))
-	}
-	if profile := strings.TrimSpace(query.Get("profile")); profile != "" {
-		loadOptions = append(loadOptions, config.WithSharedConfigProfile(profile))
-	}
-
-	accessKey := strings.TrimSpace(query.Get("access_key"))
-	secretKey := strings.TrimSpace(query.Get("secret_key"))
-	sessionToken := strings.TrimSpace(query.Get("session_token"))
-	if accessKey != "" || secretKey != "" || sessionToken != "" {
-		if accessKey == "" || secretKey == "" {
-			return nil, fmt.Errorf("%w: access_key and secret_key must both be set", ErrInvalidPath)
-		}
-		loadOptions = append(loadOptions, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(accessKey, secretKey, sessionToken),
-		))
-	}
-
-	cfg, err := config.LoadDefaultConfig(context.Background(), loadOptions...)
-	if err != nil {
 		return nil, err
 	}
-
-	client := s3sdk.NewFromConfig(cfg, func(options *s3sdk.Options) {
-		options.UsePathStyle = pathStyle
-		if endpoint != "" {
-			options.BaseEndpoint = aws.String(endpoint)
-		}
-	})
 
 	return &s3FS{
-		client:   client,
-		transfer: transfermanager.New(client),
-		bucket:   parse.Host,
-		prefix:   rootPrefix,
-		tempDir:  tempDir,
+		client:   target.Client,
+		transfer: transfermanager.New(target.Client),
+		bucket:   target.Bucket,
+		prefix:   target.Prefix,
+		tempDir:  target.TempDir,
 		name:     "S3FS",
 	}, nil
-}
-
-func parseS3Bool(query url.Values, key string) (bool, error) {
-	value := strings.TrimSpace(query.Get(key))
-	if value == "" {
-		return false, nil
-	}
-	parsed, err := strconv.ParseBool(value)
-	if err != nil {
-		return false, fmt.Errorf("%w: invalid %s", ErrInvalidPath, key)
-	}
-	return parsed, nil
 }
 
 func normalizeS3Path(name string) (string, error) {

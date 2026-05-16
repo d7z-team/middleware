@@ -73,3 +73,21 @@ func TestNewRedisValidation(t *testing.T) {
 		require.Error(t, err, raw)
 	}
 }
+
+func TestNewS3Validation(t *testing.T) {
+	tests := []string{
+		"s3:///missing-bucket",
+		"s3://bucket/root?path_style=maybe",
+		"s3://bucket/root?disable_ssl=maybe",
+		"s3://bucket/root?access_key=only",
+		"s3://bucket/a/../b",
+	}
+
+	for _, raw := range tests {
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+
+		_, err = NewS3(u)
+		require.Error(t, err, raw)
+	}
+}
