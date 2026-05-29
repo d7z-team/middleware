@@ -656,8 +656,22 @@ func (m *Memory) PutIfNotExists(ctx context.Context, key, value string, ttl time
 }
 
 func (m *Memory) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
+	return m.CompareAndSwapTTL(ctx, key, oldValue, newValue, TTLKeep)
+}
+
+func (m *Memory) CompareAndSwapTTL(ctx context.Context, key, oldValue, newValue string, ttl time.Duration) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	default:
+	}
+	if invalidTTL(ttl) {
+		return false, ErrInvalidTTL
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	fullKey := m.resolve(key)
 	node, leaf := m.find(fullKey, false)
 	if node == nil {
@@ -671,7 +685,39 @@ func (m *Memory) CompareAndSwap(ctx context.Context, key, oldValue, newValue str
 	if v.Value != oldValue {
 		return false, nil
 	}
+
 	v.Value = newValue
+	if ttl > 0 {
+		expiresAt := time.Now().Add(ttl)
+		v.TTL = &expiresAt
+	}
 	node.values[leaf] = v
+	return true, nil
+}
+
+func (m *Memory) DeleteIfValue(ctx context.Context, key, value string) (bool, error) {
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	default:
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	fullKey := m.resolve(key)
+	node, leaf := m.find(fullKey, false)
+	if node == nil {
+		return false, nil
+	}
+
+	v, ok := node.values[leaf]
+	if !ok || (v.TTL != nil && time.Now().After(*v.TTL)) {
+		return false, nil
+	}
+	if v.Value != value {
+		return false, nil
+	}
+	delete(node.values, leaf)
 	return true, nil
 }

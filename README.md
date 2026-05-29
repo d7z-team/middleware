@@ -10,6 +10,17 @@
 
 请勿用于 **任何** 生产环境
 
+## Packages
+
+- `cache`: memory / Redis blob cache with metadata and TTL.
+- `kv`: hierarchical key-value abstraction with TTL, scan, batch operations, CAS, and conditional atomic updates.
+- `lock`: memory / etcd locking primitives.
+- `queue`: memory / etcd at-least-once queue.
+- `storage`: afero-based memory, local, overlay, and S3 storage.
+- `subscribe`: memory / etcd pub/sub primitives.
+- `cluster`: lightweight KV-only cluster coordination with Raft-style leader election, leader lease fencing, and optional KV task claims.
+- `tools`: typed helpers built on top of `kv` and `cache`.
+
 ## License
 
 Apache-2.0

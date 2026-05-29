@@ -251,6 +251,13 @@ func (b *Badger) PutIfNotExists(ctx context.Context, key, value string, ttl time
 }
 
 func (b *Badger) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
+	return b.CompareAndSwapTTL(ctx, key, oldValue, newValue, TTLKeep)
+}
+
+func (b *Badger) CompareAndSwapTTL(ctx context.Context, key, oldValue, newValue string, ttl time.Duration) (bool, error) {
+	if invalidTTL(ttl) {
+		return false, ErrInvalidTTL
+	}
 	fullKey, err := b.buildKey(key)
 	if err != nil {
 		return false, err
@@ -267,6 +274,10 @@ func (b *Badger) CompareAndSwap(ctx context.Context, key, oldValue, newValue str
 				}
 				return err
 			}
+			if item.IsDeletedOrExpired() {
+				swapped = false
+				return nil
+			}
 			val, err := item.ValueCopy(nil)
 			if err != nil {
 				return err
@@ -275,10 +286,16 @@ func (b *Badger) CompareAndSwap(ctx context.Context, key, oldValue, newValue str
 				swapped = false
 				return nil
 			}
-			remaining := b.ttlFromItem(item)
+
 			swapped = true
-			if remaining > 0 {
-				return b.setWithTTL(txn, fullKey, newValue, remaining)
+			if ttl > 0 {
+				return b.setWithTTL(txn, fullKey, newValue, ttl)
+			}
+			if ttl == TTLKeep {
+				remaining := b.ttlFromItem(item)
+				if remaining > 0 {
+					return b.setWithTTL(txn, fullKey, newValue, remaining)
+				}
 			}
 			return txn.Set(fullKey, []byte(newValue))
 		})
@@ -287,6 +304,45 @@ func (b *Badger) CompareAndSwap(ctx context.Context, key, oldValue, newValue str
 		return false, err
 	}
 	return swapped, nil
+}
+
+func (b *Badger) DeleteIfValue(ctx context.Context, key, value string) (bool, error) {
+	fullKey, err := b.buildKey(key)
+	if err != nil {
+		return false, err
+	}
+
+	var deleted bool
+	err = b.withRetry(ctx, func() error {
+		return b.db.Update(func(txn *badger.Txn) error {
+			item, err := txn.Get(fullKey)
+			if err != nil {
+				if errors.Is(err, badger.ErrKeyNotFound) {
+					deleted = false
+					return nil
+				}
+				return err
+			}
+			if item.IsDeletedOrExpired() {
+				deleted = false
+				return nil
+			}
+			val, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			if string(val) != value {
+				deleted = false
+				return nil
+			}
+			deleted = true
+			return txn.Delete(fullKey)
+		})
+	})
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
 }
 
 func (b *Badger) List(ctx context.Context, prefix string) ([]Pair, error) {

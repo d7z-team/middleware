@@ -284,26 +284,53 @@ func (e *Etcd) PutIfNotExists(ctx context.Context, key, value string, ttl time.D
 
 // CompareAndSwap updates the value if it matches the old value.
 func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error) {
+	return e.CompareAndSwapTTL(ctx, key, oldValue, newValue, TTLKeep)
+}
+
+func (e *Etcd) CompareAndSwapTTL(ctx context.Context, key, oldValue, newValue string, ttl time.Duration) (bool, error) {
+	if invalidTTL(ttl) {
+		return false, ErrInvalidTTL
+	}
 	fullKey, err := e.buildKey(key)
 	if err != nil {
 		return false, err
 	}
 
-	cmp := clientv3.Compare(clientv3.Value(fullKey), "=", oldValue)
-	putOp := clientv3.OpPut(fullKey, newValue)
+	var putOp clientv3.Op
+	var leaseID clientv3.LeaseID
+	if ttl == TTLKeep {
+		putOp = clientv3.OpPut(fullKey, newValue, clientv3.WithIgnoreLease())
+	} else {
+		resp, err := e.client.Grant(ctx, ttlToSeconds(ttl))
+		if err != nil {
+			return false, fmt.Errorf("create lease failed: %w", err)
+		}
+		leaseID = resp.ID
+		putOp = clientv3.OpPut(fullKey, newValue, clientv3.WithLease(leaseID))
+	}
+
 	getOp := clientv3.OpGet(fullKey)
 
 	txnResp, err := e.client.Txn(ctx).
-		If(cmp).
+		If(
+			clientv3.Compare(clientv3.Version(fullKey), ">", 0),
+			clientv3.Compare(clientv3.Value(fullKey), "=", oldValue),
+		).
 		Then(putOp).
 		Else(getOp).
 		Commit()
 	if err != nil {
+		if leaseID != 0 {
+			_, _ = e.client.Revoke(context.Background(), leaseID)
+		}
 		return false, fmt.Errorf("compare and swap failed: %w", err)
 	}
 
 	if txnResp.Succeeded {
 		return true, nil
+	}
+	if leaseID != 0 {
+		_, _ = e.client.Revoke(context.Background(), leaseID)
 	}
 
 	if len(txnResp.Responses) > 0 {
@@ -314,6 +341,25 @@ func (e *Etcd) CompareAndSwap(ctx context.Context, key, oldValue, newValue strin
 	}
 
 	return false, nil
+}
+
+func (e *Etcd) DeleteIfValue(ctx context.Context, key, value string) (bool, error) {
+	fullKey, err := e.buildKey(key)
+	if err != nil {
+		return false, err
+	}
+
+	txnResp, err := e.client.Txn(ctx).
+		If(
+			clientv3.Compare(clientv3.Version(fullKey), ">", 0),
+			clientv3.Compare(clientv3.Value(fullKey), "=", value),
+		).
+		Then(clientv3.OpDelete(fullKey)).
+		Commit()
+	if err != nil {
+		return false, fmt.Errorf("delete if value failed: %w", err)
+	}
+	return txnResp.Succeeded, nil
 }
 
 // ListCursor implements cursor-based pagination.

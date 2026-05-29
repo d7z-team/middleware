@@ -193,6 +193,59 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 		assert.False(t, done)
 	})
 
+	t.Run("Atomic_TTL_And_DeleteIfValue", func(t *testing.T) {
+		key := uniquePrefix + "cas_ttl"
+		require.NoError(t, kvClient.Put(ctx, key, "old", TTLKeep))
+
+		done, err := kvClient.CompareAndSwapTTL(ctx, key, "missing", "new", time.Second)
+		require.NoError(t, err)
+		assert.False(t, done)
+
+		done, err = kvClient.CompareAndSwapTTL(ctx, key, "old", "new", time.Second)
+		require.NoError(t, err)
+		assert.True(t, done)
+		got, err := kvClient.Get(ctx, key)
+		require.NoError(t, err)
+		assert.Equal(t, "new", got)
+
+		assert.Eventually(t, func() bool {
+			_, err := kvClient.Get(ctx, key)
+			return errors.Is(err, ErrKeyNotFound)
+		}, 3*time.Second, 200*time.Millisecond, "CompareAndSwapTTL should replace the ttl")
+
+		keepKey := uniquePrefix + "cas_keep_ttl"
+		require.NoError(t, kvClient.Put(ctx, keepKey, "v1", time.Second))
+		done, err = kvClient.CompareAndSwapTTL(ctx, keepKey, "v1", "v2", TTLKeep)
+		require.NoError(t, err)
+		require.True(t, done)
+		got, err = kvClient.Get(ctx, keepKey)
+		require.NoError(t, err)
+		assert.Equal(t, "v2", got)
+		assert.Eventually(t, func() bool {
+			_, err := kvClient.Get(ctx, keepKey)
+			return errors.Is(err, ErrKeyNotFound)
+		}, 3*time.Second, 200*time.Millisecond, "TTLKeep should preserve the existing ttl")
+
+		done, err = kvClient.CompareAndSwapTTL(ctx, uniquePrefix+"invalid_ttl", "x", "y", 0)
+		assert.ErrorIs(t, err, ErrInvalidTTL)
+		assert.False(t, done)
+
+		deleteKey := uniquePrefix + "delete_if_value"
+		require.NoError(t, kvClient.Put(ctx, deleteKey, "value", TTLKeep))
+		deleted, err := kvClient.DeleteIfValue(ctx, deleteKey, "other")
+		require.NoError(t, err)
+		assert.False(t, deleted)
+		got, err = kvClient.Get(ctx, deleteKey)
+		require.NoError(t, err)
+		assert.Equal(t, "value", got)
+
+		deleted, err = kvClient.DeleteIfValue(ctx, deleteKey, "value")
+		require.NoError(t, err)
+		assert.True(t, deleted)
+		_, err = kvClient.Get(ctx, deleteKey)
+		assert.ErrorIs(t, err, ErrKeyNotFound)
+	})
+
 	// Child & Hierarchy Isolation
 	t.Run("Child_And_Hierarchy_Isolation", func(t *testing.T) {
 		// Parent: uniquePrefix

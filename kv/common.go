@@ -64,6 +64,11 @@ type KV interface {
 	PutIfNotExists(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
 	// CompareAndSwap updates the value for a key only if the current value matches oldValue.
 	CompareAndSwap(ctx context.Context, key, oldValue, newValue string) (bool, error)
+	// CompareAndSwapTTL updates the value and TTL only if the current value matches oldValue.
+	// TTLKeep preserves the existing TTL.
+	CompareAndSwapTTL(ctx context.Context, key, oldValue, newValue string, ttl time.Duration) (bool, error)
+	// DeleteIfValue removes a key only if the current value matches value.
+	DeleteIfValue(ctx context.Context, key, value string) (bool, error)
 
 	// List returns all key-value pairs matching the prefix.
 	// This is a small-dataset convenience API and may scan the full range in memory.
