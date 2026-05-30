@@ -125,9 +125,18 @@ type WatchOptions struct {
 	Name              string
 	Since             string
 	Selector          Selector
+	Scope             WatchScope
 	AllowBookmarks    bool
 	SendInitialEvents bool
 }
+
+type WatchScope string
+
+const (
+	WatchScopeObject   WatchScope = "object"
+	WatchScopeMetadata WatchScope = "metadata"
+	WatchScopeStatus   WatchScope = "status"
+)
 
 type WatchEventType string
 

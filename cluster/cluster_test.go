@@ -317,6 +317,72 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.True(t, slices.Contains(event.Changed, "spec.size"), event.Changed)
 	})
 
+	t.Run("watch_metadata_and_status_scopes", func(t *testing.T) {
+		c := newURLCluster(t, factory, nil)
+		widgets := defineWidgets(t, c, "scopedwidgets")
+		ctx := testContext(t, 5*time.Second)
+
+		_, err := widgets.Create(ctx, "alpha", widgetSpec{Size: "small", Owner: "team-a"}, CreateOptions{
+			Labels:      Labels{"app": "demo"},
+			Annotations: Annotations{"tenant": "t1"},
+		})
+		require.NoError(t, err)
+
+		list, err := widgets.List(ctx, ListOptions{Selector: Where(Field("metadata.name").Eq("alpha"))})
+		require.NoError(t, err)
+		require.Len(t, list.Items, 1)
+
+		watchCtx := testContext(t, 4*time.Second)
+		metadataEvents, err := widgets.WatchMetadata(watchCtx, WatchOptions{
+			Since: list.ResourceVersion,
+			Name:  "alpha",
+		})
+		require.NoError(t, err)
+		statusEvents, err := widgets.WatchStatus(watchCtx, WatchOptions{
+			Since: list.ResourceVersion,
+			Name:  "alpha",
+		})
+		require.NoError(t, err)
+
+		_, err = widgets.Patch(ctx, "alpha", []byte(`{"spec":{"size":"medium"}}`), PatchOptions{})
+		require.NoError(t, err)
+		patched, err := widgets.Patch(ctx, "alpha", []byte(`{"metadata":{"labels":{"app":"demo","tier":"frontend"}}}`), PatchOptions{})
+		require.NoError(t, err)
+
+		event := nextWatchEvent(t, metadataEvents)
+		require.Equal(t, WatchModified, event.Type)
+		require.Equal(t, patched.Metadata.ResourceVersion, event.ResourceVersion)
+		require.True(t, slices.Contains(event.Changed, "metadata.labels"), event.Changed)
+
+		statused, err := widgets.UpdateStatus(ctx, "alpha", widgetStatus{Phase: "Ready"}, UpdateOptions{})
+		require.NoError(t, err)
+
+		event = nextWatchEvent(t, statusEvents)
+		require.Equal(t, WatchModified, event.Type)
+		require.Equal(t, statused.Metadata.ResourceVersion, event.ResourceVersion)
+		require.True(t, slices.Contains(event.Changed, "status.phase"), event.Changed)
+		select {
+		case event, ok := <-metadataEvents:
+			require.True(t, ok, "watch channel closed")
+			t.Fatalf("unexpected metadata watch event: %#v", event)
+		case <-time.After(300 * time.Millisecond):
+		}
+
+		initialCtx := testContext(t, 3*time.Second)
+		initialEvents, err := widgets.WatchStatus(initialCtx, WatchOptions{
+			Name:              "alpha",
+			SendInitialEvents: true,
+		})
+		require.NoError(t, err)
+		event = nextWatchEvent(t, initialEvents)
+		require.Equal(t, WatchAdded, event.Type)
+		require.Equal(t, "alpha", event.Object.Metadata.Name)
+		require.Empty(t, event.Changed)
+
+		_, err = widgets.Watch(ctx, WatchOptions{Scope: WatchScope("invalid")})
+		require.ErrorIs(t, err, ErrInvalidObject)
+	})
+
 	t.Run("watch_replay_and_compaction", func(t *testing.T) {
 		c := newURLCluster(t, factory, url.Values{
 			"event_retention_count": {"2"},
@@ -383,9 +449,26 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.NoError(t, err)
 		require.Len(t, list.Items, 1)
 
+		watchCtx := testContext(t, 3*time.Second)
+		statusEvents, err := raw.WatchStatus(watchCtx, WatchOptions{
+			Since: list.ResourceVersion,
+			Name:  "alpha",
+		})
+		require.NoError(t, err)
 		statused, err := raw.PatchStatus(ctx, "alpha", []byte(`{"phase":"Ready"}`), PatchOptions{})
 		require.NoError(t, err)
 		require.JSONEq(t, `{"phase":"Ready"}`, string(statused.Status))
+		var event UnstructuredWatchEvent
+		select {
+		case got, ok := <-statusEvents:
+			require.True(t, ok)
+			event = got
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for unstructured watch event")
+		}
+		require.Equal(t, WatchModified, event.Type)
+		require.Equal(t, statused.Metadata.ResourceVersion, event.ResourceVersion)
+		require.True(t, slices.Contains(event.Changed, "status.phase"), event.Changed)
 
 		_, err = raw.Patch(ctx, "alpha", []byte(`{"status":{"phase":"Failed"}}`), PatchOptions{})
 		require.ErrorIs(t, err, ErrInvalidObject)

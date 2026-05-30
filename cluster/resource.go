@@ -149,6 +149,16 @@ func (r *Resource[S, T]) Watch(ctx context.Context, opts WatchOptions) (<-chan W
 	return out, nil
 }
 
+func (r *Resource[S, T]) WatchMetadata(ctx context.Context, opts WatchOptions) (<-chan WatchEvent[S, T], error) {
+	opts.Scope = WatchScopeMetadata
+	return r.Watch(ctx, opts)
+}
+
+func (r *Resource[S, T]) WatchStatus(ctx context.Context, opts WatchOptions) (<-chan WatchEvent[S, T], error) {
+	opts.Scope = WatchScopeStatus
+	return r.Watch(ctx, opts)
+}
+
 func unstructuredToTyped[S, T any](obj *Unstructured) (*Object[S, T], error) {
 	if obj == nil {
 		return nil, nil

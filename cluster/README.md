@@ -375,6 +375,7 @@ for event := range events {
 | `Name` | 只 watch 指定对象名 |
 | `Since` | 从指定 `resourceVersion` 之后开始 |
 | `Selector` | 按 label、annotation、field 过滤 |
+| `Scope` | watch 范围，支持 `WatchScopeObject`、`WatchScopeMetadata`、`WatchScopeStatus` |
 | `AllowBookmarks` | 允许发送 bookmark 事件 |
 | `SendInitialEvents` | 先把当前已有对象作为 `ADDED` 事件发出 |
 
@@ -386,6 +387,43 @@ events, err = widgets.Watch(ctx, cluster.WatchOptions{
 	Since: statused.Metadata.ResourceVersion,
 })
 ```
+
+只关注 metadata 或 status 变化：
+
+```go
+metadataEvents, err := widgets.WatchMetadata(ctx, cluster.WatchOptions{
+	Name:  "alpha",
+	Since: statused.Metadata.ResourceVersion,
+})
+if err != nil {
+	return err
+}
+_ = metadataEvents
+
+statusEvents, err := widgets.WatchStatus(ctx, cluster.WatchOptions{
+	Name:  "alpha",
+	Since: statused.Metadata.ResourceVersion,
+})
+if err != nil {
+	return err
+}
+_ = statusEvents
+```
+
+也可以在 `Watch` 中显式设置 `Scope`：
+
+```go
+statusEvents, err = widgets.Watch(ctx, cluster.WatchOptions{
+	Name:  "alpha",
+	Since: statused.Metadata.ResourceVersion,
+	Scope: cluster.WatchScopeStatus,
+})
+```
+
+`WatchMetadata` 会返回 `metadata.labels`、`metadata.annotations`、
+`metadata.finalizers`、`metadata.deletedAt` 等 metadata 变化事件。
+`WatchStatus` 只返回 `status.<field>` 变化事件。`SendInitialEvents` 会先返回当前对象，
+初始事件不受 `Scope` 过滤。
 
 读取当前已有对象作为初始事件：
 

@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -105,6 +106,9 @@ func (r *UnstructuredResource) drainEvents(
 			if opts.Name != "" && event.Ref.Name != opts.Name {
 				continue
 			}
+			if !watchScopeMatches(opts.Scope, event.Changed) {
+				continue
+			}
 			if event.Object == nil || !matchesSelector(*event.Object, opts.Selector) {
 				continue
 			}
@@ -122,6 +126,37 @@ func (r *UnstructuredResource) drainEvents(
 			return latestSeen, true
 		}
 	}
+}
+
+func validateWatchScope(scope WatchScope) error {
+	switch scope {
+	case "", WatchScopeObject, WatchScopeMetadata, WatchScopeStatus:
+		return nil
+	default:
+		return ErrInvalidObject
+	}
+}
+
+func watchScopeMatches(scope WatchScope, changed []string) bool {
+	switch scope {
+	case "", WatchScopeObject:
+		return true
+	case WatchScopeMetadata:
+		return changedPathMatches(changed, "metadata")
+	case WatchScopeStatus:
+		return changedPathMatches(changed, "status")
+	default:
+		return false
+	}
+}
+
+func changedPathMatches(changed []string, prefix string) bool {
+	for _, path := range changed {
+		if path == prefix || strings.HasPrefix(path, prefix+".") {
+			return true
+		}
+	}
+	return false
 }
 
 func sendWatchEvent(ctx context.Context, out chan<- UnstructuredWatchEvent, event UnstructuredWatchEvent) bool {

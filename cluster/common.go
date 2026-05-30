@@ -28,6 +28,8 @@
 //	})
 //	events, _ := widgets.Watch(ctx, WatchOptions{Since: list.ResourceVersion})
 //	_ = events
+//	statusEvents, _ := widgets.WatchStatus(ctx, WatchOptions{Since: list.ResourceVersion})
+//	_ = statusEvents
 package cluster
 
 import (

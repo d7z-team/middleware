@@ -336,6 +336,9 @@ func (r *UnstructuredResource) Watch(
 	ctx context.Context,
 	opts WatchOptions,
 ) (<-chan UnstructuredWatchEvent, error) {
+	if err := validateWatchScope(opts.Scope); err != nil {
+		return nil, err
+	}
 	if opts.Name != "" {
 		if err := validateObjectName(opts.Name); err != nil {
 			return nil, err
@@ -361,6 +364,22 @@ func (r *UnstructuredResource) Watch(
 	out := make(chan UnstructuredWatchEvent, r.cluster.options.WatchBufferSize)
 	go r.watchLoop(ctx, opts, startRV, notify, cancel, out)
 	return out, nil
+}
+
+func (r *UnstructuredResource) WatchMetadata(
+	ctx context.Context,
+	opts WatchOptions,
+) (<-chan UnstructuredWatchEvent, error) {
+	opts.Scope = WatchScopeMetadata
+	return r.Watch(ctx, opts)
+}
+
+func (r *UnstructuredResource) WatchStatus(
+	ctx context.Context,
+	opts WatchOptions,
+) (<-chan UnstructuredWatchEvent, error) {
+	opts.Scope = WatchScopeStatus
+	return r.Watch(ctx, opts)
 }
 
 func (r *UnstructuredResource) mutateStatus(
