@@ -12,12 +12,12 @@ import (
 )
 
 type widgetSpec struct {
-	Size  string `json:"size,omitempty" cluster:"required,enum=small|medium|large,index,watch"`
+	Size  string `json:"size,omitempty" cluster:"required,enum=small|medium|large,index"`
 	Owner string `json:"owner,omitempty" cluster:"immutable,index=owner"`
 }
 
 type widgetStatus struct {
-	Phase string `json:"phase,omitempty" cluster:"enum=Pending|Ready|Failed,index=phase,watch"`
+	Phase string `json:"phase,omitempty" cluster:"enum=Pending|Ready|Failed,index=phase"`
 }
 
 type clusterURLFactory struct {
@@ -26,11 +26,17 @@ type clusterURLFactory struct {
 }
 
 func localURLFactories() []clusterURLFactory {
+	memoryCounter := 0
+	badgerCounter := 0
 	return []clusterURLFactory{
 		{
 			name: "memory",
 			raw: func(t *testing.T, query url.Values) string {
 				t.Helper()
+				memoryCounter++
+				if query.Get("node") == "" {
+					query.Set("node", fmt.Sprintf("memory-%d", memoryCounter))
+				}
 				return (&url.URL{Scheme: "memory", RawQuery: query.Encode()}).String()
 			},
 		},
@@ -38,6 +44,10 @@ func localURLFactories() []clusterURLFactory {
 			name: "badger",
 			raw: func(t *testing.T, query url.Values) string {
 				t.Helper()
+				badgerCounter++
+				if query.Get("node") == "" {
+					query.Set("node", fmt.Sprintf("badger-%d", badgerCounter))
+				}
 				return (&url.URL{Scheme: "badger", Path: t.TempDir(), RawQuery: query.Encode()}).String()
 			},
 		},
@@ -53,16 +63,44 @@ func TestClusterURLContractLocalBackends(t *testing.T) {
 }
 
 func TestClusterFromURLValidation(t *testing.T) {
-	_, err := NewClusterFromURL("unknown://")
+	_, err := NewClusterFromURL("memory://")
 	require.ErrorIs(t, err, ErrInvalidConfig)
-	_, err = NewClusterFromURL("memory://?event_retention_count=-1")
+	_, err = NewClusterFromURL("unknown://?node=n1")
 	require.ErrorIs(t, err, ErrInvalidConfig)
-	_, err = NewClusterFromURL("memory://?event_retention_count=0")
+	_, err = NewClusterFromURL("memory://?node=../x")
 	require.ErrorIs(t, err, ErrInvalidConfig)
-	_, err = NewClusterFromURL("memory://?watch_buffer_size=0")
+	_, err = NewClusterFromURL("memory://?node=n1&node_lease_ttl=bad")
 	require.ErrorIs(t, err, ErrInvalidConfig)
-	_, err = NewClusterFromURL("badger://")
+	_, err = NewClusterFromURL("memory://?node=n1&node_renew_interval=bad")
 	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&node_lease_ttl=1s&node_renew_interval=1s")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&event_retention_count=-1")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&event_retention_count=0")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&watch_buffer_size=0")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("badger://?node=n1")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+}
+
+func TestClusterNodeLeaseRequiresUniqueLocalNode(t *testing.T) {
+	rawURL := "memory://?node=dup&prefix=lease-test&node_lease_ttl=2s&node_renew_interval=500ms"
+	first, err := NewClusterFromURL(rawURL)
+	require.NoError(t, err)
+
+	_, err = NewClusterFromURL(rawURL)
+	require.ErrorIs(t, err, ErrNodeAlreadyExists)
+
+	other, err := NewClusterFromURL("memory://?node=other&prefix=lease-test")
+	require.NoError(t, err)
+	require.NoError(t, other.Close())
+
+	require.NoError(t, first.Close())
+	second, err := NewClusterFromURL(rawURL)
+	require.NoError(t, err)
+	require.NoError(t, second.Close())
 }
 
 func TestClusterDefaultEventRetention(t *testing.T) {
@@ -71,6 +109,7 @@ func TestClusterDefaultEventRetention(t *testing.T) {
 		name: "memory",
 		raw: func(t *testing.T, query url.Values) string {
 			t.Helper()
+			query.Set("node", "retention")
 			return (&url.URL{Scheme: "memory", RawQuery: query.Encode()}).String()
 		},
 	}, nil)
@@ -96,7 +135,7 @@ func TestBadgerURLPersistsTypedObjects(t *testing.T) {
 	rawURL := (&url.URL{
 		Scheme:   "badger",
 		Path:     t.TempDir(),
-		RawQuery: url.Values{"prefix": {"persist"}}.Encode(),
+		RawQuery: url.Values{"prefix": {"persist"}, "node": {"disk"}}.Encode(),
 	}).String()
 
 	c, err := NewClusterFromURL(rawURL)
@@ -130,7 +169,7 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 			Annotations: Annotations{"tenant": "t1"},
 		})
 		require.NoError(t, err)
-		require.Equal(t, "1", created.Metadata.ResourceVersion)
+		require.NotEmpty(t, created.Metadata.ResourceVersion)
 		require.EqualValues(t, 1, created.Metadata.Generation)
 		require.NotEmpty(t, created.Metadata.UID)
 		require.Equal(t, "default-controller", created.Metadata.Annotations["controller"])
@@ -142,7 +181,7 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		stale := *got
 		patched, err := widgets.Patch(ctx, "alpha", []byte(`{"spec":{"size":"large"}}`), PatchOptions{})
 		require.NoError(t, err)
-		require.Equal(t, "2", patched.Metadata.ResourceVersion)
+		require.NotEqual(t, created.Metadata.ResourceVersion, patched.Metadata.ResourceVersion)
 		require.EqualValues(t, 2, patched.Metadata.Generation)
 
 		stale.Spec.Size = "medium"
@@ -151,7 +190,7 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 
 		statused, err := widgets.UpdateStatus(ctx, "alpha", widgetStatus{Phase: "Ready"}, UpdateOptions{})
 		require.NoError(t, err)
-		require.Equal(t, "3", statused.Metadata.ResourceVersion)
+		require.NotEqual(t, patched.Metadata.ResourceVersion, statused.Metadata.ResourceVersion)
 		require.EqualValues(t, 2, statused.Metadata.Generation)
 
 		statused.Status.Phase = "Failed"
@@ -164,7 +203,7 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.NoError(t, err)
 		require.Len(t, list.Items, 1)
 
-		withFinalizer, err := widgets.Patch(ctx, "alpha", []byte(`{"metadata":{"finalizers":["cleanup.example.test"]}}`), PatchOptions{})
+		withFinalizer, err := widgets.PatchMetadata(ctx, "alpha", []byte(`{"finalizers":["cleanup.example.test"]}`), PatchOptions{})
 		require.NoError(t, err)
 		require.NotEmpty(t, withFinalizer.Metadata.Finalizers)
 
@@ -174,7 +213,7 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		_, err = widgets.Get(ctx, "alpha")
 		require.NoError(t, err)
 
-		_, err = widgets.Patch(ctx, "alpha", []byte(`{"metadata":{"finalizers":[]}}`), PatchOptions{})
+		_, err = widgets.PatchMetadata(ctx, "alpha", []byte(`{"finalizers":[]}`), PatchOptions{})
 		require.NoError(t, err)
 		_, err = widgets.Delete(ctx, "alpha", DeleteOptions{})
 		require.NoError(t, err)
@@ -197,7 +236,7 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.Equal(t, "medium", created.Spec.Size)
 		require.Equal(t, "default-controller", created.Metadata.Annotations["controller"])
 
-		_, err = widgets.Patch(ctx, "defaulted", []byte(`{"metadata":{"annotations":{"tenant":"t2"}}}`), PatchOptions{})
+		_, err = widgets.PatchMetadata(ctx, "defaulted", []byte(`{"annotations":{"tenant":"t2"}}`), PatchOptions{})
 		require.ErrorIs(t, err, ErrInvalidObject)
 		_, err = widgets.Patch(ctx, "defaulted", []byte(`{"spec":{"owner":"team-b"}}`), PatchOptions{})
 		require.ErrorIs(t, err, ErrInvalidObject)
@@ -244,15 +283,23 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 
 		selected, err := widgets.List(ctx, ListOptions{
 			Selector: Where(
-				Label("app").Eq("demo"),
+				Label("app").In("demo"),
 				Annotation("tenant").Eq("t1"),
+				Annotation("tenant").Exists(),
 				Field("apiVersion").Eq("example.test/v1"),
 				Field("kind").Eq("Widget"),
 				Field("status.phase").Eq("Ready"),
+				Field("status.phase").NotIn("Failed"),
 			),
 		})
 		require.NoError(t, err)
 		require.Len(t, selected.Items, 2)
+
+		notBeta, err := widgets.List(ctx, ListOptions{
+			Selector: Where(Label("app").NotEq("other"), Field("spec.owner").Exists()),
+		})
+		require.NoError(t, err)
+		require.Len(t, notBeta.Items, 2)
 
 		named, err := widgets.List(ctx, ListOptions{
 			Selector: Where(Field("metadata.name").Eq("alpha")),
@@ -346,8 +393,9 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 
 		_, err = widgets.Patch(ctx, "alpha", []byte(`{"spec":{"size":"medium"}}`), PatchOptions{})
 		require.NoError(t, err)
-		patched, err := widgets.Patch(ctx, "alpha", []byte(`{"metadata":{"labels":{"app":"demo","tier":"frontend"}}}`), PatchOptions{})
+		patched, err := widgets.PatchMetadata(ctx, "alpha", []byte(`{"labels":{"app":"demo","tier":"frontend"}}`), PatchOptions{})
 		require.NoError(t, err)
+		require.EqualValues(t, 2, patched.Metadata.Generation)
 
 		event := nextWatchEvent(t, metadataEvents)
 		require.Equal(t, WatchModified, event.Type)
@@ -381,6 +429,80 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 
 		_, err = widgets.Watch(ctx, WatchOptions{Scope: WatchScope("invalid")})
 		require.ErrorIs(t, err, ErrInvalidObject)
+	})
+
+	t.Run("node_api_and_resource_schema", func(t *testing.T) {
+		c := newURLCluster(t, factory, nil)
+		widgets := defineWidgets(t, c, "schemawidgets")
+		ctx := testContext(t, 5*time.Second)
+
+		node, err := c.CurrentNode(ctx)
+		require.NoError(t, err)
+		require.Equal(t, c.options.NodeName, node.Metadata.Name)
+		require.False(t, node.Status.LeaseUntil.IsZero())
+
+		nodes := c.Nodes()
+		list, err := nodes.List(ctx, ListOptions{Selector: Where(Field("metadata.name").Eq(c.options.NodeName))})
+		require.NoError(t, err)
+		require.Len(t, list.Items, 1)
+
+		watchCtx := testContext(t, 4*time.Second)
+		metadataEvents, err := nodes.WatchMetadata(watchCtx, WatchOptions{
+			Since: list.ResourceVersion,
+			Name:  c.options.NodeName,
+		})
+		require.NoError(t, err)
+
+		patchedMeta, err := c.PatchCurrentNodeMetadata(ctx, []byte(`{"labels":{"node":"current"},"annotations":{"role":"worker"}}`), PatchOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "worker", patchedMeta.Metadata.Annotations["role"])
+		require.Equal(t, node.Metadata.Generation, patchedMeta.Metadata.Generation)
+
+		event := nextWatchEvent(t, metadataEvents)
+		require.Equal(t, WatchModified, event.Type)
+		require.True(t, slices.Contains(event.Changed, "metadata.labels"), event.Changed)
+
+		patchedSpec, err := c.PatchCurrentNodeSpec(ctx, []byte(`{"metadata":{"zone":"test"}}`), PatchOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "test", patchedSpec.Spec.Metadata["zone"])
+
+		statused, err := c.UpdateCurrentNodeStatus(ctx, NodeStatus{Metadata: Annotations{"ready": "true"}}, UpdateOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "true", statused.Status.Metadata["ready"])
+		require.False(t, statused.Status.LeaseUntil.IsZero())
+
+		patchedStatus, err := c.PatchCurrentNodeStatus(ctx, []byte(`{"metadata":{"ready":"true","zone":"test"}}`), PatchOptions{})
+		require.NoError(t, err)
+		require.Equal(t, "test", patchedStatus.Status.Metadata["zone"])
+		require.False(t, patchedStatus.Status.LeaseUntil.IsZero())
+
+		resources, err := c.Resources()
+		require.NoError(t, err)
+		require.True(t, slices.ContainsFunc(resources, func(info ResourceInfo) bool {
+			return info.Resource == ResourceNodes && info.Builtin
+		}))
+		require.True(t, slices.ContainsFunc(resources, func(info ResourceInfo) bool {
+			return info.Resource == "schemawidgets" && !info.Builtin
+		}))
+
+		info, err := c.Resource("schemawidgets")
+		require.NoError(t, err)
+		require.Equal(t, "Widget", info.Kind)
+		require.True(t, slices.ContainsFunc(info.Spec, func(field FieldInfo) bool {
+			return field.Path == "spec.size" && field.Required && field.Indexed
+		}))
+		require.True(t, slices.ContainsFunc(info.Annotations, func(rule AnnotationRule) bool {
+			return rule.Key == "tenant" && rule.Required && rule.Immutable && rule.Indexed
+		}))
+
+		_, err = Define(c, ResourceDef[widgetSpec, widgetStatus]{
+			Resource:   ResourceNodes,
+			APIVersion: "example.test/v1",
+			Kind:       "Node",
+		})
+		require.ErrorIs(t, err, ErrInvalidResource)
+
+		_ = widgets
 	})
 
 	t.Run("watch_replay_and_compaction", func(t *testing.T) {
@@ -542,7 +664,7 @@ func defineWidgets(t *testing.T, c *Cluster, resource string) *Resource[widgetSp
 		APIVersion: "example.test/v1",
 		Kind:       "Widget",
 		Annotations: []AnnotationRule{
-			{Key: "tenant", Required: true, Immutable: true, Indexed: true, Watch: true},
+			{Key: "tenant", Required: true, Immutable: true, Indexed: true},
 			{Key: "controller", Indexed: true, Default: "default-controller"},
 		},
 		Default: func(obj *Object[widgetSpec, widgetStatus]) error {

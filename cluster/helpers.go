@@ -72,6 +72,24 @@ func validateSpecPatch(patch []byte) error {
 	return nil
 }
 
+func validateMetadataPatch(patch []byte) error {
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(patch, &meta); err != nil {
+		return err
+	}
+	if len(meta) == 0 {
+		return ErrInvalidObject
+	}
+	for key := range meta {
+		switch key {
+		case "labels", "annotations", "finalizers":
+		default:
+			return fmt.Errorf("%w: metadata.%s is managed", ErrInvalidObject, key)
+		}
+	}
+	return nil
+}
+
 func validateRawObjectJSON(obj *Unstructured) error {
 	if err := validateRawJSONField("spec", obj.Spec); err != nil {
 		return err
@@ -145,8 +163,8 @@ func objectCursor(obj Unstructured) string {
 	return obj.APIVersion + "/" + obj.Kind + "/" + obj.Metadata.Name
 }
 
-func randomToken(prefix string, size int) (string, error) {
-	buf := make([]byte, size)
+func randomToken(prefix string) (string, error) {
+	buf := make([]byte, 18)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}

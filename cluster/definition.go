@@ -23,7 +23,6 @@ type AnnotationRule struct {
 	Required  bool
 	Immutable bool
 	Indexed   bool
-	Watch     bool
 	Default   string
 }
 
@@ -31,6 +30,7 @@ type resourceDefinition struct {
 	Resource   string
 	APIVersion string
 	Kind       string
+	Builtin    bool
 
 	annotationRules map[string]AnnotationRule
 	specRules       []fieldRule
@@ -44,7 +44,6 @@ type fieldRule struct {
 	Required  bool
 	Immutable bool
 	Indexed   bool
-	Watch     bool
 	Enum      []string
 	IndexName string
 }
@@ -116,12 +115,15 @@ func buildDefinition[S, T any](def ResourceDef[S, T]) (*resourceDefinition, erro
 		if err := validateAnnotationRules(rawDef, oldObj, newObj, subresource); err != nil {
 			return err
 		}
-		if subresource == SubresourceStatus {
+		switch subresource {
+		case SubresourceStatus:
 			if err := validateFieldRules(oldObj, newObj, rawDef.statusRules); err != nil {
 				return err
 			}
-		} else if err := validateFieldRules(oldObj, newObj, rawDef.specRules); err != nil {
-			return err
+		case SubresourceSpec:
+			if err := validateFieldRules(oldObj, newObj, rawDef.specRules); err != nil {
+				return err
+			}
 		}
 		if def.Validate == nil {
 			return nil
@@ -220,8 +222,6 @@ func parseClusterTag(path, tag string) (fieldRule, error) {
 			if hasValue {
 				rule.IndexName = value
 			}
-		case "watch":
-			rule.Watch = true
 		case "enum":
 			if !hasValue || value == "" {
 				return fieldRule{}, fmt.Errorf("%w: invalid enum rule for %s", ErrInvalidResource, path)

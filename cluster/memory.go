@@ -3,9 +3,11 @@ package cluster
 import (
 	"context"
 	"sync"
+	"time"
 )
 
 type memoryStore struct {
+	prefix    string
 	mu        sync.RWMutex
 	objects   map[string]map[string]Unstructured
 	events    []resourceEvent
@@ -16,8 +18,16 @@ type memoryStore struct {
 	closed    bool
 }
 
+var memoryNodeLeases = struct {
+	sync.Mutex
+	records map[string]nodeLeaseRecord
+}{
+	records: make(map[string]nodeLeaseRecord),
+}
+
 func newMemoryStore(options Options) *memoryStore {
 	return &memoryStore{
+		prefix:    normalizeStorePrefix(options.Prefix),
 		objects:   make(map[string]map[string]Unstructured),
 		events:    make([]resourceEvent, 0),
 		retention: options.EventRetentionCount,
@@ -181,12 +191,71 @@ func (s *memoryStore) subscribe(ctx context.Context, resource string) (<-chan st
 	return s.hub.subscribe(resource)
 }
 
+func (s *memoryStore) acquireNode(ctx context.Context, name string, ttl time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	token, err := randomToken("node")
+	if err != nil {
+		return "", err
+	}
+	memoryNodeLeases.Lock()
+	defer memoryNodeLeases.Unlock()
+	key := s.nodeLeaseKey(name)
+	now := time.Now().UTC()
+	if record, ok := memoryNodeLeases.records[key]; ok {
+		if record.ExpiresAt.After(now) {
+			return "", ErrNodeAlreadyExists
+		}
+		delete(memoryNodeLeases.records, key)
+	}
+	memoryNodeLeases.records[key] = nodeLeaseRecord{
+		Token:     token,
+		ExpiresAt: now.Add(ttl),
+	}
+	return token, nil
+}
+
+func (s *memoryStore) renewNode(ctx context.Context, name, token string, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	memoryNodeLeases.Lock()
+	defer memoryNodeLeases.Unlock()
+	key := s.nodeLeaseKey(name)
+	record, ok := memoryNodeLeases.records[key]
+	now := time.Now().UTC()
+	if !ok || record.Token != token || !record.ExpiresAt.After(now) {
+		return ErrNodeLeaseLost
+	}
+	record.ExpiresAt = now.Add(ttl)
+	memoryNodeLeases.records[key] = record
+	return nil
+}
+
+func (s *memoryStore) releaseNode(ctx context.Context, name, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	memoryNodeLeases.Lock()
+	defer memoryNodeLeases.Unlock()
+	key := s.nodeLeaseKey(name)
+	if record, ok := memoryNodeLeases.records[key]; ok && record.Token == token {
+		delete(memoryNodeLeases.records, key)
+	}
+	return nil
+}
+
 func (s *memoryStore) close() error {
 	s.mu.Lock()
 	s.closed = true
 	s.mu.Unlock()
 	s.hub.close()
 	return nil
+}
+
+func (s *memoryStore) nodeLeaseKey(name string) string {
+	return s.prefix + "leases/nodes/" + name
 }
 
 func (s *memoryStore) enforceRetentionLocked() {

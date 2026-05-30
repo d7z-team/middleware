@@ -84,6 +84,10 @@ func (r *UnstructuredResource) drainEvents(
 	lastRV *uint64,
 	out chan<- UnstructuredWatchEvent,
 ) (uint64, bool) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		sendWatchError(ctx, out, err)
+		return *lastRV, false
+	}
 	latestSeen := *lastRV
 	for {
 		events, latest, err := r.cluster.store.eventsAfter(ctx, *lastRV, r.def.Resource, defaultEventBatchSize)

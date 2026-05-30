@@ -3,6 +3,7 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -19,6 +20,9 @@ func (r *UnstructuredResource) Create(
 	obj *Unstructured,
 	opts CreateOptions,
 ) (*Unstructured, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	if obj == nil {
 		return nil, ErrInvalidObject
 	}
@@ -52,7 +56,7 @@ func (r *UnstructuredResource) Create(
 		return nil, fmt.Errorf("%w: default changed object identity", ErrInvalidObject)
 	}
 	now := time.Now().UTC()
-	uid, err := randomToken("uid", 18)
+	uid, err := randomToken("uid")
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +87,9 @@ func (r *UnstructuredResource) Create(
 }
 
 func (r *UnstructuredResource) Get(ctx context.Context, name string) (*Unstructured, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	ref, err := r.ref(name)
 	if err != nil {
 		return nil, err
@@ -91,6 +98,9 @@ func (r *UnstructuredResource) Get(ctx context.Context, name string) (*Unstructu
 }
 
 func (r *UnstructuredResource) List(ctx context.Context, opts ListOptions) (*UnstructuredList, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	objects, rv, err := r.cluster.store.list(ctx, r.def.Resource)
 	if err != nil {
 		return nil, err
@@ -131,6 +141,9 @@ func (r *UnstructuredResource) Update(
 	obj *Unstructured,
 	opts UpdateOptions,
 ) (*Unstructured, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	if obj == nil {
 		return nil, ErrInvalidObject
 	}
@@ -174,6 +187,9 @@ func (r *UnstructuredResource) Patch(
 	patch []byte,
 	opts PatchOptions,
 ) (*Unstructured, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	if len(bytes.TrimSpace(patch)) == 0 {
 		return nil, ErrInvalidObject
 	}
@@ -229,12 +245,76 @@ func (r *UnstructuredResource) Patch(
 	return nil, lastErr
 }
 
+func (r *UnstructuredResource) PatchMetadata(
+	ctx context.Context,
+	name string,
+	patch []byte,
+	opts PatchOptions,
+) (*Unstructured, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(patch)) == 0 {
+		return nil, ErrInvalidObject
+	}
+	ref, err := r.ref(name)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateMetadataPatch(patch); err != nil {
+		return nil, err
+	}
+	expected, err := parseOptionalRV(opts.ResourceVersion)
+	if err != nil {
+		return nil, err
+	}
+	attempts := 1
+	if expected == 0 {
+		attempts = maxMutationRetries
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		oldObj, err := r.cluster.store.get(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		oldRV := parseStoredRV(oldObj.Metadata.ResourceVersion)
+		if expected != 0 && oldRV != expected {
+			return nil, ErrConflict
+		}
+		updated, err := r.prepareMetadataUpdate(*oldObj, patch)
+		if err != nil {
+			return nil, err
+		}
+		out, err := r.commit(ctx, commitRequest{
+			Op:               commitUpdate,
+			Ref:              ref,
+			ExpectedRV:       oldRV,
+			Object:           &updated,
+			EventType:        WatchModified,
+			EventAnnotations: opts.EventAnnotations,
+			Changed:          changedPaths(oldObj, &updated, SubresourceMetadata),
+		})
+		if err == nil {
+			return out, nil
+		}
+		if !errors.Is(err, ErrConflict) || expected != 0 {
+			return nil, err
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 func (r *UnstructuredResource) UpdateStatus(
 	ctx context.Context,
 	name string,
 	status []byte,
 	opts UpdateOptions,
 ) (*Unstructured, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	ref, err := r.ref(name)
 	if err != nil {
 		return nil, err
@@ -255,6 +335,9 @@ func (r *UnstructuredResource) PatchStatus(
 	patch []byte,
 	opts PatchOptions,
 ) (*Unstructured, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	if len(bytes.TrimSpace(patch)) == 0 {
 		return nil, ErrInvalidObject
 	}
@@ -277,6 +360,9 @@ func (r *UnstructuredResource) PatchStatus(
 }
 
 func (r *UnstructuredResource) Delete(ctx context.Context, name string, opts DeleteOptions) (*Unstructured, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	ref, err := r.ref(name)
 	if err != nil {
 		return nil, err
@@ -336,6 +422,9 @@ func (r *UnstructuredResource) Watch(
 	ctx context.Context,
 	opts WatchOptions,
 ) (<-chan UnstructuredWatchEvent, error) {
+	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
 	if err := validateWatchScope(opts.Scope); err != nil {
 		return nil, err
 	}
@@ -435,6 +524,35 @@ func (r *UnstructuredResource) mutateStatus(
 		lastErr = err
 	}
 	return nil, lastErr
+}
+
+func (r *UnstructuredResource) prepareMetadataUpdate(oldObj Unstructured, patch []byte) (Unstructured, error) {
+	raw, err := json.Marshal(oldObj.Metadata)
+	if err != nil {
+		return Unstructured{}, err
+	}
+	merged, err := applyMergePatch(raw, patch)
+	if err != nil {
+		return Unstructured{}, err
+	}
+	var metadata Metadata
+	if err := json.Unmarshal(merged, &metadata); err != nil {
+		return Unstructured{}, err
+	}
+	updated := cloneUnstructured(oldObj)
+	updated.Metadata.Labels = cloneLabels(metadata.Labels)
+	updated.Metadata.Annotations = cloneAnnotations(metadata.Annotations)
+	updated.Metadata.Finalizers = append([]string(nil), metadata.Finalizers...)
+	updated.Metadata.UpdatedAt = time.Now().UTC()
+	ensureMetadataMaps(&updated.Metadata)
+	applyAnnotationDefaults(r.def, &updated)
+	if err := validateMetadata(updated.Metadata); err != nil {
+		return Unstructured{}, err
+	}
+	if err := r.def.validateObject(&oldObj, &updated, SubresourceMetadata); err != nil {
+		return Unstructured{}, err
+	}
+	return updated, nil
 }
 
 func (r *UnstructuredResource) prepareSpecUpdate(oldObj, input Unstructured) (Unstructured, error) {

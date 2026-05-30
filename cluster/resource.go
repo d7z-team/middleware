@@ -83,6 +83,14 @@ func (r *Resource[S, T]) Patch(ctx context.Context, name string, patch []byte, o
 	return unstructuredToTyped[S, T](out)
 }
 
+func (r *Resource[S, T]) PatchMetadata(ctx context.Context, name string, patch []byte, opts PatchOptions) (*Object[S, T], error) {
+	out, err := r.raw.PatchMetadata(ctx, name, patch, opts)
+	if err != nil {
+		return nil, err
+	}
+	return unstructuredToTyped[S, T](out)
+}
+
 func (r *Resource[S, T]) UpdateStatus(ctx context.Context, name string, status T, opts UpdateOptions) (*Object[S, T], error) {
 	rawStatus, err := marshalValue(status)
 	if err != nil {

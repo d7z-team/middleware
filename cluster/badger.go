@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 )
@@ -249,6 +250,90 @@ func (s *badgerStore) subscribe(ctx context.Context, resource string) (<-chan st
 	return s.hub.subscribe(resource)
 }
 
+func (s *badgerStore) acquireNode(ctx context.Context, name string, ttl time.Duration) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	token, err := randomToken("node")
+	if err != nil {
+		return "", err
+	}
+	now := time.Now().UTC()
+	record := nodeLeaseRecord{Token: token, ExpiresAt: now.Add(ttl)}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return "", err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return "", ErrClosed
+	}
+	err = s.db.Update(func(txn *badger.Txn) error {
+		current, exists, err := s.getNodeLeaseTxn(txn, name)
+		if err != nil {
+			return err
+		}
+		if exists && current.ExpiresAt.After(now) {
+			return ErrNodeAlreadyExists
+		}
+		return txn.Set([]byte(s.nodeLeaseKey(name)), raw)
+	})
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func (s *badgerStore) renewNode(ctx context.Context, name, token string, ttl time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	now := time.Now().UTC()
+	return s.db.Update(func(txn *badger.Txn) error {
+		record, exists, err := s.getNodeLeaseTxn(txn, name)
+		if err != nil {
+			return err
+		}
+		if !exists || record.Token != token || !record.ExpiresAt.After(now) {
+			return ErrNodeLeaseLost
+		}
+		record.ExpiresAt = now.Add(ttl)
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		return txn.Set([]byte(s.nodeLeaseKey(name)), raw)
+	})
+}
+
+func (s *badgerStore) releaseNode(ctx context.Context, name, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	return s.db.Update(func(txn *badger.Txn) error {
+		record, exists, err := s.getNodeLeaseTxn(txn, name)
+		if err != nil || !exists || record.Token != token {
+			return err
+		}
+		err = txn.Delete([]byte(s.nodeLeaseKey(name)))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		return err
+	})
+}
+
 func (s *badgerStore) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -275,6 +360,23 @@ func (s *badgerStore) getObjectTxn(txn *badger.Txn, ref objectRef) (Unstructured
 		return Unstructured{}, false, err
 	}
 	return obj, true, nil
+}
+
+func (s *badgerStore) getNodeLeaseTxn(txn *badger.Txn, name string) (nodeLeaseRecord, bool, error) {
+	item, err := txn.Get([]byte(s.nodeLeaseKey(name)))
+	if err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nodeLeaseRecord{}, false, nil
+		}
+		return nodeLeaseRecord{}, false, err
+	}
+	var record nodeLeaseRecord
+	if err := item.Value(func(value []byte) error {
+		return json.Unmarshal(value, &record)
+	}); err != nil {
+		return nodeLeaseRecord{}, false, err
+	}
+	return record, true, nil
 }
 
 func (s *badgerStore) currentRV(txn *badger.Txn) (uint64, error) {
@@ -420,4 +522,8 @@ func (s *badgerStore) eventAllKey(rv uint64) string {
 
 func (s *badgerStore) eventResourceKey(resource string, rv uint64) string {
 	return s.eventPrefix(resource) + rvKey(rv)
+}
+
+func (s *badgerStore) nodeLeaseKey(name string) string {
+	return s.prefix + "leases/nodes/" + name
 }

@@ -3,7 +3,7 @@
 ## 创建 Cluster
 
 ```go
-c, err := cluster.NewClusterFromURL("memory://?watch_buffer_size=256")
+c, err := cluster.NewClusterFromURL("memory://?node=worker-a&watch_buffer_size=256")
 if err != nil {
 	return err
 }
@@ -14,16 +14,19 @@ defer c.Close()
 
 | URL | 用途 |
 | --- | --- |
-| `memory://` | 进程内存储 |
-| `mem://` | `memory://` 的简写 |
-| `badger:///path/to/db?prefix=app` | 本地持久化存储 |
-| `etcd://127.0.0.1:2379?prefix=app` | etcd 存储 |
+| `memory://?node=worker-a` | 进程内存储 |
+| `mem://?node=worker-a` | `memory://` 的简写 |
+| `badger:///path/to/db?node=worker-a&prefix=app` | 本地持久化存储 |
+| `etcd://127.0.0.1:2379?node=worker-a&prefix=app` | etcd 存储 |
 
 可用参数：
 
 | 参数 | 说明 |
 | --- | --- |
+| `node` | 当前实例的 node 名称，必填，同一 backend/prefix 下不能重复 |
 | `prefix` | 存储前缀 |
+| `node_lease_ttl` | node lease TTL，默认 `30s` |
+| `node_renew_interval` | node lease 续约间隔，默认 `10s`，必须小于 TTL |
 | `event_retention_count` | 保留的 watch 事件数量，默认 `2000`，传入时必须大于 `0` |
 | `watch_buffer_size` | 每个 watch channel 的缓冲大小，默认 `256` |
 
@@ -33,12 +36,12 @@ defer c.Close()
 
 ```go
 type WidgetSpec struct {
-	Size  string `json:"size,omitempty" cluster:"required,enum=small|medium|large,index,watch"`
+	Size  string `json:"size,omitempty" cluster:"required,enum=small|medium|large,index"`
 	Owner string `json:"owner,omitempty" cluster:"immutable,index=owner"`
 }
 
 type WidgetStatus struct {
-	Phase string `json:"phase,omitempty" cluster:"enum=Pending|Ready|Failed,index=phase,watch"`
+	Phase string `json:"phase,omitempty" cluster:"enum=Pending|Ready|Failed,index=phase"`
 }
 
 widgets, err := cluster.Define(c, cluster.ResourceDef[WidgetSpec, WidgetStatus]{
@@ -46,7 +49,7 @@ widgets, err := cluster.Define(c, cluster.ResourceDef[WidgetSpec, WidgetStatus]{
 	APIVersion: "example.test/v1",
 	Kind:       "Widget",
 	Annotations: []cluster.AnnotationRule{
-		{Key: "tenant", Required: true, Immutable: true, Indexed: true, Watch: true},
+		{Key: "tenant", Required: true, Immutable: true, Indexed: true},
 		{Key: "controller", Default: "default-controller", Indexed: true},
 	},
 	Default: func(obj *cluster.Object[WidgetSpec, WidgetStatus]) error {
@@ -79,7 +82,7 @@ if err != nil {
 | `Kind` | 对象的 `kind` |
 | `Annotations` | metadata annotation 规则 |
 | `Default` | 创建或更新 spec 时填默认值 |
-| `Validate` | 创建、更新 spec、更新 status 时做校验 |
+| `Validate` | 创建、更新 spec、更新 metadata、更新 status 时做校验 |
 
 资源名不能是空值、`.`、`..`，也不能包含 `/` 或 `\`。
 
@@ -89,7 +92,7 @@ if err != nil {
 
 ```go
 type WidgetSpec struct {
-	Size  string `json:"size,omitempty" cluster:"required,enum=small|medium|large,index,watch"`
+	Size  string `json:"size,omitempty" cluster:"required,enum=small|medium|large,index"`
 	Owner string `json:"owner,omitempty" cluster:"immutable,index=owner"`
 }
 ```
@@ -103,7 +106,6 @@ type WidgetSpec struct {
 | `immutable` | 对象创建后字段不可修改 |
 | `index` | 声明字段用于查询 |
 | `index=name` | 声明字段索引名 |
-| `watch` | 声明字段用于 watch 关注 |
 
 字段路径按 JSON 字段名生成，例如 `Size` 的路径是 `spec.size`，`Phase` 的路径是
 `status.phase`。
@@ -132,7 +134,7 @@ if err != nil {
 
 ```go
 Annotations: []cluster.AnnotationRule{
-	{Key: "tenant", Required: true, Immutable: true, Indexed: true, Watch: true},
+	{Key: "tenant", Required: true, Immutable: true, Indexed: true},
 	{Key: "controller", Default: "default-controller", Indexed: true},
 },
 ```
@@ -146,16 +148,16 @@ Annotations: []cluster.AnnotationRule{
 | `Immutable` | 创建后不能修改 |
 | `Default` | 未提供时填入默认值 |
 | `Indexed` | 声明注解用于查询 |
-| `Watch` | 声明注解用于 watch 关注 |
 
-修改 metadata 注解使用 `Patch`：
+修改 metadata 使用 `PatchMetadata`：
 
 ```go
-patched, err := widgets.Patch(ctx, created.Metadata.Name, []byte(`{
-	"metadata": {
-		"annotations": {
-			"owner": "platform"
-		}
+patched, err := widgets.PatchMetadata(ctx, created.Metadata.Name, []byte(`{
+	"labels": {
+		"app": "demo"
+	},
+	"annotations": {
+		"owner": "platform"
 	}
 }`), cluster.PatchOptions{
 	ResourceVersion: created.Metadata.ResourceVersion,
@@ -254,7 +256,8 @@ if err != nil {
 ```
 
 普通 `Update` 和 `Patch` 只能修改 `metadata.labels`、`metadata.annotations`、
-`metadata.finalizers` 和 `spec`。`status` 需要使用 status 方法修改。
+`metadata.finalizers` 和 `spec`。推荐使用 `PatchMetadata` 修改 metadata，
+`PatchMetadata` 不会递增 `Metadata.Generation`。`status` 需要使用 status 方法修改。
 
 ## 更新 status
 
@@ -290,8 +293,9 @@ status 更新不会递增 `Metadata.Generation`。
 list, err := widgets.List(ctx, cluster.ListOptions{
 	Limit: 100,
 	Selector: cluster.Where(
-		cluster.Label("app").Eq("demo"),
+		cluster.Label("app").In("demo", "worker"),
 		cluster.Annotation("tenant").Eq("t1"),
+		cluster.Annotation("tenant").Exists(),
 		cluster.Field("status.phase").Eq("Ready"),
 	),
 })
@@ -319,6 +323,10 @@ for list.Continue != "" {
 | 写法 | 说明 |
 | --- | --- |
 | `cluster.Label("app").Eq("demo")` | 匹配 label |
+| `cluster.Label("app").NotEq("demo")` | label 不等于指定值，缺失也会匹配 |
+| `cluster.Label("app").In("api", "worker")` | label 在集合内 |
+| `cluster.Label("app").NotIn("api", "worker")` | label 不在集合内，缺失也会匹配 |
+| `cluster.Label("app").Exists()` | label 存在 |
 | `cluster.Annotation("tenant").Eq("t1")` | 匹配 annotation |
 | `cluster.Field("metadata.name").Eq("alpha")` | 匹配 metadata 字段 |
 | `cluster.Field("spec.size").Eq("large")` | 匹配 spec 字段 |
@@ -453,8 +461,8 @@ _ = deleted
 有 finalizer 时，第一次 `Delete` 只设置 `Metadata.DeletedAt`，对象仍然可以读取：
 
 ```go
-withFinalizer, err := widgets.Patch(ctx, "alpha", []byte(`{
-	"metadata": {"finalizers": ["cleanup.example.test"]}
+withFinalizer, err := widgets.PatchMetadata(ctx, "alpha", []byte(`{
+	"finalizers": ["cleanup.example.test"]
 }`), cluster.PatchOptions{})
 if err != nil {
 	return err
@@ -472,8 +480,8 @@ _ = deleting.Metadata.DeletedAt
 清理完成后，先清空 finalizer，再次调用 `Delete` 删除对象本身：
 
 ```go
-cleared, err := widgets.Patch(ctx, deleting.Metadata.Name, []byte(`{
-	"metadata": {"finalizers": []}
+cleared, err := widgets.PatchMetadata(ctx, deleting.Metadata.Name, []byte(`{
+	"finalizers": []
 }`), cluster.PatchOptions{
 	ResourceVersion: deleting.Metadata.ResourceVersion,
 })
@@ -498,6 +506,80 @@ if err := c.Compact(ctx, list.ResourceVersion); err != nil {
 ```
 
 压缩后，从更早版本开始的 watch 会收到 `ErrResourceVersionTooOld`。
+
+## Node
+
+每个 cluster 实例必须使用唯一的 node 名称启动。启动时会获取 node lease，同一
+backend/prefix 下同名 node 不能同时存在。`Close` 会释放 lease，进程崩溃后需要等待
+`node_lease_ttl` 过期后才能复用同名 node。
+
+当前实例的 node 可以直接查询和修改：
+
+```go
+node, err := c.CurrentNode(ctx)
+if err != nil {
+	return err
+}
+_ = node.Metadata.Name
+
+node, err = c.PatchCurrentNodeMetadata(ctx, []byte(`{
+	"labels": {"role": "worker"},
+	"annotations": {"zone": "test"}
+}`), cluster.PatchOptions{})
+if err != nil {
+	return err
+}
+
+node, err = c.PatchCurrentNodeSpec(ctx, []byte(`{
+	"metadata": {"owner": "platform"}
+}`), cluster.PatchOptions{})
+if err != nil {
+	return err
+}
+
+node, err = c.UpdateCurrentNodeStatus(ctx, cluster.NodeStatus{
+	Metadata: cluster.Annotations{"ready": "true"},
+}, cluster.UpdateOptions{})
+if err != nil {
+	return err
+}
+```
+
+也可以通过内置资源 `nodes` 做列表和 watch：
+
+```go
+nodes := c.Nodes()
+nodeList, err := nodes.List(ctx, cluster.ListOptions{})
+if err != nil {
+	return err
+}
+_ = nodeList
+```
+
+## 资源信息
+
+查询已注册资源和 schema：
+
+```go
+resources, err := c.Resources()
+if err != nil {
+	return err
+}
+for _, resource := range resources {
+	_ = resource.Resource
+	_ = resource.Builtin
+}
+
+info, err := c.Resource("widgets")
+if err != nil {
+	return err
+}
+_ = info.Spec
+_ = info.Status
+_ = info.Annotations
+```
+
+内置 `nodes` 也会出现在 `Resources` 返回值中。资源定义只支持查询，不支持 watch。
 
 ## Unstructured
 
@@ -554,4 +636,6 @@ default:
 | `ErrNotFound` | 对象不存在 |
 | `ErrConflict` | `resourceVersion` 冲突 |
 | `ErrResourceVersionTooOld` | watch 起始版本早于已保留事件 |
+| `ErrNodeAlreadyExists` | 同一 backend/prefix 下 node 名称已被占用 |
+| `ErrNodeLeaseLost` | 当前实例丢失 node lease |
 | `ErrClosed` | cluster 已关闭 |

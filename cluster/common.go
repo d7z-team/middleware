@@ -2,7 +2,7 @@
 //
 // Example:
 //
-//	c, _ := NewClusterFromURL("memory://")
+//	c, _ := NewClusterFromURL("memory://?node=worker-a")
 //	defer c.Close()
 //
 //	type WidgetSpec struct {
@@ -37,6 +37,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.d7z.net/middleware/connects"
 )
@@ -45,24 +46,27 @@ import (
 //
 // Supported schemes:
 //   - memory:// and mem://
-//   - badger:///path/to/db
-//   - etcd://127.0.0.1:2379?prefix=app
+//   - badger:///path/to/db?node=worker-a
+//   - etcd://127.0.0.1:2379?node=worker-a&prefix=app
 //
 // Supported query parameters:
+//   - node: required unique node name for this cluster client
 //   - prefix: backend key prefix for badger and etcd
+//   - node_lease_ttl: node lease TTL, default 30s
+//   - node_renew_interval: node lease renew interval, default 10s
 //   - event_retention_count: number of recent watch events to retain, default 2000
 //   - watch_buffer_size: per-watch channel buffer size
 //
 // Example:
 //
-//	c, _ := NewClusterFromURL("badger:///var/lib/app/cluster?prefix=control")
+//	c, _ := NewClusterFromURL("badger:///var/lib/app/cluster?node=worker-a&prefix=control")
 //	defer c.Close()
 //
 //	type JobSpec struct {
 //		Owner string `json:"owner,omitempty" cluster:"required,index"`
 //	}
 //	type JobStatus struct {
-//		Phase string `json:"phase,omitempty" cluster:"index=phase,watch"`
+//		Phase string `json:"phase,omitempty" cluster:"index=phase"`
 //	}
 //
 //	jobs, _ := Define(c, ResourceDef[JobSpec, JobStatus]{
@@ -105,7 +109,24 @@ func NewClusterFromURL(raw string) (*Cluster, error) {
 
 func clusterOptionsFromURL(parsed *url.URL) (Options, error) {
 	query := parsed.Query()
-	options := Options{Prefix: query.Get("prefix")}
+	options := Options{
+		Prefix:   query.Get("prefix"),
+		NodeName: query.Get("node"),
+	}
+	if value := query.Get("node_lease_ttl"); value != "" {
+		parsedValue, err := time.ParseDuration(value)
+		if err != nil || parsedValue <= 0 {
+			return Options{}, fmt.Errorf("%w: invalid node_lease_ttl", ErrInvalidConfig)
+		}
+		options.NodeLeaseTTL = parsedValue
+	}
+	if value := query.Get("node_renew_interval"); value != "" {
+		parsedValue, err := time.ParseDuration(value)
+		if err != nil || parsedValue <= 0 {
+			return Options{}, fmt.Errorf("%w: invalid node_renew_interval", ErrInvalidConfig)
+		}
+		options.NodeRenewInterval = parsedValue
+	}
 	if value := query.Get("event_retention_count"); value != "" {
 		parsedValue, err := strconv.Atoi(value)
 		if err != nil || parsedValue <= 0 {

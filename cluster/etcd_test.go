@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"testing"
@@ -13,6 +14,33 @@ import (
 
 func TestClusterURLContractEtcdBackend(t *testing.T) {
 	runClusterURLContract(t, newEtcdURLFactory(t))
+}
+
+func TestEtcdNodeLeaseLost(t *testing.T) {
+	c := newURLCluster(t, newEtcdURLFactory(t), url.Values{
+		"node_lease_ttl":        {"2s"},
+		"node_renew_interval":   {"100ms"},
+		"event_retention_count": {"10"},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	require.NoError(t, c.store.releaseNode(ctx, c.options.NodeName, c.nodeToken))
+	cancel()
+
+	deadline := time.After(3 * time.Second)
+	for {
+		callCtx, callCancel := context.WithTimeout(context.Background(), time.Second)
+		_, err := c.CurrentNode(callCtx)
+		callCancel()
+		if errors.Is(err, ErrNodeLeaseLost) {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected node lease loss, last error: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func newEtcdURLFactory(t *testing.T) clusterURLFactory {
@@ -45,6 +73,9 @@ func newEtcdURLFactory(t *testing.T) clusterURLFactory {
 			t.Helper()
 			counter++
 			query.Set("prefix", fmt.Sprintf("%s/%d", basePrefix, counter))
+			if query.Get("node") == "" {
+				query.Set("node", fmt.Sprintf("etcd-%d", counter))
+			}
 			query.Set("dial_timeout", "300ms")
 			return (&url.URL{
 				Scheme:   "etcd",

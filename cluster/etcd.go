@@ -265,6 +265,73 @@ func (s *etcdStore) subscribe(ctx context.Context, resource string) (<-chan stru
 	return out, cancelWatch, nil
 }
 
+func (s *etcdStore) acquireNode(ctx context.Context, name string, ttl time.Duration) (string, error) {
+	if err := s.ensureOpen(ctx); err != nil {
+		return "", err
+	}
+	token, err := randomToken("node")
+	if err != nil {
+		return "", err
+	}
+	lease, err := s.client.Grant(ctx, etcdLeaseSeconds(ttl))
+	if err != nil {
+		return "", err
+	}
+	resp, err := s.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.Version(s.nodeLeaseKey(name)), "=", 0)).
+		Then(clientv3.OpPut(s.nodeLeaseKey(name), token, clientv3.WithLease(lease.ID))).
+		Commit()
+	if err != nil {
+		_, _ = s.client.Revoke(context.Background(), lease.ID)
+		return "", err
+	}
+	if !resp.Succeeded {
+		_, _ = s.client.Revoke(context.Background(), lease.ID)
+		return "", ErrNodeAlreadyExists
+	}
+	return token, nil
+}
+
+func (s *etcdStore) renewNode(ctx context.Context, name, token string, ttl time.Duration) error {
+	if err := s.ensureOpen(ctx); err != nil {
+		return err
+	}
+	lease, err := s.client.Grant(ctx, etcdLeaseSeconds(ttl))
+	if err != nil {
+		return err
+	}
+	resp, err := s.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(s.nodeLeaseKey(name)), "=", token)).
+		Then(clientv3.OpPut(s.nodeLeaseKey(name), token, clientv3.WithLease(lease.ID))).
+		Commit()
+	if err != nil {
+		_, _ = s.client.Revoke(context.Background(), lease.ID)
+		return err
+	}
+	if !resp.Succeeded {
+		_, _ = s.client.Revoke(context.Background(), lease.ID)
+		return ErrNodeLeaseLost
+	}
+	return nil
+}
+
+func (s *etcdStore) releaseNode(ctx context.Context, name, token string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	closed := s.closed
+	s.mu.RUnlock()
+	if closed {
+		return nil
+	}
+	_, err := s.client.Txn(ctx).
+		If(clientv3.Compare(clientv3.Value(s.nodeLeaseKey(name)), "=", token)).
+		Then(clientv3.OpDelete(s.nodeLeaseKey(name))).
+		Commit()
+	return err
+}
+
 func (s *etcdStore) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -409,4 +476,19 @@ func (s *etcdStore) notifyKey(resource string) string {
 		return s.prefix + "notify/all"
 	}
 	return s.prefix + "notify/resources/" + resource
+}
+
+func (s *etcdStore) nodeLeaseKey(name string) string {
+	return s.prefix + "leases/nodes/" + name
+}
+
+func etcdLeaseSeconds(ttl time.Duration) int64 {
+	seconds := int64(ttl / time.Second)
+	if ttl%time.Second != 0 {
+		seconds++
+	}
+	if seconds < 1 {
+		return 1
+	}
+	return seconds
 }

@@ -13,6 +13,10 @@ const (
 	defaultEventBatchSize      = 512
 	defaultListLimit           = 100
 	maxMutationRetries         = 8
+	defaultNodeLeaseTTL        = 30 * time.Second
+	defaultNodeRenewInterval   = 10 * time.Second
+
+	ResourceNodes = "nodes"
 )
 
 var (
@@ -25,11 +29,19 @@ var (
 	ErrConflict              = errors.New("cluster: resource version conflict")
 	ErrResourceVersionTooOld = errors.New("cluster: resource version too old")
 	ErrUnsupported           = errors.New("cluster: unsupported operation")
+	ErrNodeAlreadyExists     = errors.New("cluster: node already exists")
+	ErrNodeLeaseLost         = errors.New("cluster: node lease lost")
 )
 
 type Options struct {
 	// Prefix scopes persistent keys for badger and etcd backends.
 	Prefix string
+	// NodeName identifies this cluster client instance and is required.
+	NodeName string
+	// NodeLeaseTTL controls how long another process must wait after a crash before reusing this node name.
+	NodeLeaseTTL time.Duration
+	// NodeRenewInterval controls how often the node lease is renewed.
+	NodeRenewInterval time.Duration
 	// EventRetentionCount keeps only the newest N events. Zero uses the default.
 	EventRetentionCount int
 	// WatchBufferSize controls each Watch result channel buffer.
@@ -61,6 +73,16 @@ type Metadata struct {
 	Finalizers      []string    `json:"finalizers,omitempty"`
 }
 
+type NodeSpec struct {
+	Metadata Annotations `json:"metadata,omitempty"`
+}
+
+type NodeStatus struct {
+	Metadata   Annotations `json:"metadata,omitempty"`
+	LeaseUntil time.Time   `json:"leaseUntil,omitempty"`
+	UpdatedAt  time.Time   `json:"updatedAt,omitempty"`
+}
+
 type ObjectList[S, T any] struct {
 	Items           []Object[S, T] `json:"items"`
 	ResourceVersion string         `json:"resourceVersion"`
@@ -89,8 +111,9 @@ type objectRef struct {
 type Subresource string
 
 const (
-	SubresourceSpec   Subresource = "spec"
-	SubresourceStatus Subresource = "status"
+	SubresourceSpec     Subresource = "spec"
+	SubresourceMetadata Subresource = "metadata"
+	SubresourceStatus   Subresource = "status"
 )
 
 type CreateOptions struct {
@@ -166,6 +189,25 @@ type UnstructuredWatchEvent struct {
 	Error           error          `json:"-"`
 }
 
+type ResourceInfo struct {
+	Resource    string
+	APIVersion  string
+	Kind        string
+	Spec        []FieldInfo
+	Status      []FieldInfo
+	Annotations []AnnotationRule
+	Builtin     bool
+}
+
+type FieldInfo struct {
+	Path      string
+	Required  bool
+	Immutable bool
+	Indexed   bool
+	IndexName string
+	Enum      []string
+}
+
 type resourceEvent struct {
 	Type            WatchEventType `json:"type"`
 	ResourceVersion string         `json:"resourceVersion"`
@@ -175,6 +217,11 @@ type resourceEvent struct {
 	Changed         []string       `json:"changed,omitempty"`
 }
 
+type nodeLeaseRecord struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expiresAt"`
+}
+
 type resourceStore interface {
 	get(context.Context, objectRef) (*Unstructured, error)
 	list(context.Context, string) ([]Unstructured, uint64, error)
@@ -182,6 +229,9 @@ type resourceStore interface {
 	eventsAfter(context.Context, uint64, string, int) ([]resourceEvent, uint64, error)
 	compact(context.Context, uint64) error
 	subscribe(context.Context, string) (<-chan struct{}, func(), error)
+	acquireNode(context.Context, string, time.Duration) (string, error)
+	renewNode(context.Context, string, string, time.Duration) error
+	releaseNode(context.Context, string, string) error
 	close() error
 }
 
