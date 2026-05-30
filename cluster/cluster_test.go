@@ -57,10 +57,38 @@ func TestClusterFromURLValidation(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?event_retention_count=-1")
 	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?event_retention_count=0")
+	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?watch_buffer_size=0")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("badger://")
 	require.ErrorIs(t, err, ErrInvalidConfig)
+}
+
+func TestClusterDefaultEventRetention(t *testing.T) {
+	ctx := testContext(t, 10*time.Second)
+	c := newURLCluster(t, clusterURLFactory{
+		name: "memory",
+		raw: func(t *testing.T, query url.Values) string {
+			t.Helper()
+			return (&url.URL{Scheme: "memory", RawQuery: query.Encode()}).String()
+		},
+	}, nil)
+	widgets := defineWidgets(t, c, "retentionwidgets")
+
+	for i := 0; i < defaultEventRetentionCount+2; i++ {
+		_, err := widgets.Create(ctx, fmt.Sprintf("item-%04d", i), widgetSpec{Size: "small"}, CreateOptions{
+			Annotations: Annotations{"tenant": "t1"},
+		})
+		require.NoError(t, err)
+	}
+
+	watchCtx := testContext(t, 3*time.Second)
+	events, err := widgets.Watch(watchCtx, WatchOptions{Since: "1"})
+	require.NoError(t, err)
+	event := nextWatchEvent(t, events)
+	require.Equal(t, WatchError, event.Type)
+	require.ErrorIs(t, event.Error, ErrResourceVersionTooOld)
 }
 
 func TestBadgerURLPersistsTypedObjects(t *testing.T) {

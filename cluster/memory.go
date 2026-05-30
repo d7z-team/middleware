@@ -190,7 +190,7 @@ func (s *memoryStore) close() error {
 }
 
 func (s *memoryStore) enforceRetentionLocked() {
-	if s.retention <= 0 || len(s.events) <= s.retention {
+	if len(s.events) <= s.retention {
 		return
 	}
 	remove := len(s.events) - s.retention

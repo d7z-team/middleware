@@ -145,9 +145,7 @@ func (s *etcdStore) commit(ctx context.Context, req commitRequest) (*Unstructure
 			return nil, resourceEvent{}, err
 		}
 		if txnResp.Succeeded {
-			if s.retention > 0 {
-				_ = s.enforceRetention(ctx, s.retention)
-			}
+			_ = s.enforceRetention(ctx, s.retention)
 			return cloneUnstructuredPtr(&out), event, nil
 		}
 		lastErr = ErrConflict

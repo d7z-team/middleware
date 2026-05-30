@@ -171,10 +171,7 @@ func (s *badgerStore) commit(ctx context.Context, req commitRequest) (*Unstructu
 		if err := s.setRV(txn, nextRV); err != nil {
 			return err
 		}
-		if s.retention > 0 {
-			return s.enforceRetentionTxn(txn, s.retention)
-		}
-		return nil
+		return s.enforceRetentionTxn(txn, s.retention)
 	})
 	if err != nil {
 		return nil, resourceEvent{}, err

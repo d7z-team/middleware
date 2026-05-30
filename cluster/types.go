@@ -8,10 +8,11 @@ import (
 )
 
 const (
-	defaultWatchBufferSize = 256
-	defaultEventBatchSize  = 512
-	defaultListLimit       = 100
-	maxMutationRetries     = 8
+	defaultWatchBufferSize     = 256
+	defaultEventRetentionCount = 2000
+	defaultEventBatchSize      = 512
+	defaultListLimit           = 100
+	maxMutationRetries         = 8
 )
 
 var (
@@ -29,7 +30,7 @@ var (
 type Options struct {
 	// Prefix scopes persistent keys for badger and etcd backends.
 	Prefix string
-	// EventRetentionCount keeps only the newest N events when greater than 0.
+	// EventRetentionCount keeps only the newest N events. Zero uses the default.
 	EventRetentionCount int
 	// WatchBufferSize controls each Watch result channel buffer.
 	WatchBufferSize int

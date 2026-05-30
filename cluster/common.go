@@ -2,7 +2,7 @@
 //
 // Example:
 //
-//	c, _ := NewClusterFromURL("memory://?event_retention_count=100")
+//	c, _ := NewClusterFromURL("memory://")
 //	defer c.Close()
 //
 //	type WidgetSpec struct {
@@ -48,7 +48,7 @@ import (
 //
 // Supported query parameters:
 //   - prefix: backend key prefix for badger and etcd
-//   - event_retention_count: number of recent watch events to retain
+//   - event_retention_count: number of recent watch events to retain, default 2000
 //   - watch_buffer_size: per-watch channel buffer size
 //
 // Example:
@@ -106,7 +106,7 @@ func clusterOptionsFromURL(parsed *url.URL) (Options, error) {
 	options := Options{Prefix: query.Get("prefix")}
 	if value := query.Get("event_retention_count"); value != "" {
 		parsedValue, err := strconv.Atoi(value)
-		if err != nil || parsedValue < 0 {
+		if err != nil || parsedValue <= 0 {
 			return Options{}, fmt.Errorf("%w: invalid event_retention_count", ErrInvalidConfig)
 		}
 		options.EventRetentionCount = parsedValue

@@ -21,12 +21,17 @@ type Cluster struct {
 }
 
 func OpenMemory(options Options) (*Cluster, error) {
+	options, err := normalizeOptions(options)
+	if err != nil {
+		return nil, err
+	}
 	return newCluster(options, newMemoryStore(options))
 }
 
 func OpenBadger(path string, options Options) (*Cluster, error) {
-	if options.EventRetentionCount < 0 {
-		return nil, ErrInvalidConfig
+	options, err := normalizeOptions(options)
+	if err != nil {
+		return nil, err
 	}
 	store, err := newBadgerStore(path, options)
 	if err != nil {
@@ -39,17 +44,15 @@ func OpenEtcd(client *clientv3.Client, options Options) (*Cluster, error) {
 	if client == nil {
 		return nil, ErrInvalidConfig
 	}
+	options, err := normalizeOptions(options)
+	if err != nil {
+		return nil, err
+	}
 	return newCluster(options, newEtcdStore(client, options))
 }
 
 func newCluster(options Options, store resourceStore) (*Cluster, error) {
 	if store == nil {
-		return nil, ErrInvalidConfig
-	}
-	if options.WatchBufferSize <= 0 {
-		options.WatchBufferSize = defaultWatchBufferSize
-	}
-	if options.EventRetentionCount < 0 {
 		return nil, ErrInvalidConfig
 	}
 	return &Cluster{
@@ -58,6 +61,19 @@ func newCluster(options Options, store resourceStore) (*Cluster, error) {
 		definitions:      make(map[string]*resourceDefinition),
 		definitionsByGVK: make(map[string]*resourceDefinition),
 	}, nil
+}
+
+func normalizeOptions(options Options) (Options, error) {
+	if options.WatchBufferSize <= 0 {
+		options.WatchBufferSize = defaultWatchBufferSize
+	}
+	if options.EventRetentionCount < 0 {
+		return Options{}, ErrInvalidConfig
+	}
+	if options.EventRetentionCount == 0 {
+		options.EventRetentionCount = defaultEventRetentionCount
+	}
+	return options, nil
 }
 
 func (c *Cluster) Unstructured(resource string) (*UnstructuredResource, error) {

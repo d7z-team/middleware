@@ -3,7 +3,7 @@
 ## 创建 Cluster
 
 ```go
-c, err := cluster.NewClusterFromURL("memory://?event_retention_count=100&watch_buffer_size=256")
+c, err := cluster.NewClusterFromURL("memory://?watch_buffer_size=256")
 if err != nil {
 	return err
 }
@@ -24,7 +24,7 @@ defer c.Close()
 | 参数 | 说明 |
 | --- | --- |
 | `prefix` | 存储前缀 |
-| `event_retention_count` | 保留的 watch 事件数量，`0` 表示不按数量裁剪 |
+| `event_retention_count` | 保留的 watch 事件数量，默认 `2000`，传入时必须大于 `0` |
 | `watch_buffer_size` | 每个 watch channel 的缓冲大小，默认 `256` |
 
 ## 定义资源
