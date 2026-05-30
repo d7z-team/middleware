@@ -58,14 +58,17 @@ func testSubscriberChannelBehaviors(t *testing.T, factory func(t *testing.T) Clo
 		}
 	})
 
-	t.Run("child_normalization", func(t *testing.T) {
+	t.Run("child_namespace_and_invalid_child", func(t *testing.T) {
 		sub := factory(t)
 		defer sub.Close()
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
 
-		child := sub.Child("", "/", "team", "/alpha/", "")
+		require.Panics(t, func() { _ = sub.Child("../other") })
+		require.Panics(t, func() { _ = sub.Child("team//alpha") })
+
+		child := sub.Child("team", "alpha")
 		stream, err := child.Subscribe(ctx, "topic")
 		require.NoError(t, err)
 		defer stream.Close()

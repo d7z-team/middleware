@@ -471,7 +471,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 	// ListCurrent
 	t.Run("List_Current", func(t *testing.T) {
-		lcPrefix := uniquePrefix + "list_current/"
+		lcPrefix := uniquePrefix + "list_current"
 		lcKV := kvClient.Child(lcPrefix)
 
 		// Structure:
@@ -522,7 +522,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 	// ListCurrent only returns items at the current level.
 	t.Run("List_Current", func(t *testing.T) {
-		lcpPrefix := uniquePrefix + "lcp/"
+		lcpPrefix := uniquePrefix + "lcp"
 		lcpKV := kvClient.Child(lcpPrefix)
 
 		// Create files: a, b, c, d
@@ -553,7 +553,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 	// ListCurrentCursor
 	t.Run("List_Current_Cursor", func(t *testing.T) {
-		clcPrefix := uniquePrefix + "clc/"
+		clcPrefix := uniquePrefix + "clc"
 		clcKV := kvClient.Child(clcPrefix)
 
 		// a, b, c, sub/d
@@ -683,6 +683,9 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 	// Boundary Conditions & Edge Cases
 	t.Run("KV_Boundary_Edge_Cases", func(t *testing.T) {
+		require.Panics(t, func() { _ = kvClient.Child("../escape") })
+		require.Panics(t, func() { _ = kvClient.Child("a//b") })
+
 		// 1. 空 Key 处理 (应作为路径处理或报错，视具体实现而定)
 		// 大多数 KV 实现会把空 key 当作 prefix 本身
 		_ = kvClient.Put(ctx, "", "root_val", TTLKeep)
@@ -729,7 +732,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 	// Scan
 	t.Run("Scan", func(t *testing.T) {
-		prefix := uniquePrefix + "scan/"
+		prefix := uniquePrefix + "scan"
 		sKV := kvClient.Child(prefix)
 
 		// Insert 5 items: k1, k2, k3, k4, k5
@@ -786,7 +789,7 @@ func testKVConsistency(t *testing.T, kvClient KV) {
 
 	// Batch Operations
 	t.Run("Batch_Operations", func(t *testing.T) {
-		prefix := uniquePrefix + "batch/"
+		prefix := uniquePrefix + "batch"
 		bKV := kvClient.Child(prefix)
 
 		pairs := []Pair{
@@ -1068,7 +1071,7 @@ func testKVExtended(t *testing.T, kvClient KV) {
 	})
 
 	t.Run("Batch_Edge_Cases", func(t *testing.T) {
-		prefix := uniquePrefix + "batch_edge/"
+		prefix := uniquePrefix + "batch_edge"
 		bKV := kvClient.Child(prefix)
 
 		// 1. DeleteBatch non-existent
@@ -1092,7 +1095,7 @@ func testKVExtended(t *testing.T, kvClient KV) {
 	})
 
 	t.Run("Scan_Edge_Cases", func(t *testing.T) {
-		prefix := uniquePrefix + "scan_edge/"
+		prefix := uniquePrefix + "scan_edge"
 		sKV := kvClient.Child(prefix)
 		for i := 0; i < 5; i++ {
 			_ = sKV.Put(ctx, fmt.Sprintf("k%d", i), "v", TTLKeep)

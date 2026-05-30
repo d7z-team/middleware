@@ -5,13 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/pkg/errors"
+	"gopkg.d7z.net/middleware/utils"
 )
 
 type NopCloser struct {
@@ -22,8 +22,8 @@ func (NopCloser) Close() error { return nil }
 
 type internalValue struct {
 	data      []byte
-	length    uint64
 	metadata  []byte
+	size      uint64
 	expiresAt time.Time
 }
 
@@ -35,11 +35,14 @@ type MemoryCache struct {
 	closed *atomic.Bool
 	stopWG *sync.WaitGroup
 
-	prefix string
+	prefix    string
+	maxBytes  uint64
+	usedBytes *uint64
 }
 
 type MemoryCacheConfig struct {
 	MaxCapacity int
+	MaxBytes    uint64
 	CleanupInt  time.Duration
 }
 
@@ -56,8 +59,16 @@ func NewMemoryCache(config MemoryCacheConfig) (*MemoryCache, error) {
 	if config.CleanupInt <= 0 {
 		config.CleanupInt = 5 * time.Minute
 	}
+	if config.MaxBytes == 0 {
+		config.MaxBytes = defaultMemoryCacheMaxBytes()
+	}
 
-	lruCache, err := lru.New[string, *internalValue](config.MaxCapacity)
+	usedBytes := new(uint64)
+	lruCache, err := lru.NewWithEvict[string, *internalValue](config.MaxCapacity, func(_ string, value *internalValue) {
+		if value != nil {
+			*usedBytes -= value.size
+		}
+	})
 	if err != nil {
 		return nil, errors.Wrap(err, "create lru cache failed")
 	}
@@ -69,6 +80,8 @@ func NewMemoryCache(config MemoryCacheConfig) (*MemoryCache, error) {
 		closed:     new(atomic.Bool),
 		stopWG:     &sync.WaitGroup{},
 		prefix:     "/",
+		maxBytes:   config.MaxBytes,
+		usedBytes:  usedBytes,
 	}
 
 	mc.stopWG.Add(1)
@@ -78,27 +91,19 @@ func NewMemoryCache(config MemoryCacheConfig) (*MemoryCache, error) {
 }
 
 func (mc *MemoryCache) Child(paths ...string) Cache {
-	if len(paths) == 0 {
-		return mc
-	}
-	keys := make([]string, 0, len(paths))
-	for _, path := range paths {
-		path = strings.Trim(path, "/")
-		if path == "" {
-			continue
-		}
-		keys = append(keys, path)
-	}
-	if len(keys) == 0 {
+	childPath := utils.MustChild(paths...)
+	if childPath == "" {
 		return mc
 	}
 
 	return &MemoryCache{
-		lruCache: mc.lruCache,
-		mu:       mc.mu,
-		closed:   mc.closed,
-		stopWG:   mc.stopWG,
-		prefix:   mc.prefix + strings.Join(keys, "/") + "/",
+		lruCache:  mc.lruCache,
+		mu:        mc.mu,
+		closed:    mc.closed,
+		stopWG:    mc.stopWG,
+		prefix:    mc.prefix + childPath + "/",
+		maxBytes:  mc.maxBytes,
+		usedBytes: mc.usedBytes,
 	}
 }
 
@@ -112,34 +117,55 @@ func (mc *MemoryCache) Put(ctx context.Context, key string, metadata map[string]
 	default:
 	}
 
-	key = mc.prefix + key
-	data, err := io.ReadAll(value)
-	if err != nil {
-		return errors.Wrap(err, "read value failed")
-	}
-
 	if ttl != TTLKeep && ttl <= 0 {
 		return ErrInvalidTTL
 	}
 
+	metaRaw, err := json.Marshal(metadata)
+	if err != nil {
+		return errors.Wrap(err, "marshal metadata failed")
+	}
+	if uint64(len(metaRaw)) > mc.maxBytes {
+		return ErrCacheTooLarge
+	}
+
+	dataLimit := mc.maxBytes - uint64(len(metaRaw))
+	reader := value
+	if dataLimit < maxInt64Uint {
+		reader = io.LimitReader(value, int64(dataLimit)+1)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	if uint64(len(data)) > dataLimit {
+		return ErrCacheTooLarge
+	}
+
+	key = mc.prefix + key
 	now := time.Now()
 	expiresAt := time.Time{}
 	if ttl != TTLKeep {
 		expiresAt = now.Add(ttl)
 	}
-	metaRaw, err := json.Marshal(metadata)
-	if err != nil {
-		return errors.Wrap(err, "marshal metadata failed")
-	}
 	internalVal := &internalValue{
 		data:      data,
-		length:    uint64(len(data)),
 		metadata:  metaRaw,
+		size:      uint64(len(data)) + uint64(len(metaRaw)),
 		expiresAt: expiresAt,
 	}
 
 	mc.mu.Lock()
+	if existing, exists := mc.lruCache.Peek(key); exists && existing != nil {
+		*mc.usedBytes -= existing.size
+	}
+	*mc.usedBytes += internalVal.size
 	mc.lruCache.Add(key, internalVal)
+	for *mc.usedBytes > mc.maxBytes {
+		if _, _, ok := mc.lruCache.RemoveOldest(); !ok {
+			break
+		}
+	}
 	mc.mu.Unlock()
 
 	return nil

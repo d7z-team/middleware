@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"gopkg.d7z.net/middleware/connects"
+	"gopkg.d7z.net/middleware/utils"
 )
 
 // TTLKeep indicates that the TTL should not be modified.
@@ -48,7 +49,8 @@ type Pair struct {
 //	_, _ = users.CompareAndSwap(ctx, "alice", "admin", "owner")
 //	_, _ = users.Delete(ctx, "bob")
 type KV interface {
-	// Child creates a child KV with the given path segments appended to the current prefix.
+	// Child creates a child KV under developer-provided path segments.
+	// Invalid child paths panic because Child must not receive user input.
 	Child(paths ...string) KV
 	// Put stores a key-value pair with an optional TTL.
 	Put(ctx context.Context, key, value string, ttl time.Duration) error
@@ -181,21 +183,11 @@ func normalizeKVPrefix(prefix string) string {
 }
 
 func childKVPrefix(base string, paths ...string) string {
-	if len(paths) == 0 {
+	child := utils.MustChild(paths...)
+	if child == "" {
 		return base
 	}
-	keys := make([]string, 0, len(paths))
-	for _, path := range paths {
-		path = strings.Trim(path, "/")
-		if path == "" {
-			continue
-		}
-		keys = append(keys, path)
-	}
-	if len(keys) == 0 {
-		return base
-	}
-	return base + strings.Join(keys, "/") + "/"
+	return base + child + "/"
 }
 
 // NewKVFromURL creates a new KV instance from a URL string.

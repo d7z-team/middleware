@@ -16,7 +16,7 @@ func TestID2KV(t *testing.T) {
 	memory, err := kv.NewMemory("")
 	assert.NoError(t, err)
 
-	id2kv := NewID2KV[User](memory, "/users/")
+	id2kv := NewID2KV[User](memory, "users")
 
 	user1 := User{Name: "Alice", Age: 30}
 

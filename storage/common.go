@@ -42,20 +42,18 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"os"
 	"path"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/spf13/afero"
+	"gopkg.d7z.net/middleware/utils"
 )
 
 // Storage exposes an afero-backed filesystem with Child support.
 //
-// Child returns a new view rooted under the given path segments. Invalid child
-// paths do not panic; they return a view whose later operations fail with
-// ErrInvalidPath.
+// Child returns a new view rooted under developer-provided path segments.
+// Invalid child paths panic because Child must not receive user input.
 type Storage interface {
 	afero.Fs
 	Child(paths ...string) Storage
@@ -70,7 +68,6 @@ type CloserStorage interface {
 
 type storageFS struct {
 	afero.Fs
-	childErr error
 }
 
 type closerStorage struct {
@@ -141,7 +138,12 @@ func NewStorageFromURL(raw string) (CloserStorage, error) {
 		}
 		return closerStorage{
 			Storage: fs,
-			closer:  func() error { return nil },
+			closer: func() error {
+				if closer, ok := fs.(io.Closer); ok {
+					return closer.Close()
+				}
+				return nil
+			},
 		}, nil
 	case "overlay", "mount":
 		return newOverlayStorageFromURL(parse)
@@ -163,43 +165,22 @@ func newStorage(fs afero.Fs) Storage {
 	return &storageFS{Fs: fs}
 }
 
-func (s *storageFS) Child(paths ...string) Storage {
-	if s.childErr != nil {
-		return &storageFS{Fs: invalidFs{err: s.childErr}, childErr: s.childErr}
+func (s *storageFS) Close() error {
+	if closer, ok := s.Fs.(io.Closer); ok {
+		return closer.Close()
 	}
+	return nil
+}
 
-	childPath, err := normalizeChildPath(paths...)
-	if err != nil {
-		return &storageFS{Fs: invalidFs{err: err}, childErr: err}
-	}
+func (s *storageFS) Child(paths ...string) Storage {
+	childPath := utils.MustChild(paths...)
 	if childPath == "" {
 		return s
 	}
 
 	return &storageFS{
-		Fs: afero.NewBasePathFs(s.Fs, childPath),
+		Fs: &scopedFS{base: s.Fs, prefix: childPath},
 	}
-}
-
-func normalizeChildPath(paths ...string) (string, error) {
-	segments := make([]string, 0, len(paths))
-	for _, raw := range paths {
-		raw = strings.ReplaceAll(raw, "\\", "/")
-		raw = strings.Trim(raw, "/")
-		if raw == "" {
-			continue
-		}
-		for _, part := range strings.Split(raw, "/") {
-			switch part {
-			case "", ".", "..":
-				return "", ErrInvalidPath
-			default:
-				segments = append(segments, part)
-			}
-		}
-	}
-
-	return strings.Join(segments, "/"), nil
 }
 
 func resolveLocalRoot(parse *url.URL) (string, error) {
@@ -294,23 +275,3 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
-
-type invalidFs struct {
-	err error
-}
-
-func (fs invalidFs) Create(_ string) (afero.File, error)    { return nil, fs.err }
-func (fs invalidFs) Mkdir(_ string, _ os.FileMode) error    { return fs.err }
-func (fs invalidFs) MkdirAll(_ string, _ os.FileMode) error { return fs.err }
-func (fs invalidFs) Open(_ string) (afero.File, error)      { return nil, fs.err }
-func (fs invalidFs) OpenFile(_ string, _ int, _ os.FileMode) (afero.File, error) {
-	return nil, fs.err
-}
-func (fs invalidFs) Remove(_ string) error                  { return fs.err }
-func (fs invalidFs) RemoveAll(_ string) error               { return fs.err }
-func (fs invalidFs) Rename(_, _ string) error               { return fs.err }
-func (fs invalidFs) Stat(_ string) (os.FileInfo, error)     { return nil, fs.err }
-func (fs invalidFs) Name() string                           { return "invalid" }
-func (fs invalidFs) Chmod(_ string, _ os.FileMode) error    { return fs.err }
-func (fs invalidFs) Chown(_ string, _, _ int) error         { return fs.err }
-func (fs invalidFs) Chtimes(_ string, _, _ time.Time) error { return fs.err }

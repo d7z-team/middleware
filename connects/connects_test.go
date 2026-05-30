@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -79,6 +80,8 @@ func TestNewS3Validation(t *testing.T) {
 		"s3:///missing-bucket",
 		"s3://bucket/root?path_style=maybe",
 		"s3://bucket/root?disable_ssl=maybe",
+		"s3://bucket/root?http_timeout=bad",
+		"s3://bucket/root?http_timeout=-1s",
 		"s3://bucket/root?access_key=only",
 		"s3://bucket/a/../b",
 	}
@@ -90,4 +93,18 @@ func TestNewS3Validation(t *testing.T) {
 		_, err = NewS3(u)
 		require.Error(t, err, raw)
 	}
+}
+
+func TestParseS3HTTPTimeout(t *testing.T) {
+	timeout, err := parseS3HTTPTimeout(url.Values{})
+	require.NoError(t, err)
+	require.Equal(t, defaultS3HTTPTimeout, timeout)
+
+	timeout, err = parseS3HTTPTimeout(url.Values{"http_timeout": []string{"10s"}})
+	require.NoError(t, err)
+	require.Equal(t, 10*time.Second, timeout)
+
+	timeout, err = parseS3HTTPTimeout(url.Values{"http_timeout": []string{"0"}})
+	require.NoError(t, err)
+	require.Zero(t, timeout)
 }

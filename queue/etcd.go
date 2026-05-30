@@ -15,6 +15,7 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"gopkg.d7z.net/middleware/connects"
+	"gopkg.d7z.net/middleware/utils"
 )
 
 const (
@@ -60,9 +61,9 @@ func NewEtcdQueue(client *clientv3.Client, prefix string) *EtcdQueue {
 }
 
 func newEtcdQueue(client *clientv3.Client, prefix string, closer func() error, config Config) *EtcdQueue {
-	prefix = strings.Trim(prefix, "/")
-	if prefix != "" {
-		prefix += "/"
+	prefix, err := normalizeQueuePrefix(prefix)
+	if err != nil {
+		panic(err)
 	}
 	return &EtcdQueue{
 		client: client,
@@ -73,8 +74,8 @@ func newEtcdQueue(client *clientv3.Client, prefix string, closer func() error, c
 }
 
 func (e *EtcdQueue) Child(paths ...string) Namespace {
-	keys := normalizePaths(paths...)
-	if len(keys) == 0 {
+	childPath := utils.MustChild(paths...)
+	if childPath == "" {
 		return e
 	}
 
@@ -83,7 +84,7 @@ func (e *EtcdQueue) Child(paths ...string) Namespace {
 
 	return &EtcdQueue{
 		client: e.client,
-		prefix: e.prefix + strings.Join(keys, "/") + "/",
+		prefix: e.prefix + childPath + "/",
 		config: e.config,
 		parent: e,
 	}
@@ -526,9 +527,9 @@ func (e *EtcdQueue) ensureOpen(ctx context.Context) error {
 }
 
 func (e *EtcdQueue) buildTopic(topic string) (string, error) {
-	topic = strings.Trim(topic, "/")
-	if topic == "" {
-		return "", ErrInvalidTopic
+	topic, err := normalizeQueueTopic(topic)
+	if err != nil {
+		return "", err
 	}
 	if e.prefix == "" {
 		return topic, nil
@@ -1042,11 +1043,11 @@ func (e *EtcdQueue) markCanceled(msg *etcdStoredMessage) {
 }
 
 func (e *EtcdQueue) topicPrefix(topic string) string {
-	return path.Join("/", topic)
+	return "/" + topic
 }
 
 func (e *EtcdQueue) messagePrefix(topic string) string {
-	return path.Join(e.topicPrefix(topic), "messages") + "/"
+	return e.topicPrefix(topic) + "/messages/"
 }
 
 func (e *EtcdQueue) messageKey(topic, id string) string {
@@ -1054,15 +1055,15 @@ func (e *EtcdQueue) messageKey(topic, id string) string {
 }
 
 func (e *EtcdQueue) readyPrefix(topic string) string {
-	return path.Join(e.topicPrefix(topic), "ready") + "/"
+	return e.topicPrefix(topic) + "/ready/"
 }
 
 func (e *EtcdQueue) inflightPrefix(topic string) string {
-	return path.Join(e.topicPrefix(topic), "inflight") + "/"
+	return e.topicPrefix(topic) + "/inflight/"
 }
 
 func (e *EtcdQueue) deadPrefix(topic string) string {
-	return path.Join(e.topicPrefix(topic), "dead") + "/"
+	return e.topicPrefix(topic) + "/dead/"
 }
 
 func (e *EtcdQueue) readyKey(topic string, visibleAt time.Time, seq uint64, id string) string {
@@ -1078,7 +1079,7 @@ func (e *EtcdQueue) deadKey(topic string, deadAt time.Time, seq uint64, id strin
 }
 
 func (e *EtcdQueue) dedupKey(topic, dedup string) string {
-	return path.Join(e.topicPrefix(topic), "dedup", base64.RawURLEncoding.EncodeToString([]byte(dedup)))
+	return e.topicPrefix(topic) + "/dedup/" + base64.RawURLEncoding.EncodeToString([]byte(dedup))
 }
 
 func (e *EtcdQueue) normalizeCursor(prefix, cursor string) string {
@@ -1154,6 +1155,10 @@ func NewEtcdQueueFromURL(s string) (CloserNamespace, error) {
 	}
 	client, err := connects.NewEtcd(parse)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := normalizeQueuePrefix(parse.Query().Get("prefix")); err != nil {
+		_ = client.Close()
 		return nil, err
 	}
 	return newEtcdQueue(client, parse.Query().Get("prefix"), client.Close, Config{}), nil

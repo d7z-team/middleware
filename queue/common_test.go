@@ -229,6 +229,37 @@ func testQueueContract(t *testing.T, factory namespaceFactory) {
 		require.ErrorIs(t, err, ErrQueueClosed)
 	})
 
+	t.Run("invalid_child_panics_and_topic_rejects_escape", func(t *testing.T) {
+		root := factory(t)
+		defer root.Close()
+
+		require.Panics(t, func() { _ = root.Child("../tenant-b") })
+		require.Panics(t, func() { _ = root.Child("tenant//b") })
+
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+
+		child := root.Child("tenant-a")
+		invalidTopics := []string{
+			"../tenant-b/jobs",
+			"a/../b",
+			"a/b",
+			".",
+			"..",
+			"",
+		}
+		for _, topic := range invalidTopics {
+			_, err := child.Producer().Publish(ctx, topic, "payload", nil)
+			require.ErrorIs(t, err, ErrInvalidTopic, topic)
+
+			_, err = child.Consumer().Consume(ctx, topic, nil)
+			require.ErrorIs(t, err, ErrInvalidTopic, topic)
+
+			_, err = child.Admin().Get(ctx, topic, "missing")
+			require.ErrorIs(t, err, ErrInvalidTopic, topic)
+		}
+	})
+
 	t.Run("child_close_does_not_close_parent", func(t *testing.T) {
 		root := factory(t)
 		defer root.Close()

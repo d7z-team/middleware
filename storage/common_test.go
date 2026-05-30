@@ -138,15 +138,39 @@ func testStorageContract(t *testing.T, factory func(t *testing.T) CloserStorage)
 
 		for _, parts := range testCases {
 			t.Run(fmt.Sprintf("%q", parts), func(t *testing.T) {
-				child := fs.Child(parts...)
-				err := child.MkdirAll("blocked", 0o755)
-				require.ErrorIs(t, err, ErrInvalidPath)
-
-				_, err = child.Create("x.txt")
-				require.ErrorIs(t, err, ErrInvalidPath)
+				require.Panics(t, func() {
+					_ = fs.Child(parts...)
+				})
 			})
 		}
 	})
+}
+
+func TestLocalStorageRejectsRootAndChildEscape(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "app")
+	evilSibling := filepath.Join(parent, "app_evil")
+	require.NoError(t, os.MkdirAll(evilSibling, 0o755))
+
+	fs, err := NewStorageFromURL("local://" + filepath.ToSlash(root))
+	require.NoError(t, err)
+	defer fs.Close()
+
+	err = afero.WriteFile(fs, "../app_evil/pwn.txt", []byte("bad"), 0o644)
+	require.ErrorIs(t, err, ErrInvalidPath)
+	_, err = os.Stat(filepath.Join(evilSibling, "pwn.txt"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+
+	child := fs.Child("a")
+	require.NoError(t, child.MkdirAll(".", 0o755))
+	err = afero.WriteFile(child, "../ab/pwn.txt", []byte("bad"), 0o644)
+	require.ErrorIs(t, err, ErrInvalidPath)
+
+	outside := filepath.Join(parent, "outside.txt")
+	require.NoError(t, os.WriteFile(outside, []byte("secret"), 0o644))
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "outside-link")))
+	_, err = afero.ReadFile(fs, "outside-link")
+	require.Error(t, err)
 }
 
 func TestNewStorageFromURL(t *testing.T) {
@@ -224,12 +248,5 @@ func TestS3StorageContract(t *testing.T) {
 
 func TestNewLocalStorageRequiresRoot(t *testing.T) {
 	_, err := NewLocalStorage("")
-	require.ErrorIs(t, err, ErrInvalidPath)
-}
-
-func TestInvalidChildPersistsError(t *testing.T) {
-	child := NewMemoryStorage().Child("..").Child("safe")
-
-	_, err := child.Open("x")
 	require.ErrorIs(t, err, ErrInvalidPath)
 }

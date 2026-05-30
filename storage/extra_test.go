@@ -10,28 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestInvalidChildFsMethodsReturnErrInvalidPath(t *testing.T) {
-	child := NewMemoryStorage().Child("..")
-	now := time.Now()
-
-	require.Equal(t, "invalid", child.Name())
-
-	_, err := child.Create("x.txt")
-	require.ErrorIs(t, err, ErrInvalidPath)
-	require.ErrorIs(t, child.Mkdir("dir", 0o755), ErrInvalidPath)
-	require.ErrorIs(t, child.MkdirAll("dir", 0o755), ErrInvalidPath)
-	_, err = child.Open("x.txt")
-	require.ErrorIs(t, err, ErrInvalidPath)
-	_, err = child.OpenFile("x.txt", os.O_CREATE|os.O_RDWR, 0o644)
-	require.ErrorIs(t, err, ErrInvalidPath)
-	require.ErrorIs(t, child.Remove("x.txt"), ErrInvalidPath)
-	require.ErrorIs(t, child.RemoveAll("x.txt"), ErrInvalidPath)
-	require.ErrorIs(t, child.Rename("x.txt", "y.txt"), ErrInvalidPath)
-	_, err = child.Stat("x.txt")
-	require.ErrorIs(t, err, ErrInvalidPath)
-	require.ErrorIs(t, child.Chmod("x.txt", 0o644), ErrInvalidPath)
-	require.ErrorIs(t, child.Chown("x.txt", 0, 0), ErrInvalidPath)
-	require.ErrorIs(t, child.Chtimes("x.txt", now, now), ErrInvalidPath)
+func TestStorageChildPanicsOnInvalidPath(t *testing.T) {
+	root := NewMemoryStorage()
+	require.Panics(t, func() { _ = root.Child("..") })
+	require.Panics(t, func() { _ = root.Child("a//b") })
+	require.Panics(t, func() { _ = root.Child("/a") })
+	require.Panics(t, func() { _ = root.Child("") })
 }
 
 func TestMountFSHelperMethods(t *testing.T) {

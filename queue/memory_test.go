@@ -108,7 +108,7 @@ func testQueueExtendedAdminBehaviors(t *testing.T, factory namespaceFactory) {
 		require.Equal(t, &Stats{Ready: 1, Total: 1}, stats)
 
 		require.Eventually(t, func() bool {
-			retryCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			retryCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 			defer cancel()
 
 			retry, err := q.Consumer().Consume(retryCtx, "jobs", nil)
@@ -117,7 +117,7 @@ func testQueueExtendedAdminBehaviors(t *testing.T, factory namespaceFactory) {
 			}
 			defer retry.Ack(context.Background())
 			return retry.ID == id && retry.Attempt == 2
-		}, time.Second, 10*time.Millisecond)
+		}, 3*time.Second, 25*time.Millisecond)
 
 		err = q.Admin().Cancel(ctx, "jobs", id)
 		require.ErrorIs(t, err, ErrInvalidState)

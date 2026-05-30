@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"gopkg.d7z.net/middleware/utils"
 )
 
 type RedisCache struct {
@@ -34,23 +35,13 @@ func NewRedisCache(client *redis.Client, prefix string) *RedisCache {
 }
 
 func (rc *RedisCache) Child(paths ...string) Cache {
-	if len(paths) == 0 {
-		return rc
-	}
-	keys := make([]string, 0, len(paths))
-	for _, path := range paths {
-		path = strings.Trim(path, "/")
-		if path == "" {
-			continue
-		}
-		keys = append(keys, path)
-	}
-	if len(keys) == 0 {
+	childPath := utils.MustChild(paths...)
+	if childPath == "" {
 		return rc
 	}
 	return &RedisCache{
 		client: rc.client,
-		prefix: rc.prefix + strings.Join(keys, "/") + "/",
+		prefix: rc.prefix + childPath + "/",
 	}
 }
 

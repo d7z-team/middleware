@@ -8,26 +8,16 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestMemoryCacheChildNormalization(t *testing.T) {
+func TestMemoryCacheChildPanicsOnInvalidPath(t *testing.T) {
 	cache, err := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 16})
 	require.NoError(t, err)
 	defer cache.Close()
 
-	require.Same(t, cache, cache.Child("", "/", "///"))
-
-	child, ok := cache.Child("/a/", "b//").(*MemoryCache)
-	require.True(t, ok)
-	require.Equal(t, "/a/b/", child.prefix)
-
-	require.NoError(t, child.Put(context.Background(), "key", nil, strings.NewReader("value"), TTLKeep))
-
-	content, err := cache.Get(context.Background(), "a/b/key")
-	require.NoError(t, err)
-	defer content.Close()
-
-	data, err := content.ReadToString()
-	require.NoError(t, err)
-	require.Equal(t, "value", data)
+	require.Same(t, cache, cache.Child())
+	require.Panics(t, func() { _ = cache.Child("") })
+	require.Panics(t, func() { _ = cache.Child("/") })
+	require.Panics(t, func() { _ = cache.Child("/a/") })
+	require.Panics(t, func() { _ = cache.Child("b//") })
 }
 
 func TestMemoryCacheClosedAndCanceledBranches(t *testing.T) {

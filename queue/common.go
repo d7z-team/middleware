@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"gopkg.d7z.net/middleware/utils"
 )
 
 type MessageID = string
@@ -107,7 +109,8 @@ type Admin interface {
 //		_ = msg.Ack(ctx)
 //	}
 type Namespace interface {
-	// Child returns a namespaced view rooted under the provided path segments.
+	// Child returns a namespaced view rooted under developer-provided path segments.
+	// Invalid child paths panic because Child must not receive user input.
 	Child(paths ...string) Namespace
 	// Producer returns the publishing view for this namespace.
 	Producer() Producer
@@ -345,16 +348,26 @@ func normalizeListOptions(opts *ListOptions) ListOptions {
 	return normalized
 }
 
-func normalizePaths(paths ...string) []string {
-	keys := make([]string, 0, len(paths))
-	for _, path := range paths {
-		path = strings.Trim(path, "/")
-		if path == "" {
-			continue
-		}
-		keys = append(keys, path)
+func normalizeQueueTopic(topic string) (string, error) {
+	normalized, err := utils.NormalizeChild(topic)
+	if err != nil || strings.Contains(normalized, "/") {
+		return "", ErrInvalidTopic
 	}
-	return keys
+	return normalized, nil
+}
+
+func normalizeQueuePrefix(prefix string) (string, error) {
+	if prefix == "" {
+		return "", nil
+	}
+	normalized, err := utils.NormalizePath(prefix)
+	if err != nil {
+		return "", ErrInvalidTopic
+	}
+	if normalized == "" {
+		return "", nil
+	}
+	return normalized + "/", nil
 }
 
 func nextMessageID() (MessageID, error) {

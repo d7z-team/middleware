@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"gopkg.d7z.net/middleware/connects"
+	"gopkg.d7z.net/middleware/utils"
 )
 
 // Event is a published key/value notification.
@@ -119,21 +120,14 @@ func (s *subscriptionState) closeChannels() {
 }
 
 func subscriberChildPrefix(base string, paths ...string) string {
-	keys := make([]string, 0, len(paths))
-	for _, raw := range paths {
-		raw = strings.Trim(raw, "/")
-		if raw == "" {
-			continue
-		}
-		keys = append(keys, raw)
-	}
-	if len(keys) == 0 {
+	child := utils.MustChild(paths...)
+	if child == "" {
 		return base
 	}
 	if base != "" && !strings.HasSuffix(base, "/") {
 		base += "/"
 	}
-	return base + strings.Join(keys, "/") + "/"
+	return base + child + "/"
 }
 
 func buildSubscriberKey(prefix, key string) string {
@@ -184,7 +178,8 @@ type Subscription interface {
 //	event := <-stream.Events()
 //	_ = event.Key
 type Subscriber interface {
-	// Child returns a subscriber scoped under the provided path segments.
+	// Child returns a subscriber scoped under developer-provided path segments.
+	// Invalid child paths panic because Child must not receive user input.
 	Child(paths ...string) Subscriber
 	// Publish writes one event value to the specified key.
 	Publish(ctx context.Context, key, data string) error

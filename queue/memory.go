@@ -4,10 +4,11 @@ import (
 	"context"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"gopkg.d7z.net/middleware/utils"
 )
 
 type memoryQueueState struct {
@@ -73,8 +74,8 @@ func NewMemoryQueueWithConfig(config Config) *MemoryQueue {
 }
 
 func (m *MemoryQueue) Child(paths ...string) Namespace {
-	keys := normalizePaths(paths...)
-	if len(keys) == 0 {
+	childPath := utils.MustChild(paths...)
+	if childPath == "" {
 		return m
 	}
 
@@ -83,7 +84,7 @@ func (m *MemoryQueue) Child(paths ...string) Namespace {
 
 	child := &MemoryQueue{
 		state:  m.state,
-		prefix: m.prefix + strings.Join(keys, "/") + "/",
+		prefix: m.prefix + childPath + "/",
 		parent: m,
 	}
 	m.children = append(m.children, child)
@@ -559,9 +560,9 @@ func (m *MemoryQueue) isClosedLocked() bool {
 }
 
 func (m *MemoryQueue) buildTopic(topic string) (string, error) {
-	topic = strings.Trim(topic, "/")
-	if topic == "" {
-		return "", ErrInvalidTopic
+	topic, err := normalizeQueueTopic(topic)
+	if err != nil {
+		return "", err
 	}
 	if m.prefix == "" {
 		return topic, nil

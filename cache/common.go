@@ -35,6 +35,8 @@ const TTLKeep = -1
 //
 //	_ = avatars.Delete(ctx, "user-1")
 type Cache interface {
+	// Child returns a cache scoped under developer-provided path segments.
+	// Invalid child paths panic because Child must not receive user input.
 	Child(paths ...string) Cache
 	Put(ctx context.Context, key string, metadata map[string]string, value io.Reader, ttl time.Duration) error
 	Get(ctx context.Context, key string) (*Content, error)
@@ -79,6 +81,7 @@ var (
 	ErrCacheMiss       = errors.Join(os.ErrNotExist, errors.New("cache: key not found or expired"))
 	ErrInvalidTTL      = errors.New("cache: invalid ttl value (use TTLKeep for permanent cache)")
 	ErrInvalidCapacity = errors.New("cache: invalid cache capacity (must be greater than 0)")
+	ErrCacheTooLarge   = errors.New("cache: value exceeds maximum cache size")
 	ErrCacheClosed     = errors.New("cache is closed")
 )
 
@@ -143,6 +146,16 @@ func newMemoryCacheFromURL(ur *url.URL) (*MemoryCache, error) {
 		}
 	}
 
+	var maxBytes uint64
+	maxBytesStr := query.Get("max_bytes")
+	if maxBytesStr != "" {
+		parsed, err := strconv.ParseUint(maxBytesStr, 10, 64)
+		if err != nil || parsed == 0 {
+			return nil, errors.New("max_bytes must be a positive integer")
+		}
+		maxBytes = parsed
+	}
+
 	cleanupIntervalStr := query.Get("cleanup_interval")
 	cleanupInterval := 5 * time.Minute
 	if cleanupIntervalStr != "" {
@@ -156,6 +169,7 @@ func newMemoryCacheFromURL(ur *url.URL) (*MemoryCache, error) {
 	return NewMemoryCache(
 		MemoryCacheConfig{
 			MaxCapacity: maxCap,
+			MaxBytes:    maxBytes,
 			CleanupInt:  cleanupInterval,
 		},
 	)

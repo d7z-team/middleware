@@ -8,14 +8,18 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	s3sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 var ErrInvalidS3Config = errors.New("invalid s3 configuration")
+
+const defaultS3HTTPTimeout = 5 * time.Minute
 
 type S3Target struct {
 	Client  *s3sdk.Client
@@ -43,8 +47,15 @@ func NewS3(ur *url.URL) (*S3Target, error) {
 	if err != nil {
 		return nil, err
 	}
+	httpTimeout, err := parseS3HTTPTimeout(query)
+	if err != nil {
+		return nil, err
+	}
 
-	tempDir := firstNonEmpty(query.Get("temp_dir"), os.TempDir())
+	tempDir := query.Get("temp_dir")
+	if tempDir == "" {
+		tempDir = os.TempDir()
+	}
 	if err := os.MkdirAll(tempDir, 0o755); err != nil {
 		return nil, fmt.Errorf("%w: create temp_dir: %w", ErrInvalidS3Config, err)
 	}
@@ -68,6 +79,11 @@ func NewS3(ur *url.URL) (*S3Target, error) {
 	}
 	if profile := strings.TrimSpace(query.Get("profile")); profile != "" {
 		loadOptions = append(loadOptions, config.WithSharedConfigProfile(profile))
+	}
+	if httpTimeout > 0 {
+		loadOptions = append(loadOptions, config.WithHTTPClient(
+			awshttp.NewBuildableClient().WithTimeout(httpTimeout),
+		))
 	}
 
 	accessKey := strings.TrimSpace(query.Get("access_key"))
@@ -114,6 +130,18 @@ func parseS3QueryBool(query url.Values, key string) (bool, error) {
 	return parsed, nil
 }
 
+func parseS3HTTPTimeout(query url.Values) (time.Duration, error) {
+	value := strings.TrimSpace(query.Get("http_timeout"))
+	if value == "" {
+		return defaultS3HTTPTimeout, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%w: invalid http_timeout", ErrInvalidS3Config)
+	}
+	return parsed, nil
+}
+
 func normalizeS3URLPath(raw string) (string, error) {
 	raw = strings.ReplaceAll(raw, "\\", "/")
 	if raw == "" || raw == "." || raw == "/" {
@@ -131,13 +159,4 @@ func normalizeS3URLPath(raw string) (string, error) {
 		}
 	}
 	return strings.Join(cleaned, "/"), nil
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
 }

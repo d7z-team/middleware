@@ -205,6 +205,8 @@ func TestCommonFunctions(t *testing.T) {
 			{"InvalidCapacity", "memory://?max_capacity=-1"},
 			{"ZeroCapacity", "memory://?max_capacity=0"},
 			{"NonIntCapacity", "memory://?max_capacity=abc"},
+			{"InvalidMaxBytes", "memory://?max_bytes=abc"},
+			{"ZeroMaxBytes", "memory://?max_bytes=0"},
 			{"InvalidInterval", "memory://?cleanup_interval=invalid"},
 		}
 
@@ -269,6 +271,39 @@ func TestMemoryImplementation(t *testing.T) {
 		assert.ErrorIs(t, err, ErrCacheMiss)
 	})
 
+	t.Run("MaxBytesRejectsSingleOversizedValue", func(t *testing.T) {
+		cache, err := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 10, MaxBytes: 8})
+		require.NoError(t, err)
+		defer cache.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		err = cache.Put(ctx, "too-large", nil, strings.NewReader("123456789"), TTLKeep)
+		require.ErrorIs(t, err, ErrCacheTooLarge)
+		require.Zero(t, *cache.usedBytes)
+	})
+
+	t.Run("MaxBytesEvictsOldestAndTracksOverwrite", func(t *testing.T) {
+		cache, err := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 10, MaxBytes: 20})
+		require.NoError(t, err)
+		defer cache.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		require.NoError(t, cache.Put(ctx, "k1", nil, strings.NewReader("12345678"), TTLKeep))
+		require.NoError(t, cache.Put(ctx, "k2", nil, strings.NewReader("abcdefgh"), TTLKeep))
+		_, err = cache.Get(ctx, "k1")
+		require.ErrorIs(t, err, ErrCacheMiss)
+		require.LessOrEqual(t, *cache.usedBytes, cache.maxBytes)
+
+		before := *cache.usedBytes
+		require.NoError(t, cache.Put(ctx, "k2", nil, strings.NewReader("xy"), TTLKeep))
+		require.Less(t, *cache.usedBytes, before)
+		require.LessOrEqual(t, *cache.usedBytes, cache.maxBytes)
+	})
+
 	t.Run("CleanupExpired", func(t *testing.T) {
 		cache, _ := NewMemoryCache(MemoryCacheConfig{MaxCapacity: 10, CleanupInt: time.Hour})
 		defer cache.Close()
@@ -308,6 +343,7 @@ func TestMemoryImplementation(t *testing.T) {
 		assert.Same(t, root.mu, child.mu)
 		assert.Same(t, root.stopWG, child.stopWG)
 		assert.Same(t, root.closed, child.closed)
+		assert.Same(t, root.usedBytes, child.usedBytes)
 	})
 }
 
