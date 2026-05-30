@@ -18,7 +18,7 @@
 - `queue`: memory / etcd at-least-once queue.
 - `storage`: afero-based memory, local, overlay, and S3 storage.
 - `subscribe`: memory / etcd pub/sub primitives.
-- `cluster`: lightweight KV-only cluster coordination with Raft-style leader election, leader lease fencing, and optional KV task claims.
+- `cluster`: Kubernetes-style typed resource control plane with CRUD, patch, watch, metadata/status, and memory / badger / etcd backends.
 - `tools`: typed helpers built on top of `kv` and `cache`.
 
 ## License
