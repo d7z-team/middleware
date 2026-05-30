@@ -103,6 +103,20 @@ func TestClusterNodeLeaseRequiresUniqueLocalNode(t *testing.T) {
 	require.NoError(t, second.Close())
 }
 
+func TestClusterResourceDiscoveryClosed(t *testing.T) {
+	c, err := NewClusterFromURL("memory://?node=closed-discovery")
+	require.NoError(t, err)
+
+	_, err = c.Resources()
+	require.NoError(t, err)
+	require.NoError(t, c.Close())
+
+	_, err = c.Resources()
+	require.ErrorIs(t, err, ErrClosed)
+	_, err = c.Resource(ResourceNodes)
+	require.ErrorIs(t, err, ErrClosed)
+}
+
 func TestClusterDefaultEventRetention(t *testing.T) {
 	ctx := testContext(t, 10*time.Second)
 	c := newURLCluster(t, clusterURLFactory{
@@ -465,6 +479,8 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		patchedSpec, err := c.PatchCurrentNodeSpec(ctx, []byte(`{"metadata":{"zone":"test"}}`), PatchOptions{})
 		require.NoError(t, err)
 		require.Equal(t, "test", patchedSpec.Spec.Metadata["zone"])
+		_, err = c.PatchCurrentNodeSpec(ctx, []byte(` `), PatchOptions{})
+		require.ErrorIs(t, err, ErrInvalidObject)
 
 		statused, err := c.UpdateCurrentNodeStatus(ctx, NodeStatus{Metadata: Annotations{"ready": "true"}}, UpdateOptions{})
 		require.NoError(t, err)
@@ -475,6 +491,8 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.NoError(t, err)
 		require.Equal(t, "test", patchedStatus.Status.Metadata["zone"])
 		require.False(t, patchedStatus.Status.LeaseUntil.IsZero())
+		_, err = c.PatchCurrentNodeStatus(ctx, []byte(` `), PatchOptions{})
+		require.ErrorIs(t, err, ErrInvalidObject)
 
 		resources, err := c.Resources()
 		require.NoError(t, err)

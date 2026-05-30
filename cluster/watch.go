@@ -19,6 +19,10 @@ func (r *UnstructuredResource) watchLoop(
 
 	lastRV := startRV
 	if opts.SendInitialEvents {
+		if err := r.cluster.ensureActive(ctx); err != nil {
+			sendWatchError(ctx, out, err)
+			return
+		}
 		objects, rv, err := r.cluster.store.list(ctx, r.def.Resource)
 		if err != nil {
 			sendWatchError(ctx, out, err)

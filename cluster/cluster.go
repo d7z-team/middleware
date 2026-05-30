@@ -141,6 +141,9 @@ func (c *Cluster) PatchCurrentNodeMetadata(ctx context.Context, patch []byte, op
 }
 
 func (c *Cluster) PatchCurrentNodeSpec(ctx context.Context, patch []byte, opts PatchOptions) (*Object[NodeSpec, NodeStatus], error) {
+	if len(bytes.TrimSpace(patch)) == 0 {
+		return nil, ErrInvalidObject
+	}
 	raw, err := json.Marshal(map[string]json.RawMessage{"spec": patch})
 	if err != nil {
 		return nil, err

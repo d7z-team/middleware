@@ -61,12 +61,8 @@ func validateSpecPatch(patch []byte) error {
 		if err := json.Unmarshal(raw, &meta); err != nil {
 			return err
 		}
-		for key := range meta {
-			switch key {
-			case "labels", "annotations", "finalizers":
-			default:
-				return fmt.Errorf("%w: metadata.%s is managed", ErrInvalidObject, key)
-			}
+		if err := validateMetadataPatchKeys(meta); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -80,6 +76,10 @@ func validateMetadataPatch(patch []byte) error {
 	if len(meta) == 0 {
 		return ErrInvalidObject
 	}
+	return validateMetadataPatchKeys(meta)
+}
+
+func validateMetadataPatchKeys(meta map[string]json.RawMessage) error {
 	for key := range meta {
 		switch key {
 		case "labels", "annotations", "finalizers":

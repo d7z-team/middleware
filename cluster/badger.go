@@ -416,6 +416,7 @@ func (s *badgerStore) enforceRetentionTxn(txn *badger.Txn, retention int) error 
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = []byte(prefix)
 	it := txn.NewIterator(opts)
+	defer it.Close()
 
 	type indexedEvent struct {
 		rv       uint64
@@ -431,7 +432,6 @@ func (s *badgerStore) enforceRetentionTxn(txn *badger.Txn, retention int) error 
 		}
 		events = append(events, indexedEvent{rv: parseStoredRV(event.ResourceVersion), resource: event.Ref.Resource})
 	}
-	it.Close()
 	if len(events) <= retention {
 		return nil
 	}
@@ -462,6 +462,7 @@ func (s *badgerStore) compactTxn(txn *badger.Txn, before uint64) error {
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = []byte(prefix)
 	it := txn.NewIterator(opts)
+	defer it.Close()
 	toDelete := make([]resourceEvent, 0)
 	for it.Rewind(); it.ValidForPrefix([]byte(prefix)); it.Next() {
 		var event resourceEvent
@@ -474,7 +475,6 @@ func (s *badgerStore) compactTxn(txn *badger.Txn, before uint64) error {
 			toDelete = append(toDelete, event)
 		}
 	}
-	it.Close()
 	for _, event := range toDelete {
 		rv := parseStoredRV(event.ResourceVersion)
 		if err := txn.Delete([]byte(s.eventAllKey(rv))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
