@@ -26,11 +26,12 @@ defer c.Close()
 | `node` | 当前实例的 node 名称，必填，同一 backend/prefix 下不能重复 |
 | `prefix` | 存储前缀 |
 | `node_lease_ttl` | node lease TTL，默认 `30s` |
-| `node_renew_interval` | node lease 续约间隔，默认 `10s`，必须小于 TTL |
+| `node_renew_interval` | node lease 续约间隔，默认 `10s`，必须小于 TTL，传入时不得小于 `10ms` |
 | `master_lease_ttl` | master lease TTL，默认跟随 `node_lease_ttl` |
-| `master_renew_interval` | master lease 续约间隔，默认跟随 `node_renew_interval`，必须小于 master TTL |
+| `master_renew_interval` | master lease 续约间隔，默认跟随 `node_renew_interval`，必须小于 master TTL，传入时不得小于 `10ms` |
 | `master_history_limit` | 保留的 master 切换记录数量，默认 `2000`，传入时必须大于 `0` |
 | `event_retention_count` | 保留的 watch 事件数量，默认 `2000`，传入时必须大于 `0` |
+| `event_cleanup_interval` | 当前 master 清理旧 watch 事件的间隔，默认跟随 `master_renew_interval`，传入时不得小于 `10ms` |
 | `watch_buffer_size` | 每个 watch channel 的缓冲大小，默认 `256` |
 
 `etcd` 后端的资源写入、node lease 和 master lease 都落在 etcd 中，多个实例共享同一
@@ -448,7 +449,7 @@ events, err = widgets.Watch(ctx, cluster.WatchOptions{
 })
 ```
 
-如果 `Since` 早于已压缩的事件版本，watch 会返回 `WatchError`，错误为
+如果 `Since` 早于已清理的事件版本，watch 会返回 `WatchError`，错误为
 `ErrResourceVersionTooOld`。
 
 ## 删除对象
@@ -504,15 +505,11 @@ if err != nil {
 }
 ```
 
-## 压缩事件
+## 事件保留
 
-```go
-if err := c.Compact(ctx, list.ResourceVersion); err != nil {
-	return err
-}
-```
-
-压缩后，从更早版本开始的 watch 会收到 `ErrResourceVersionTooOld`。
+watch 事件按 `event_retention_count` 保留最近的记录，默认 `2000`。旧事件只由当前
+master 按 `event_cleanup_interval` 后台清理，清理间隔不得小于 `10ms`；普通资源写入不会触发全局清理。
+从已清理版本开始的 watch 会收到 `ErrResourceVersionTooOld`。
 
 ## Node
 

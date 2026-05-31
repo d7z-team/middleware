@@ -132,7 +132,6 @@ func (s *memoryStore) commitLocked(req commitRequest) (*Unstructured, resourceEv
 	}
 	event := newStoreEvent(req, s.rv, &eventObj)
 	s.events = append(s.events, event)
-	s.enforceRetentionLocked()
 	return cloneUnstructuredPtr(&eventObj), event, nil
 }
 
@@ -164,7 +163,7 @@ func (s *memoryStore) eventsAfter(ctx context.Context, after uint64, resource st
 	return out, s.rv, nil
 }
 
-func (s *memoryStore) compact(ctx context.Context, before uint64) error {
+func (s *memoryStore) cleanupEvents(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -173,14 +172,7 @@ func (s *memoryStore) compact(ctx context.Context, before uint64) error {
 	if s.closed {
 		return ErrClosed
 	}
-	s.compacted = max(s.compacted, before)
-	kept := s.events[:0]
-	for _, event := range s.events {
-		if parseStoredRV(event.ResourceVersion) > before {
-			kept = append(kept, event)
-		}
-	}
-	s.events = kept
+	s.enforceRetentionLocked()
 	return nil
 }
 
@@ -259,13 +251,16 @@ func (s *memoryStore) nodeLeaseKey(name string) string {
 }
 
 func (s *memoryStore) enforceRetentionLocked() {
-	if len(s.events) <= s.retention {
+	if s.rv <= uint64(s.retention) {
 		return
 	}
-	remove := len(s.events) - s.retention
-	for i := 0; i < remove; i++ {
-		s.compacted = max(s.compacted, parseStoredRV(s.events[i].ResourceVersion))
+	before := s.rv - uint64(s.retention)
+	s.compacted = max(s.compacted, before)
+	kept := s.events[:0]
+	for _, event := range s.events {
+		if parseStoredRV(event.ResourceVersion) > before {
+			kept = append(kept, event)
+		}
 	}
-	copy(s.events, s.events[remove:])
-	s.events = s.events[:len(s.events)-remove]
+	s.events = kept
 }

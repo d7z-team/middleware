@@ -13,6 +13,7 @@ const (
 	defaultEventBatchSize      = 512
 	defaultListLimit           = 100
 	maxMutationRetries         = 8
+	minBackgroundInterval      = 10 * time.Millisecond
 	defaultNodeLeaseTTL        = 30 * time.Second
 	defaultNodeRenewInterval   = 10 * time.Second
 	defaultMasterHistoryLimit  = 2000
@@ -43,16 +44,18 @@ type Options struct {
 	NodeName string
 	// NodeLeaseTTL controls how long another process must wait after a crash before reusing this node name.
 	NodeLeaseTTL time.Duration
-	// NodeRenewInterval controls how often the node lease is renewed.
+	// NodeRenewInterval controls how often the node lease is renewed. Values below 10ms are rejected.
 	NodeRenewInterval time.Duration
 	// MasterLeaseTTL controls how long a master term stays valid without renewal. Zero uses NodeLeaseTTL.
 	MasterLeaseTTL time.Duration
-	// MasterRenewInterval controls how often the current master term is renewed. Zero uses NodeRenewInterval.
+	// MasterRenewInterval controls how often the current master term is renewed. Zero uses NodeRenewInterval. Values below 10ms are rejected.
 	MasterRenewInterval time.Duration
 	// MasterHistoryLimit keeps only the newest N master transition records. Zero uses the default.
 	MasterHistoryLimit int
 	// EventRetentionCount keeps only the newest N events. Zero uses the default.
 	EventRetentionCount int
+	// EventCleanupInterval controls how often the master cleans old watch events. Zero uses MasterRenewInterval. Values below 10ms are rejected.
+	EventCleanupInterval time.Duration
 	// WatchBufferSize controls each Watch result channel buffer.
 	WatchBufferSize int
 }
@@ -275,7 +278,7 @@ type resourceStore interface {
 	list(context.Context, string) ([]Unstructured, uint64, error)
 	commit(context.Context, commitRequest) (*Unstructured, resourceEvent, error)
 	eventsAfter(context.Context, uint64, string, int) ([]resourceEvent, uint64, error)
-	compact(context.Context, uint64) error
+	cleanupEvents(context.Context) error
 	subscribe(context.Context, string) (<-chan struct{}, func(), error)
 	acquireNode(context.Context, string, time.Duration) (string, error)
 	renewNode(context.Context, string, string, time.Duration) error

@@ -2,12 +2,15 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/stretchr/testify/require"
 )
 
@@ -23,6 +26,28 @@ type widgetStatus struct {
 type clusterURLFactory struct {
 	name string
 	raw  func(t *testing.T, query url.Values) string
+}
+
+type cleanupErrorStore struct {
+	resourceStore
+	mu  sync.RWMutex
+	err error
+}
+
+func (s *cleanupErrorStore) setError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+}
+
+func (s *cleanupErrorStore) cleanupEvents(ctx context.Context) error {
+	s.mu.RLock()
+	err := s.err
+	s.mu.RUnlock()
+	if err != nil {
+		return err
+	}
+	return s.resourceStore.cleanupEvents(ctx)
 }
 
 func localURLFactories() []clusterURLFactory {
@@ -73,11 +98,15 @@ func TestClusterFromURLValidation(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&node_renew_interval=bad")
 	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&node_renew_interval=1ns")
+	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&node_lease_ttl=1s&node_renew_interval=1s")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&master_lease_ttl=bad")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&master_renew_interval=bad")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&master_renew_interval=1ns")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&master_lease_ttl=1s&master_renew_interval=1s")
 	require.ErrorIs(t, err, ErrInvalidConfig)
@@ -86,6 +115,12 @@ func TestClusterFromURLValidation(t *testing.T) {
 	_, err = NewClusterFromURL("memory://?node=n1&event_retention_count=-1")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&event_retention_count=0")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&event_cleanup_interval=bad")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&event_cleanup_interval=0")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&event_cleanup_interval=1ns")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&watch_buffer_size=0")
 	require.ErrorIs(t, err, ErrInvalidConfig)
@@ -156,8 +191,7 @@ func TestClusterMasterHistoryLimit(t *testing.T) {
 	}
 }
 
-func TestClusterDefaultEventRetention(t *testing.T) {
-	ctx := testContext(t, 10*time.Second)
+func TestClusterEventCleanupDefaults(t *testing.T) {
 	c := newURLCluster(t, clusterURLFactory{
 		name: "memory",
 		raw: func(t *testing.T, query url.Values) string {
@@ -166,21 +200,105 @@ func TestClusterDefaultEventRetention(t *testing.T) {
 			return (&url.URL{Scheme: "memory", RawQuery: query.Encode()}).String()
 		},
 	}, nil)
-	widgets := defineWidgets(t, c, "retentionwidgets")
+	require.Equal(t, defaultEventRetentionCount, c.options.EventRetentionCount)
+	require.Equal(t, c.options.MasterRenewInterval, c.options.EventCleanupInterval)
+}
 
-	for i := 0; i < defaultEventRetentionCount+2; i++ {
-		_, err := widgets.Create(ctx, fmt.Sprintf("item-%04d", i), widgetSpec{Size: "small"}, CreateOptions{
+func TestClusterRecordsCleanupError(t *testing.T) {
+	options, err := normalizeOptions(Options{
+		Prefix:               "cleanup-error",
+		NodeName:             "cleanup-error",
+		EventCleanupInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	errCleanup := errors.New("cleanup failed")
+	store := &cleanupErrorStore{
+		resourceStore: newMemoryStore(options),
+		err:           errCleanup,
+	}
+	c, err := newCluster(options, store)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+	ctx := testContext(t, time.Second)
+
+	c.cleanupEventsIfMaster(ctx)
+	c.mu.RLock()
+	gotErr := c.cleanupErr
+	gotAt := c.cleanupErrAt
+	c.mu.RUnlock()
+	require.ErrorIs(t, gotErr, errCleanup)
+	require.False(t, gotAt.IsZero())
+
+	store.setError(nil)
+	c.cleanupEventsIfMaster(ctx)
+	c.mu.RLock()
+	gotErr = c.cleanupErr
+	gotAt = c.cleanupErrAt
+	c.mu.RUnlock()
+	require.NoError(t, gotErr)
+	require.True(t, gotAt.IsZero())
+}
+
+func TestBadgerEventCleanupDeletesLargeBacklogInBatches(t *testing.T) {
+	ctx := testContext(t, 10*time.Second)
+	rawURL := (&url.URL{
+		Scheme: "badger",
+		Path:   t.TempDir(),
+		RawQuery: url.Values{
+			"node":                   {"badger-batch-cleanup"},
+			"event_retention_count":  {"2"},
+			"event_cleanup_interval": {"1h"},
+		}.Encode(),
+	}).String()
+	c, err := NewClusterFromURL(rawURL)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+	store, ok := c.store.(*badgerStore)
+	require.True(t, ok)
+	widgets := defineWidgets(t, c, "badgerbatchwidgets")
+
+	for i := 0; i < defaultEventBatchSize+16; i++ {
+		_, err := widgets.Create(ctx, fmt.Sprintf("item-%03d", i), widgetSpec{Size: "small"}, CreateOptions{
 			Annotations: Annotations{"tenant": "t1"},
 		})
 		require.NoError(t, err)
 	}
-
-	watchCtx := testContext(t, 3*time.Second)
-	events, err := widgets.Watch(watchCtx, WatchOptions{Since: "1"})
+	list, err := widgets.List(ctx, ListOptions{})
 	require.NoError(t, err)
-	event := nextWatchEvent(t, events)
-	require.Equal(t, WatchError, event.Type)
-	require.ErrorIs(t, event.Error, ErrResourceVersionTooOld)
+	before := parseStoredRV(list.ResourceVersion) - 2
+	require.Greater(t, before, uint64(defaultEventBatchSize))
+
+	c.cleanupEventsIfMaster(ctx)
+
+	var compacted uint64
+	var stale int
+	store.mu.RLock()
+	err = store.db.View(func(txn *badger.Txn) error {
+		var err error
+		compacted, err = store.compactedRV(txn)
+		if err != nil {
+			return err
+		}
+		prefix := store.eventPrefix("")
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = []byte(prefix)
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
+			if parseRVKey(string(it.Item().Key())) <= before {
+				stale++
+			}
+		}
+		return nil
+	})
+	store.mu.RUnlock()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, compacted, before)
+	require.Zero(t, stale)
+
+	waitForWatchError(t, 3*time.Second, func(ctx context.Context) (<-chan WatchEvent[widgetSpec, widgetStatus], error) {
+		return widgets.Watch(ctx, WatchOptions{Since: "1"})
+	}, ErrResourceVersionTooOld)
 }
 
 func TestBadgerURLPersistsTypedObjects(t *testing.T) {
@@ -624,12 +742,13 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		_ = widgets
 	})
 
-	t.Run("watch_replay_and_compaction", func(t *testing.T) {
+	t.Run("watch_replay_and_retention", func(t *testing.T) {
 		c := newURLCluster(t, factory, url.Values{
-			"event_retention_count": {"2"},
-			"watch_buffer_size":     {"4"},
+			"event_retention_count":  {"2"},
+			"event_cleanup_interval": {"20ms"},
+			"watch_buffer_size":      {"4"},
 		})
-		widgets := defineWidgets(t, c, "compactwidgets")
+		widgets := defineWidgets(t, c, "retentionwidgets")
 		ctx := testContext(t, 5*time.Second)
 
 		_, err := widgets.Create(ctx, "one", widgetSpec{Size: "small"}, CreateOptions{
@@ -662,12 +781,9 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		event = nextWatchEvent(t, events)
 		require.Equal(t, WatchDeleted, event.Type)
 
-		oldCtx := testContext(t, 2*time.Second)
-		oldEvents, err := widgets.Watch(oldCtx, WatchOptions{Since: "1"})
-		require.NoError(t, err)
-		event = nextWatchEvent(t, oldEvents)
-		require.Equal(t, WatchError, event.Type)
-		require.ErrorIs(t, event.Error, ErrResourceVersionTooOld)
+		waitForWatchError(t, 3*time.Second, func(ctx context.Context) (<-chan WatchEvent[widgetSpec, widgetStatus], error) {
+			return widgets.Watch(ctx, WatchOptions{Since: "1"})
+		}, ErrResourceVersionTooOld)
 	})
 
 	t.Run("unstructured_handle", func(t *testing.T) {
@@ -815,6 +931,36 @@ func nextWatchEvent[S, T any](t *testing.T, events <-chan WatchEvent[S, T]) Watc
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for watch event")
 		return WatchEvent[S, T]{}
+	}
+}
+
+func waitForWatchError[S, T any](
+	t *testing.T,
+	timeout time.Duration,
+	open func(context.Context) (<-chan WatchEvent[S, T], error),
+	target error,
+) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		watchCtx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		events, err := open(watchCtx)
+		require.NoError(t, err)
+		select {
+		case event, ok := <-events:
+			cancel()
+			require.True(t, ok)
+			if event.Type == WatchError && errors.Is(event.Error, target) {
+				return
+			}
+		case <-watchCtx.Done():
+			cancel()
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for watch error: %v", target)
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 }
 

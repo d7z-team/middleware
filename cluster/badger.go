@@ -169,10 +169,7 @@ func (s *badgerStore) commit(ctx context.Context, req commitRequest) (*Unstructu
 		if err := txn.Set([]byte(s.eventResourceKey(req.Ref.Resource, nextRV)), eventRaw); err != nil {
 			return err
 		}
-		if err := s.setRV(txn, nextRV); err != nil {
-			return err
-		}
-		return s.enforceRetentionTxn(txn, s.retention)
+		return s.setRV(txn, nextRV)
 	})
 	if err != nil {
 		return nil, resourceEvent{}, err
@@ -229,18 +226,20 @@ func (s *badgerStore) eventsAfter(ctx context.Context, after uint64, resource st
 	return events, rv, err
 }
 
-func (s *badgerStore) compact(ctx context.Context, before uint64) error {
+func (s *badgerStore) cleanupEvents(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ErrClosed
+	before, err := s.cleanupEventsCutoff(ctx)
+	if err != nil || before == 0 {
+		return err
 	}
-	return s.db.Update(func(txn *badger.Txn) error {
-		return s.compactTxn(txn, before)
-	})
+	for {
+		deleted, err := s.deleteEventsBeforeBatch(ctx, before, defaultEventBatchSize)
+		if err != nil || deleted < defaultEventBatchSize {
+			return err
+		}
+	}
 }
 
 func (s *badgerStore) subscribe(ctx context.Context, resource string) (<-chan struct{}, func(), error) {
@@ -411,87 +410,92 @@ func (s *badgerStore) setCompactedRV(txn *badger.Txn, rv uint64) error {
 	return txn.Set([]byte(s.metaKey("compacted-rv")), []byte(formatRV(rv)))
 }
 
-func (s *badgerStore) enforceRetentionTxn(txn *badger.Txn, retention int) error {
-	prefix := s.eventPrefix("")
-	opts := badger.DefaultIteratorOptions
-	opts.Prefix = []byte(prefix)
-	it := txn.NewIterator(opts)
-	defer it.Close()
-
-	type indexedEvent struct {
-		rv       uint64
-		resource string
+func (s *badgerStore) cleanupEventsCutoff(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
-	events := make([]indexedEvent, 0)
-	for it.Rewind(); it.ValidForPrefix([]byte(prefix)); it.Next() {
-		var event resourceEvent
-		if err := it.Item().Value(func(value []byte) error {
-			return json.Unmarshal(value, &event)
-		}); err != nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return 0, ErrClosed
+	}
+	var before uint64
+	err := s.db.View(func(txn *badger.Txn) error {
+		current, err := s.currentRV(txn)
+		if err != nil {
 			return err
 		}
-		events = append(events, indexedEvent{rv: parseStoredRV(event.ResourceVersion), resource: event.Ref.Resource})
-	}
-	if len(events) <= retention {
+		if current > uint64(s.retention) {
+			before = current - uint64(s.retention)
+		}
 		return nil
-	}
-	var compacted uint64
-	for _, event := range events[:len(events)-retention] {
-		if event.rv > compacted {
-			compacted = event.rv
-		}
-		if err := txn.Delete([]byte(s.eventAllKey(event.rv))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
-			return err
-		}
-		if err := txn.Delete([]byte(s.eventResourceKey(event.resource, event.rv))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
-			return err
-		}
-	}
-	previous, err := s.compactedRV(txn)
-	if err != nil {
-		return err
-	}
-	if compacted > previous {
-		return s.setCompactedRV(txn, compacted)
-	}
-	return nil
+	})
+	return before, err
 }
 
-func (s *badgerStore) compactTxn(txn *badger.Txn, before uint64) error {
+func (s *badgerStore) deleteEventsBeforeBatch(ctx context.Context, before uint64, limit int) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, ErrClosed
+	}
+	var deleted int
+	err := s.db.Update(func(txn *badger.Txn) error {
+		var err error
+		deleted, err = s.deleteEventsBeforeTxn(ctx, txn, before, limit)
+		return err
+	})
+	return deleted, err
+}
+
+func (s *badgerStore) deleteEventsBeforeTxn(ctx context.Context, txn *badger.Txn, before uint64, limit int) (int, error) {
+	previous, err := s.compactedRV(txn)
+	if err != nil {
+		return 0, err
+	}
+	if before > previous {
+		if err := s.setCompactedRV(txn, before); err != nil {
+			return 0, err
+		}
+	}
+
 	prefix := s.eventPrefix("")
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = []byte(prefix)
 	it := txn.NewIterator(opts)
 	defer it.Close()
-	toDelete := make([]resourceEvent, 0)
-	for it.Rewind(); it.ValidForPrefix([]byte(prefix)); it.Next() {
+	toDelete := make([]resourceEvent, 0, limit)
+	for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		if parseRVKey(string(it.Item().Key())) > before {
+			break
+		}
 		var event resourceEvent
 		if err := it.Item().Value(func(value []byte) error {
 			return json.Unmarshal(value, &event)
 		}); err != nil {
-			return err
+			return 0, err
 		}
-		if parseStoredRV(event.ResourceVersion) <= before {
-			toDelete = append(toDelete, event)
+		toDelete = append(toDelete, event)
+		if len(toDelete) >= limit {
+			break
 		}
 	}
 	for _, event := range toDelete {
 		rv := parseStoredRV(event.ResourceVersion)
 		if err := txn.Delete([]byte(s.eventAllKey(rv))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
-			return err
+			return 0, err
 		}
 		if err := txn.Delete([]byte(s.eventResourceKey(event.Ref.Resource, rv))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
-			return err
+			return 0, err
 		}
 	}
-	previous, err := s.compactedRV(txn)
-	if err != nil {
-		return err
-	}
-	if before > previous {
-		return s.setCompactedRV(txn, before)
-	}
-	return nil
+	return len(toDelete), nil
 }
 
 func (s *badgerStore) metaKey(name string) string {

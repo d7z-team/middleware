@@ -118,6 +118,83 @@ switched:
 	}))
 }
 
+func TestEtcdEventCleanupRunsOnlyOnMaster(t *testing.T) {
+	factory := newEtcdURLFactory(t)
+	baseQuery := url.Values{
+		"prefix":                 {"master-cleanup"},
+		"event_retention_count":  {"2"},
+		"master_lease_ttl":       {"2s"},
+		"master_renew_interval":  {"100ms"},
+		"node_lease_ttl":         {"3s"},
+		"node_renew_interval":    {"100ms"},
+		"watch_buffer_size":      {"8"},
+		"event_cleanup_interval": {"1h"},
+	}
+	baseQuery.Set("node", "cleanup-master")
+	rawMaster := factory.raw(t, baseQuery)
+	baseQuery.Set("node", "cleanup-worker")
+	baseQuery.Set("event_cleanup_interval", "50ms")
+	rawWorker := factory.raw(t, baseQuery)
+
+	master, err := NewClusterFromURL(rawMaster)
+	require.NoError(t, err)
+	masterClosed := false
+	t.Cleanup(func() {
+		if !masterClosed {
+			require.NoError(t, master.Close())
+		}
+	})
+	worker, err := NewClusterFromURL(rawWorker)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, worker.Close()) })
+
+	ctx := testContext(t, 8*time.Second)
+	info, err := master.Master(ctx)
+	require.NoError(t, err)
+	require.True(t, info.Valid)
+	require.Equal(t, "cleanup-master", info.Node)
+	isMaster, err := worker.IsMaster(ctx)
+	require.NoError(t, err)
+	require.False(t, isMaster)
+
+	widgets := defineWidgets(t, worker, "cleanupwidgets")
+	list, err := widgets.List(ctx, ListOptions{})
+	require.NoError(t, err)
+	since := list.ResourceVersion
+	for i := 0; i < 4; i++ {
+		_, err := widgets.Create(ctx, fmt.Sprintf("item-%d", i), widgetSpec{Size: "small"}, CreateOptions{
+			Annotations: Annotations{"tenant": "t1"},
+		})
+		require.NoError(t, err)
+	}
+
+	replayCtx, replayCancel := context.WithTimeout(context.Background(), time.Second)
+	replayEvents, err := widgets.Watch(replayCtx, WatchOptions{Since: since})
+	require.NoError(t, err)
+	event := nextWatchEvent(t, replayEvents)
+	replayCancel()
+	require.NotEqual(t, WatchError, event.Type)
+
+	require.NoError(t, master.Close())
+	masterClosed = true
+	deadline := time.After(4 * time.Second)
+	for {
+		info, err = worker.Master(ctx)
+		require.NoError(t, err)
+		if info.Valid && info.Node == "cleanup-worker" {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for cleanup worker to become master")
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	waitForWatchError(t, 4*time.Second, func(ctx context.Context) (<-chan WatchEvent[widgetSpec, widgetStatus], error) {
+		return widgets.Watch(ctx, WatchOptions{Since: since})
+	}, ErrResourceVersionTooOld)
+}
+
 func newEtcdURLFactory(t *testing.T) clusterURLFactory {
 	t.Helper()
 	client, err := clientv3.New(clientv3.Config{

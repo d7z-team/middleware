@@ -145,7 +145,6 @@ func (s *etcdStore) commit(ctx context.Context, req commitRequest) (*Unstructure
 			return nil, resourceEvent{}, err
 		}
 		if txnResp.Succeeded {
-			_ = s.enforceRetention(ctx, s.retention)
 			return cloneUnstructuredPtr(&out), event, nil
 		}
 		lastErr = ErrConflict
@@ -198,8 +197,19 @@ func (s *etcdStore) eventsAfter(ctx context.Context, after uint64, resource stri
 	return events, current, nil
 }
 
-func (s *etcdStore) compact(ctx context.Context, before uint64) error {
+func (s *etcdStore) cleanupEvents(ctx context.Context) error {
 	if err := s.ensureOpen(ctx); err != nil {
+		return err
+	}
+	current, err := s.currentRV(ctx)
+	if err != nil {
+		return err
+	}
+	if current <= uint64(s.retention) {
+		return nil
+	}
+	before := current - uint64(s.retention)
+	if err := s.advanceCompactedRV(ctx, before); err != nil {
 		return err
 	}
 	return s.deleteEventsBefore(ctx, before)
@@ -385,60 +395,72 @@ func (s *etcdStore) metaRVCompare(raw string, version int64) clientv3.Cmp {
 	return clientv3.Compare(clientv3.Value(s.metaKey("rv")), "=", raw)
 }
 
-func (s *etcdStore) enforceRetention(ctx context.Context, retention int) error {
-	prefix := s.eventPrefix("")
-	resp, err := s.client.Get(ctx, prefix, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
-	if err != nil {
-		return err
-	}
-	if len(resp.Kvs) <= retention {
-		return nil
-	}
-	cutoff := parseRVKey(string(resp.Kvs[len(resp.Kvs)-retention-1].Key))
-	return s.deleteEventsBefore(ctx, cutoff)
-}
-
 func (s *etcdStore) deleteEventsBefore(ctx context.Context, before uint64) error {
 	prefix := s.eventPrefix("")
-	resp, err := s.client.Get(
-		ctx,
-		prefix,
-		clientv3.WithRange(prefix+rvKey(before+1)),
-		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
-	)
-	if err != nil {
-		return err
-	}
-	ops := make([]clientv3.Op, 0, len(resp.Kvs)*2+1)
-	for _, kv := range resp.Kvs {
-		var event resourceEvent
-		if err := json.Unmarshal(kv.Value, &event); err != nil {
-			return err
-		}
-		rv := parseStoredRV(event.ResourceVersion)
-		ops = append(ops,
-			clientv3.OpDelete(s.eventAllKey(rv)),
-			clientv3.OpDelete(s.eventResourceKey(event.Ref.Resource, rv)),
+	end := prefix + rvKey(before+1)
+	for {
+		resp, err := s.client.Get(
+			ctx,
+			prefix,
+			clientv3.WithRange(end),
+			clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+			clientv3.WithLimit(60),
 		)
-	}
-	currentCompacted, err := s.readUint(ctx, s.metaKey("compacted-rv"))
-	if err != nil {
-		return err
-	}
-	if before > currentCompacted {
-		ops = append(ops, clientv3.OpPut(s.metaKey("compacted-rv"), formatRV(before)))
-	}
-	for len(ops) > 0 {
-		batch := ops
-		if len(batch) > 120 {
-			batch = batch[:120]
-		}
-		if _, err := s.client.Txn(ctx).Then(batch...).Commit(); err != nil {
+		if err != nil {
 			return err
 		}
-		ops = ops[len(batch):]
+		if len(resp.Kvs) == 0 {
+			return nil
+		}
+		ops := make([]clientv3.Op, 0, len(resp.Kvs)*2)
+		for _, kv := range resp.Kvs {
+			var event resourceEvent
+			if err := json.Unmarshal(kv.Value, &event); err != nil {
+				return err
+			}
+			rv := parseStoredRV(event.ResourceVersion)
+			ops = append(ops,
+				clientv3.OpDelete(s.eventAllKey(rv)),
+				clientv3.OpDelete(s.eventResourceKey(event.Ref.Resource, rv)),
+			)
+		}
+		if _, err := s.client.Txn(ctx).Then(ops...).Commit(); err != nil {
+			return err
+		}
 	}
-	return nil
+}
+
+func (s *etcdStore) advanceCompactedRV(ctx context.Context, before uint64) error {
+	key := s.metaKey("compacted-rv")
+	for {
+		resp, err := s.client.Get(ctx, key, clientv3.WithLimit(1))
+		if err != nil {
+			return err
+		}
+		var current uint64
+		var cmp clientv3.Cmp
+		if len(resp.Kvs) == 0 {
+			cmp = clientv3.Compare(clientv3.Version(key), "=", 0)
+		} else {
+			current = parseStoredRV(string(resp.Kvs[0].Value))
+			if before <= current {
+				return nil
+			}
+			cmp = clientv3.Compare(clientv3.ModRevision(key), "=", resp.Kvs[0].ModRevision)
+		}
+		txnResp, err := s.client.Txn(ctx).If(cmp).Then(clientv3.OpPut(key, formatRV(before))).Commit()
+		if err != nil {
+			return err
+		}
+		if txnResp.Succeeded {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func (s *etcdStore) metaKey(name string) string {

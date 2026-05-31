@@ -30,6 +30,11 @@ type Cluster struct {
 	leaseDone        chan struct{}
 	masterCancel     context.CancelFunc
 	masterDone       chan struct{}
+	cleanupCancel    context.CancelFunc
+	cleanupDone      chan struct{}
+	cleanupWake      chan struct{}
+	cleanupErr       error
+	cleanupErrAt     time.Time
 	nodes            *Resource[NodeSpec, NodeStatus]
 	masters          *Resource[MasterSpec, MasterStatus]
 }
@@ -99,10 +104,11 @@ func newCluster(options Options, store resourceStore) (*Cluster, error) {
 		_ = c.Close()
 		return nil, err
 	}
-	if err := c.maintainMaster(ctx); err != nil {
+	if _, err := c.maintainMaster(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
+	c.startEventCleanup()
 	c.startMasterElection()
 	return c, nil
 }
@@ -130,12 +136,15 @@ func normalizeOptions(options Options) (Options, error) {
 		options.NodeRenewInterval = defaultNodeRenewInterval
 		if options.NodeRenewInterval >= options.NodeLeaseTTL {
 			options.NodeRenewInterval = options.NodeLeaseTTL / 3
+			if options.NodeRenewInterval < minBackgroundInterval && options.NodeLeaseTTL > minBackgroundInterval {
+				options.NodeRenewInterval = minBackgroundInterval
+			}
 		}
 	}
-	if options.NodeRenewInterval <= 0 || options.NodeRenewInterval >= options.NodeLeaseTTL {
+	if options.NodeRenewInterval < minBackgroundInterval || options.NodeRenewInterval >= options.NodeLeaseTTL {
 		return Options{}, ErrInvalidConfig
 	}
-	if options.MasterLeaseTTL < 0 || options.MasterRenewInterval < 0 || options.MasterHistoryLimit < 0 {
+	if options.MasterLeaseTTL < 0 || options.MasterRenewInterval < 0 || options.MasterHistoryLimit < 0 || options.EventCleanupInterval < 0 {
 		return Options{}, ErrInvalidConfig
 	}
 	if options.MasterLeaseTTL == 0 {
@@ -145,13 +154,25 @@ func normalizeOptions(options Options) (Options, error) {
 		options.MasterRenewInterval = options.NodeRenewInterval
 		if options.MasterRenewInterval >= options.MasterLeaseTTL {
 			options.MasterRenewInterval = options.MasterLeaseTTL / 3
+			if options.MasterRenewInterval < minBackgroundInterval && options.MasterLeaseTTL > minBackgroundInterval {
+				options.MasterRenewInterval = minBackgroundInterval
+			}
 		}
 	}
-	if options.MasterRenewInterval <= 0 || options.MasterRenewInterval >= options.MasterLeaseTTL {
+	if options.MasterRenewInterval < minBackgroundInterval || options.MasterRenewInterval >= options.MasterLeaseTTL {
 		return Options{}, ErrInvalidConfig
 	}
 	if options.MasterHistoryLimit == 0 {
 		options.MasterHistoryLimit = defaultMasterHistoryLimit
+	}
+	if options.EventCleanupInterval == 0 {
+		options.EventCleanupInterval = options.MasterRenewInterval
+		if options.EventCleanupInterval < minBackgroundInterval {
+			options.EventCleanupInterval = minBackgroundInterval
+		}
+	}
+	if options.EventCleanupInterval < minBackgroundInterval {
+		return Options{}, ErrInvalidConfig
 	}
 	return options, nil
 }
@@ -253,17 +274,6 @@ func (c *Cluster) Unstructured(resource string) (*UnstructuredResource, error) {
 	return &UnstructuredResource{cluster: c, def: def}, nil
 }
 
-func (c *Cluster) Compact(ctx context.Context, beforeRV string) error {
-	if err := c.ensureActive(ctx); err != nil {
-		return err
-	}
-	rv, err := parseRequiredRV(beforeRV)
-	if err != nil {
-		return err
-	}
-	return c.store.compact(ctx, rv)
-}
-
 func (c *Cluster) Close() error {
 	c.mu.Lock()
 	if c.closed || c.closing {
@@ -271,10 +281,18 @@ func (c *Cluster) Close() error {
 		return nil
 	}
 	c.closing = true
+	cleanupCancel := c.cleanupCancel
+	cleanupDone := c.cleanupDone
 	masterCancel := c.masterCancel
 	masterDone := c.masterDone
 	c.mu.Unlock()
 
+	if cleanupCancel != nil {
+		cleanupCancel()
+		if cleanupDone != nil {
+			<-cleanupDone
+		}
+	}
 	if masterCancel != nil {
 		masterCancel()
 		if masterDone != nil {
@@ -418,13 +436,7 @@ func (c *Cluster) startNodeRenewal() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				timeout := c.options.NodeRenewInterval
-				if timeout < time.Second {
-					timeout = time.Second
-				}
-				if timeout > c.options.NodeLeaseTTL {
-					timeout = c.options.NodeLeaseTTL
-				}
+				timeout := operationTimeout(c.options.NodeRenewInterval, c.options.NodeLeaseTTL)
 				renewCtx, renewCancel := context.WithTimeout(context.Background(), timeout)
 				err := c.store.renewNode(renewCtx, c.options.NodeName, c.nodeToken, c.options.NodeLeaseTTL)
 				renewCancel()
@@ -440,6 +452,72 @@ func (c *Cluster) startNodeRenewal() {
 	}()
 }
 
+func (c *Cluster) startEventCleanup() {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	wake := make(chan struct{}, 1)
+	c.cleanupCancel = cancel
+	c.cleanupDone = done
+	c.cleanupWake = wake
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(c.options.EventCleanupInterval)
+		defer ticker.Stop()
+		c.cleanupEventsIfMaster(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-wake:
+				c.cleanupEventsIfMaster(ctx)
+			case <-ticker.C:
+				c.cleanupEventsIfMaster(ctx)
+			}
+		}
+	}()
+}
+
+func (c *Cluster) triggerEventCleanup() {
+	if c.cleanupWake == nil {
+		return
+	}
+	select {
+	case c.cleanupWake <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Cluster) cleanupEventsIfMaster(ctx context.Context) {
+	cleanupCtx, cancel := context.WithTimeout(ctx, operationTimeout(c.options.EventCleanupInterval, c.options.MasterLeaseTTL))
+	defer cancel()
+	isMaster, err := c.isCurrentMaster(cleanupCtx)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, ErrClosed) && !errors.Is(err, ErrNodeLeaseLost) {
+			c.setCleanupError(err)
+		}
+		return
+	}
+	if !isMaster {
+		return
+	}
+	err = c.store.cleanupEvents(cleanupCtx)
+	if errors.Is(err, context.Canceled) || errors.Is(err, ErrClosed) || errors.Is(err, ErrNodeLeaseLost) {
+		return
+	}
+	c.setCleanupError(err)
+}
+
+func (c *Cluster) setCleanupError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cleanupErr = err
+	if err == nil {
+		c.cleanupErrAt = time.Time{}
+		return
+	}
+	c.cleanupErrAt = time.Now().UTC()
+}
+
 func (c *Cluster) markNodeLeaseLost() {
 	c.mu.Lock()
 	if c.closed || c.closing || c.leaseLost {
@@ -447,10 +525,18 @@ func (c *Cluster) markNodeLeaseLost() {
 		return
 	}
 	c.leaseLost = true
+	cleanupCancel := c.cleanupCancel
+	cleanupDone := c.cleanupDone
 	cancel := c.masterCancel
 	done := c.masterDone
 	c.mu.Unlock()
 
+	if cleanupCancel != nil {
+		cleanupCancel()
+		if cleanupDone != nil {
+			<-cleanupDone
+		}
+	}
 	if cancel != nil {
 		cancel()
 		if done != nil {
@@ -494,6 +580,17 @@ func (c *Cluster) withNodeLeaseStatus(status NodeStatus) NodeStatus {
 	status.LeaseUntil = leaseUntil
 	status.UpdatedAt = time.Now().UTC()
 	return status
+}
+
+func operationTimeout(interval, ttl time.Duration) time.Duration {
+	timeout := interval
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	if timeout > ttl {
+		timeout = ttl
+	}
+	return timeout
 }
 
 func resourceInfo(def *resourceDefinition) ResourceInfo {

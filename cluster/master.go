@@ -86,18 +86,15 @@ func (c *Cluster) startMasterElection() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				timeout := c.options.MasterRenewInterval
-				if timeout < time.Second {
-					timeout = time.Second
-				}
-				if timeout > c.options.MasterLeaseTTL {
-					timeout = c.options.MasterLeaseTTL
-				}
+				timeout := operationTimeout(c.options.MasterRenewInterval, c.options.MasterLeaseTTL)
 				maintainCtx, maintainCancel := context.WithTimeout(context.Background(), timeout)
-				err := c.maintainMaster(maintainCtx)
+				acquired, err := c.maintainMaster(maintainCtx)
 				maintainCancel()
 				if errors.Is(err, ErrClosed) || errors.Is(err, ErrNodeLeaseLost) {
 					return
+				}
+				if acquired {
+					c.triggerEventCleanup()
 				}
 			}
 		}
@@ -122,13 +119,13 @@ func (c *Cluster) ensureMaster(ctx context.Context) (*Object[MasterSpec, MasterS
 	return c.masters.Get(ctx, defaultMasterName)
 }
 
-func (c *Cluster) maintainMaster(ctx context.Context) error {
+func (c *Cluster) maintainMaster(ctx context.Context) (bool, error) {
 	if err := c.ensureActive(ctx); err != nil {
-		return err
+		return false, err
 	}
 	master, err := c.ensureMaster(ctx)
 	if err != nil {
-		return err
+		return false, err
 	}
 	now := time.Now().UTC()
 	status := master.Status
@@ -140,12 +137,12 @@ func (c *Cluster) maintainMaster(ctx context.Context) error {
 			ResourceVersion: master.Metadata.ResourceVersion,
 		})
 		if errors.Is(err, ErrConflict) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	if active {
-		return nil
+		return false, nil
 	}
 
 	reason := masterTransitionExpired
@@ -172,9 +169,20 @@ func (c *Cluster) maintainMaster(ctx context.Context) error {
 		ResourceVersion: master.Metadata.ResourceVersion,
 	})
 	if errors.Is(err, ErrConflict) {
-		return nil
+		return false, nil
 	}
-	return err
+	return err == nil, err
+}
+
+func (c *Cluster) isCurrentMaster(ctx context.Context) (bool, error) {
+	master, err := c.masters.Get(ctx, defaultMasterName)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return master.Status.Node == c.options.NodeName && master.Status.LeaseUntil.After(time.Now().UTC()), nil
 }
 
 func (c *Cluster) stepDownMaster(ctx context.Context, reason string, requireMaster bool) error {

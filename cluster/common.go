@@ -53,11 +53,12 @@ import (
 //   - node: required unique node name for this cluster client
 //   - prefix: backend key prefix for badger and etcd
 //   - node_lease_ttl: node lease TTL, default 30s
-//   - node_renew_interval: node lease renew interval, default 10s
+//   - node_renew_interval: node lease renew interval, default 10s, minimum 10ms
 //   - master_lease_ttl: master lease TTL, default follows node_lease_ttl
-//   - master_renew_interval: master lease renew interval, default follows node_renew_interval
+//   - master_renew_interval: master lease renew interval, default follows node_renew_interval, minimum 10ms
 //   - master_history_limit: number of recent master transitions to retain, default 2000
 //   - event_retention_count: number of recent watch events to retain, default 2000
+//   - event_cleanup_interval: master-only watch event cleanup interval, default follows master_renew_interval, minimum 10ms
 //   - watch_buffer_size: per-watch channel buffer size
 //
 // Example:
@@ -125,7 +126,7 @@ func clusterOptionsFromURL(parsed *url.URL) (Options, error) {
 	}
 	if value := query.Get("node_renew_interval"); value != "" {
 		parsedValue, err := time.ParseDuration(value)
-		if err != nil || parsedValue <= 0 {
+		if err != nil || parsedValue < minBackgroundInterval {
 			return Options{}, fmt.Errorf("%w: invalid node_renew_interval", ErrInvalidConfig)
 		}
 		options.NodeRenewInterval = parsedValue
@@ -139,7 +140,7 @@ func clusterOptionsFromURL(parsed *url.URL) (Options, error) {
 	}
 	if value := query.Get("master_renew_interval"); value != "" {
 		parsedValue, err := time.ParseDuration(value)
-		if err != nil || parsedValue <= 0 {
+		if err != nil || parsedValue < minBackgroundInterval {
 			return Options{}, fmt.Errorf("%w: invalid master_renew_interval", ErrInvalidConfig)
 		}
 		options.MasterRenewInterval = parsedValue
@@ -157,6 +158,13 @@ func clusterOptionsFromURL(parsed *url.URL) (Options, error) {
 			return Options{}, fmt.Errorf("%w: invalid event_retention_count", ErrInvalidConfig)
 		}
 		options.EventRetentionCount = parsedValue
+	}
+	if value := query.Get("event_cleanup_interval"); value != "" {
+		parsedValue, err := time.ParseDuration(value)
+		if err != nil || parsedValue < minBackgroundInterval {
+			return Options{}, fmt.Errorf("%w: invalid event_cleanup_interval", ErrInvalidConfig)
+		}
+		options.EventCleanupInterval = parsedValue
 	}
 	if value := query.Get("watch_buffer_size"); value != "" {
 		parsedValue, err := strconv.Atoi(value)
