@@ -255,15 +255,17 @@ func TestBadgerEventCleanupDeletesLargeBacklogInBatches(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, c.Close()) })
 	store, ok := c.store.(*badgerStore)
 	require.True(t, ok)
-	widgets := defineWidgets(t, c, "badgerbatchwidgets")
+	widgets := defineNamespacedWidgets(t, c, "badgerbatchwidgets")
+	batch, err := widgets.Namespace("batch")
+	require.NoError(t, err)
 
 	for i := 0; i < defaultEventBatchSize+16; i++ {
-		_, err := widgets.Create(ctx, fmt.Sprintf("item-%03d", i), widgetSpec{Size: "small"}, CreateOptions{
+		_, err := batch.Create(ctx, fmt.Sprintf("item-%03d", i), widgetSpec{Size: "small"}, CreateOptions{
 			Annotations: Annotations{"tenant": "t1"},
 		})
 		require.NoError(t, err)
 	}
-	list, err := widgets.List(ctx, ListOptions{})
+	list, err := batch.List(ctx, ListOptions{})
 	require.NoError(t, err)
 	before := parseStoredRV(list.ResourceVersion) - 2
 	require.Greater(t, before, uint64(defaultEventBatchSize))
@@ -271,7 +273,12 @@ func TestBadgerEventCleanupDeletesLargeBacklogInBatches(t *testing.T) {
 	c.cleanupEventsIfMaster(ctx)
 
 	var compacted uint64
-	var stale int
+	eventPrefixes := []string{
+		store.eventPrefix(resourceScope{}),
+		store.eventPrefix(resourceScope{Resource: "badgerbatchwidgets", AllNamespaces: true}),
+		store.eventPrefix(resourceScope{Resource: "badgerbatchwidgets", Namespace: "batch"}),
+	}
+	staleByPrefix := make(map[string]int, len(eventPrefixes))
 	store.mu.RLock()
 	err = store.db.View(func(txn *badger.Txn) error {
 		var err error
@@ -279,25 +286,29 @@ func TestBadgerEventCleanupDeletesLargeBacklogInBatches(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		prefix := store.eventPrefix("")
-		opts := badger.DefaultIteratorOptions
-		opts.Prefix = []byte(prefix)
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
-			if parseRVKey(string(it.Item().Key())) <= before {
-				stale++
+		for _, prefix := range eventPrefixes {
+			staleByPrefix[prefix] = 0
+			opts := badger.DefaultIteratorOptions
+			opts.Prefix = []byte(prefix)
+			it := txn.NewIterator(opts)
+			for it.Seek([]byte(prefix)); it.ValidForPrefix([]byte(prefix)); it.Next() {
+				if parseRVKey(string(it.Item().Key())) <= before {
+					staleByPrefix[prefix]++
+				}
 			}
+			it.Close()
 		}
 		return nil
 	})
 	store.mu.RUnlock()
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, compacted, before)
-	require.Zero(t, stale)
+	for prefix, stale := range staleByPrefix {
+		require.Zero(t, stale, prefix)
+	}
 
 	waitForWatchError(t, 3*time.Second, func(ctx context.Context) (<-chan WatchEvent[widgetSpec, widgetStatus], error) {
-		return widgets.Watch(ctx, WatchOptions{Since: "1"})
+		return batch.Watch(ctx, WatchOptions{Since: "1"})
 	}, ErrResourceVersionTooOld)
 }
 
@@ -478,6 +489,117 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.NoError(t, err)
 		require.Len(t, named.Items, 1)
 		require.Equal(t, "alpha", named.Items[0].Metadata.Name)
+	})
+
+	t.Run("namespaced_resources", func(t *testing.T) {
+		c := newURLCluster(t, factory, nil)
+		widgets := defineNamespacedWidgets(t, c, "namespacedwidgets")
+		ctx := testContext(t, 6*time.Second)
+
+		_, err := widgets.Create(ctx, "same", widgetSpec{Size: "small"}, CreateOptions{
+			Annotations: Annotations{"tenant": "t1"},
+		})
+		require.ErrorIs(t, err, ErrInvalidObject)
+		_, err = widgets.Get(ctx, "same")
+		require.ErrorIs(t, err, ErrInvalidObject)
+		_, err = c.Nodes().Namespace("team-a")
+		require.ErrorIs(t, err, ErrInvalidObject)
+		_, err = widgets.Namespace("../escape")
+		require.ErrorIs(t, err, ErrInvalidObject)
+
+		teamA, err := widgets.Namespace("team-a")
+		require.NoError(t, err)
+		teamB, err := widgets.Namespace("team-b")
+		require.NoError(t, err)
+		all, err := widgets.AllNamespaces()
+		require.NoError(t, err)
+
+		createdA, err := teamA.Create(ctx, "same", widgetSpec{Size: "small", Owner: "team-a"}, CreateOptions{
+			Annotations: Annotations{"tenant": "t1"},
+		})
+		require.NoError(t, err)
+		require.Equal(t, "team-a", createdA.Metadata.Namespace)
+		createdB, err := teamB.Create(ctx, "same", widgetSpec{Size: "medium", Owner: "team-b"}, CreateOptions{
+			Annotations: Annotations{"tenant": "t2"},
+		})
+		require.NoError(t, err)
+		require.Equal(t, "team-b", createdB.Metadata.Namespace)
+
+		gotA, err := teamA.Get(ctx, "same")
+		require.NoError(t, err)
+		require.Equal(t, createdA.Metadata.UID, gotA.Metadata.UID)
+		gotB, err := teamB.Get(ctx, "same")
+		require.NoError(t, err)
+		require.Equal(t, createdB.Metadata.UID, gotB.Metadata.UID)
+
+		listA, err := teamA.List(ctx, ListOptions{})
+		require.NoError(t, err)
+		require.Len(t, listA.Items, 1)
+		require.Equal(t, "team-a", listA.Items[0].Metadata.Namespace)
+		listAll, err := all.List(ctx, ListOptions{})
+		require.NoError(t, err)
+		require.Len(t, listAll.Items, 2)
+		listBase, err := widgets.List(ctx, ListOptions{
+			Selector: Where(Field("metadata.namespace").Eq("team-b")),
+		})
+		require.NoError(t, err)
+		require.Len(t, listBase.Items, 1)
+		require.Equal(t, createdB.Metadata.UID, listBase.Items[0].Metadata.UID)
+		rawWidgets, err := c.Unstructured("namespacedwidgets")
+		require.NoError(t, err)
+		_, err = rawWidgets.Get(ctx, "same")
+		require.ErrorIs(t, err, ErrInvalidObject)
+		rawTeamB, err := rawWidgets.Namespace("team-b")
+		require.NoError(t, err)
+		rawB, err := rawTeamB.Get(ctx, "same")
+		require.NoError(t, err)
+		require.Equal(t, createdB.Metadata.UID, rawB.Metadata.UID)
+
+		_, err = all.Patch(ctx, "same", []byte(`{"spec":{"size":"large"}}`), PatchOptions{})
+		require.ErrorIs(t, err, ErrInvalidObject)
+		_, err = teamA.Patch(ctx, "same", []byte(`{"metadata":{"namespace":"team-b"}}`), PatchOptions{})
+		require.ErrorIs(t, err, ErrInvalidObject)
+		wrongNamespace := *createdA
+		wrongNamespace.Metadata.Namespace = "team-b"
+		_, err = teamA.Update(ctx, &wrongNamespace, UpdateOptions{})
+		require.ErrorIs(t, err, ErrInvalidObject)
+
+		watchCtx := testContext(t, 5*time.Second)
+		teamAEvents, err := teamA.Watch(watchCtx, WatchOptions{Since: listAll.ResourceVersion})
+		require.NoError(t, err)
+		allEvents, err := all.Watch(watchCtx, WatchOptions{Since: listAll.ResourceVersion})
+		require.NoError(t, err)
+
+		patchedB, err := teamB.Patch(ctx, "same", []byte(`{"spec":{"size":"large"}}`), PatchOptions{})
+		require.NoError(t, err)
+		event := nextWatchEvent(t, allEvents)
+		require.Equal(t, WatchModified, event.Type)
+		require.Equal(t, patchedB.Metadata.ResourceVersion, event.ResourceVersion)
+		require.Equal(t, "team-b", event.Object.Metadata.Namespace)
+		requireNoWatchEvent(t, teamAEvents, 300*time.Millisecond)
+
+		patchedA, err := teamA.Patch(ctx, "same", []byte(`{"spec":{"size":"medium"}}`), PatchOptions{})
+		require.NoError(t, err)
+		event = nextWatchEvent(t, teamAEvents)
+		require.Equal(t, WatchModified, event.Type)
+		require.Equal(t, patchedA.Metadata.ResourceVersion, event.ResourceVersion)
+		require.Equal(t, "team-a", event.Object.Metadata.Namespace)
+		event = nextWatchEvent(t, allEvents)
+		require.Equal(t, WatchModified, event.Type)
+		require.Equal(t, patchedA.Metadata.ResourceVersion, event.ResourceVersion)
+		require.Equal(t, "team-a", event.Object.Metadata.Namespace)
+
+		_, err = teamA.Delete(ctx, "same", DeleteOptions{})
+		require.NoError(t, err)
+		_, err = teamA.Get(ctx, "same")
+		require.ErrorIs(t, err, ErrNotFound)
+		gotB, err = teamB.Get(ctx, "same")
+		require.NoError(t, err)
+		require.Equal(t, createdB.Metadata.UID, gotB.Metadata.UID)
+
+		info, err := c.Resource("namespacedwidgets")
+		require.NoError(t, err)
+		require.True(t, info.Namespaced)
 	})
 
 	t.Run("watch_selectors_annotations_changed_paths", func(t *testing.T) {
@@ -894,10 +1016,21 @@ func testContext(t *testing.T, timeout time.Duration) context.Context {
 
 func defineWidgets(t *testing.T, c *Cluster, resource string) *Resource[widgetSpec, widgetStatus] {
 	t.Helper()
+	return defineWidgetResource(t, c, resource, false)
+}
+
+func defineNamespacedWidgets(t *testing.T, c *Cluster, resource string) *Resource[widgetSpec, widgetStatus] {
+	t.Helper()
+	return defineWidgetResource(t, c, resource, true)
+}
+
+func defineWidgetResource(t *testing.T, c *Cluster, resource string, namespaced bool) *Resource[widgetSpec, widgetStatus] {
+	t.Helper()
 	widgets, err := Define(c, ResourceDef[widgetSpec, widgetStatus]{
 		Resource:   resource,
 		APIVersion: "example.test/v1",
 		Kind:       "Widget",
+		Namespaced: namespaced,
 		Annotations: []AnnotationRule{
 			{Key: "tenant", Required: true, Immutable: true, Indexed: true},
 			{Key: "controller", Indexed: true, Default: "default-controller"},
@@ -920,6 +1053,16 @@ func defineWidgets(t *testing.T, c *Cluster, resource string) *Resource[widgetSp
 	})
 	require.NoError(t, err)
 	return widgets
+}
+
+func requireNoWatchEvent[S, T any](t *testing.T, events <-chan WatchEvent[S, T], wait time.Duration) {
+	t.Helper()
+	select {
+	case event, ok := <-events:
+		require.True(t, ok)
+		t.Fatalf("unexpected watch event: %#v", event)
+	case <-time.After(wait):
+	}
 }
 
 func nextWatchEvent[S, T any](t *testing.T, events <-chan WatchEvent[S, T]) WatchEvent[S, T] {

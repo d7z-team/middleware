@@ -67,7 +67,7 @@ func (s *badgerStore) get(ctx context.Context, ref objectRef) (*Unstructured, er
 	return cloneUnstructuredPtr(&out), nil
 }
 
-func (s *badgerStore) list(ctx context.Context, resource string) ([]Unstructured, uint64, error) {
+func (s *badgerStore) list(ctx context.Context, scope resourceScope) ([]Unstructured, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
@@ -84,7 +84,7 @@ func (s *badgerStore) list(ctx context.Context, resource string) ([]Unstructured
 		if err != nil {
 			return err
 		}
-		prefix := s.objectPrefix(resource)
+		prefix := s.objectPrefix(scope)
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = []byte(prefix)
 		it := txn.NewIterator(opts)
@@ -99,7 +99,9 @@ func (s *badgerStore) list(ctx context.Context, resource string) ([]Unstructured
 			}); err != nil {
 				return err
 			}
-			objects = append(objects, cloneUnstructured(obj))
+			if objectMatchesScope(obj, scope) {
+				objects = append(objects, cloneUnstructured(obj))
+			}
 		}
 		return nil
 	})
@@ -169,16 +171,21 @@ func (s *badgerStore) commit(ctx context.Context, req commitRequest) (*Unstructu
 		if err := txn.Set([]byte(s.eventResourceKey(req.Ref.Resource, nextRV)), eventRaw); err != nil {
 			return err
 		}
+		if req.Ref.Namespace != "" {
+			if err := txn.Set([]byte(s.eventNamespaceKey(req.Ref, nextRV)), eventRaw); err != nil {
+				return err
+			}
+		}
 		return s.setRV(txn, nextRV)
 	})
 	if err != nil {
 		return nil, resourceEvent{}, err
 	}
-	s.hub.notify(req.Ref.Resource)
+	s.hub.notify(req.Ref)
 	return cloneUnstructuredPtr(&out), event, nil
 }
 
-func (s *badgerStore) eventsAfter(ctx context.Context, after uint64, resource string, limit int) ([]resourceEvent, uint64, error) {
+func (s *badgerStore) eventsAfter(ctx context.Context, after uint64, scope resourceScope, limit int) ([]resourceEvent, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
@@ -201,7 +208,7 @@ func (s *badgerStore) eventsAfter(ctx context.Context, after uint64, resource st
 		if after < compacted {
 			return ErrResourceVersionTooOld
 		}
-		prefix := s.eventPrefix(resource)
+		prefix := s.eventPrefix(scope)
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = []byte(prefix)
 		it := txn.NewIterator(opts)
@@ -209,6 +216,12 @@ func (s *badgerStore) eventsAfter(ctx context.Context, after uint64, resource st
 		for it.Seek([]byte(prefix + rvKey(after+1))); it.ValidForPrefix([]byte(prefix)); it.Next() {
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if scope.Resource != "" && scope.Namespace == "" {
+				suffix := strings.TrimPrefix(string(it.Item().Key()), prefix)
+				if suffix == "" || suffix[0] < '0' || suffix[0] > '9' {
+					break
+				}
 			}
 			var event resourceEvent
 			if err := it.Item().Value(func(value []byte) error {
@@ -242,11 +255,11 @@ func (s *badgerStore) cleanupEvents(ctx context.Context) error {
 	}
 }
 
-func (s *badgerStore) subscribe(ctx context.Context, resource string) (<-chan struct{}, func(), error) {
+func (s *badgerStore) subscribe(ctx context.Context, scope resourceScope) (<-chan struct{}, func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	return s.hub.subscribe(resource)
+	return s.hub.subscribe(scope)
 }
 
 func (s *badgerStore) acquireNode(ctx context.Context, name string, ttl time.Duration) (string, error) {
@@ -462,7 +475,7 @@ func (s *badgerStore) deleteEventsBeforeTxn(ctx context.Context, txn *badger.Txn
 		}
 	}
 
-	prefix := s.eventPrefix("")
+	prefix := s.eventPrefix(resourceScope{})
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = []byte(prefix)
 	it := txn.NewIterator(opts)
@@ -494,6 +507,11 @@ func (s *badgerStore) deleteEventsBeforeTxn(ctx context.Context, txn *badger.Txn
 		if err := txn.Delete([]byte(s.eventResourceKey(event.Ref.Resource, rv))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 			return 0, err
 		}
+		if event.Ref.Namespace != "" {
+			if err := txn.Delete([]byte(s.eventNamespaceKey(event.Ref, rv))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+				return 0, err
+			}
+		}
 	}
 	return len(toDelete), nil
 }
@@ -503,29 +521,42 @@ func (s *badgerStore) metaKey(name string) string {
 }
 
 func (s *badgerStore) objectKey(ref objectRef) string {
+	if ref.Namespace != "" {
+		return s.prefix + "objects/" + ref.Resource + "/namespaces/" + ref.Namespace + "/" + ref.Name
+	}
 	return s.prefix + "objects/" + ref.Resource + "/" + ref.Name
 }
 
-func (s *badgerStore) objectPrefix(resource string) string {
-	if resource == "" {
+func (s *badgerStore) objectPrefix(scope resourceScope) string {
+	if scope.Resource == "" {
 		return s.prefix + "objects/"
 	}
-	return s.prefix + "objects/" + resource + "/"
+	if scope.Namespace != "" {
+		return s.prefix + "objects/" + scope.Resource + "/namespaces/" + scope.Namespace + "/"
+	}
+	return s.prefix + "objects/" + scope.Resource + "/"
 }
 
-func (s *badgerStore) eventPrefix(resource string) string {
-	if resource == "" {
+func (s *badgerStore) eventPrefix(scope resourceScope) string {
+	if scope.Resource == "" {
 		return s.prefix + "events/all/"
 	}
-	return s.prefix + "events/resources/" + resource + "/"
+	if scope.Namespace != "" {
+		return s.prefix + "events/resources/" + scope.Resource + "/namespaces/" + scope.Namespace + "/"
+	}
+	return s.prefix + "events/resources/" + scope.Resource + "/"
 }
 
 func (s *badgerStore) eventAllKey(rv uint64) string {
-	return s.eventPrefix("") + rvKey(rv)
+	return s.eventPrefix(resourceScope{}) + rvKey(rv)
 }
 
 func (s *badgerStore) eventResourceKey(resource string, rv uint64) string {
-	return s.eventPrefix(resource) + rvKey(rv)
+	return s.eventPrefix(resourceScope{Resource: resource, AllNamespaces: true}) + rvKey(rv)
+}
+
+func (s *badgerStore) eventNamespaceKey(ref objectRef, rv uint64) string {
+	return s.eventPrefix(resourceScope{Resource: ref.Resource, Namespace: ref.Namespace}) + rvKey(rv)
 }
 
 func (s *badgerStore) nodeLeaseKey(name string) string {

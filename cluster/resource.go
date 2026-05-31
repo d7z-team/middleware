@@ -9,6 +9,22 @@ type Resource[S, T any] struct {
 	raw *UnstructuredResource
 }
 
+func (r *Resource[S, T]) Namespace(namespace string) (*Resource[S, T], error) {
+	raw, err := r.raw.Namespace(namespace)
+	if err != nil {
+		return nil, err
+	}
+	return &Resource[S, T]{raw: raw}, nil
+}
+
+func (r *Resource[S, T]) AllNamespaces() (*Resource[S, T], error) {
+	raw, err := r.raw.AllNamespaces()
+	if err != nil {
+		return nil, err
+	}
+	return &Resource[S, T]{raw: raw}, nil
+}
+
 func (r *Resource[S, T]) Create(ctx context.Context, name string, spec S, opts CreateOptions) (*Object[S, T], error) {
 	rawSpec, err := marshalValue(spec)
 	if err != nil {
@@ -19,6 +35,7 @@ func (r *Resource[S, T]) Create(ctx context.Context, name string, spec S, opts C
 		APIVersion: def.APIVersion,
 		Kind:       def.Kind,
 		Metadata: Metadata{
+			Namespace:   r.raw.namespace,
 			Name:        name,
 			Labels:      cloneLabels(opts.Labels),
 			Annotations: cloneAnnotations(opts.Annotations),

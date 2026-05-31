@@ -9,6 +9,7 @@ import (
 func (r *UnstructuredResource) watchLoop(
 	ctx context.Context,
 	opts WatchOptions,
+	scope resourceScope,
 	startRV uint64,
 	notify <-chan struct{},
 	cancel func(),
@@ -23,7 +24,7 @@ func (r *UnstructuredResource) watchLoop(
 			sendWatchError(ctx, out, err)
 			return
 		}
-		objects, rv, err := r.cluster.store.list(ctx, r.def.Resource)
+		objects, rv, err := r.cluster.store.list(ctx, scope)
 		if err != nil {
 			sendWatchError(ctx, out, err)
 			return
@@ -57,7 +58,7 @@ func (r *UnstructuredResource) watchLoop(
 	defer ticker.Stop()
 	lastBookmark := uint64(0)
 	for {
-		latest, ok := r.drainEvents(ctx, opts, &lastRV, out)
+		latest, ok := r.drainEvents(ctx, opts, scope, &lastRV, out)
 		if !ok {
 			return
 		}
@@ -85,6 +86,7 @@ func (r *UnstructuredResource) watchLoop(
 func (r *UnstructuredResource) drainEvents(
 	ctx context.Context,
 	opts WatchOptions,
+	scope resourceScope,
 	lastRV *uint64,
 	out chan<- UnstructuredWatchEvent,
 ) (uint64, bool) {
@@ -94,7 +96,7 @@ func (r *UnstructuredResource) drainEvents(
 	}
 	latestSeen := *lastRV
 	for {
-		events, latest, err := r.cluster.store.eventsAfter(ctx, *lastRV, r.def.Resource, defaultEventBatchSize)
+		events, latest, err := r.cluster.store.eventsAfter(ctx, *lastRV, scope, defaultEventBatchSize)
 		if err != nil {
 			sendWatchError(ctx, out, err)
 			return latestSeen, false

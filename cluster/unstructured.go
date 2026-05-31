@@ -11,8 +11,33 @@ import (
 )
 
 type UnstructuredResource struct {
-	cluster *Cluster
-	def     *resourceDefinition
+	cluster       *Cluster
+	def           *resourceDefinition
+	namespace     string
+	allNamespaces bool
+}
+
+func (r *UnstructuredResource) Namespace(namespace string) (*UnstructuredResource, error) {
+	if !r.def.Namespaced {
+		return nil, ErrInvalidObject
+	}
+	if err := validateNamespace(namespace); err != nil {
+		return nil, err
+	}
+	copied := *r
+	copied.namespace = namespace
+	copied.allNamespaces = false
+	return &copied, nil
+}
+
+func (r *UnstructuredResource) AllNamespaces() (*UnstructuredResource, error) {
+	if !r.def.Namespaced {
+		return nil, ErrInvalidObject
+	}
+	copied := *r
+	copied.namespace = ""
+	copied.allNamespaces = true
+	return &copied, nil
 }
 
 func (r *UnstructuredResource) Create(
@@ -49,10 +74,15 @@ func (r *UnstructuredResource) Create(
 		return nil, err
 	}
 	name := created.Metadata.Name
+	namespace, err := r.writeNamespace(created.Metadata.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	created.Metadata.Namespace = namespace
 	if err := r.def.defaultObject(&created); err != nil {
 		return nil, err
 	}
-	if created.APIVersion != r.def.APIVersion || created.Kind != r.def.Kind || created.Metadata.Name != name {
+	if created.APIVersion != r.def.APIVersion || created.Kind != r.def.Kind || created.Metadata.Name != name || created.Metadata.Namespace != namespace {
 		return nil, fmt.Errorf("%w: default changed object identity", ErrInvalidObject)
 	}
 	now := time.Now().UTC()
@@ -78,7 +108,7 @@ func (r *UnstructuredResource) Create(
 	}
 	return r.commit(ctx, commitRequest{
 		Op:               commitCreate,
-		Ref:              objectRef{Resource: r.def.Resource, Name: created.Metadata.Name},
+		Ref:              objectRef{Resource: r.def.Resource, Namespace: created.Metadata.Namespace, Name: created.Metadata.Name},
 		Object:           &created,
 		EventType:        WatchAdded,
 		EventAnnotations: opts.EventAnnotations,
@@ -101,7 +131,11 @@ func (r *UnstructuredResource) List(ctx context.Context, opts ListOptions) (*Uns
 	if err := r.cluster.ensureActive(ctx); err != nil {
 		return nil, err
 	}
-	objects, rv, err := r.cluster.store.list(ctx, r.def.Resource)
+	scope, err := r.readScope()
+	if err != nil {
+		return nil, err
+	}
+	objects, rv, err := r.cluster.store.list(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -151,11 +185,16 @@ func (r *UnstructuredResource) Update(
 	if err := validateObjectName(input.Metadata.Name); err != nil {
 		return nil, err
 	}
+	namespace, err := r.writeNamespace(input.Metadata.Namespace)
+	if err != nil {
+		return nil, err
+	}
+	input.Metadata.Namespace = namespace
 	expectedRV, err := updateRV(input.Metadata.ResourceVersion, opts.ResourceVersion)
 	if err != nil {
 		return nil, err
 	}
-	ref := objectRef{Resource: r.def.Resource, Name: input.Metadata.Name}
+	ref := objectRef{Resource: r.def.Resource, Namespace: input.Metadata.Namespace, Name: input.Metadata.Name}
 	oldObj, err := r.cluster.store.get(ctx, ref)
 	if err != nil {
 		return nil, err
@@ -437,12 +476,16 @@ func (r *UnstructuredResource) Watch(
 	if err != nil {
 		return nil, err
 	}
-	notify, cancel, err := r.cluster.store.subscribe(ctx, r.def.Resource)
+	scope, err := r.readScope()
+	if err != nil {
+		return nil, err
+	}
+	notify, cancel, err := r.cluster.store.subscribe(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
 	if opts.Since == "" && !opts.SendInitialEvents {
-		_, currentRV, err := r.cluster.store.list(ctx, r.def.Resource)
+		_, currentRV, err := r.cluster.store.list(ctx, scope)
 		if err != nil {
 			cancel()
 			return nil, err
@@ -451,7 +494,7 @@ func (r *UnstructuredResource) Watch(
 	}
 
 	out := make(chan UnstructuredWatchEvent, r.cluster.options.WatchBufferSize)
-	go r.watchLoop(ctx, opts, startRV, notify, cancel, out)
+	go r.watchLoop(ctx, opts, scope, startRV, notify, cancel, out)
 	return out, nil
 }
 
@@ -556,8 +599,8 @@ func (r *UnstructuredResource) prepareMetadataUpdate(oldObj Unstructured, patch 
 }
 
 func (r *UnstructuredResource) prepareSpecUpdate(oldObj, input Unstructured) (Unstructured, error) {
-	if input.APIVersion != oldObj.APIVersion || input.Kind != oldObj.Kind || input.Metadata.Name != oldObj.Metadata.Name {
-		return Unstructured{}, fmt.Errorf("%w: apiVersion, kind, and name are immutable", ErrInvalidObject)
+	if input.APIVersion != oldObj.APIVersion || input.Kind != oldObj.Kind || input.Metadata.Name != oldObj.Metadata.Name || input.Metadata.Namespace != oldObj.Metadata.Namespace {
+		return Unstructured{}, fmt.Errorf("%w: apiVersion, kind, namespace, and name are immutable", ErrInvalidObject)
 	}
 	if input.Metadata.UID != "" && input.Metadata.UID != oldObj.Metadata.UID {
 		return Unstructured{}, fmt.Errorf("%w: uid is immutable", ErrInvalidObject)
@@ -579,6 +622,7 @@ func (r *UnstructuredResource) prepareSpecUpdate(oldObj, input Unstructured) (Un
 	restoreManagedFields := func() {
 		updated.APIVersion = oldObj.APIVersion
 		updated.Kind = oldObj.Kind
+		updated.Metadata.Namespace = oldObj.Metadata.Namespace
 		updated.Metadata.Name = oldObj.Metadata.Name
 		updated.Metadata.UID = oldObj.Metadata.UID
 		updated.Metadata.ResourceVersion = oldObj.Metadata.ResourceVersion
@@ -625,7 +669,43 @@ func (r *UnstructuredResource) ref(name string) (objectRef, error) {
 	if err := validateObjectName(name); err != nil {
 		return objectRef{}, err
 	}
-	return objectRef{Resource: r.def.Resource, Name: name}, nil
+	namespace, err := r.writeNamespace("")
+	if err != nil {
+		return objectRef{}, err
+	}
+	return objectRef{Resource: r.def.Resource, Namespace: namespace, Name: name}, nil
+}
+
+func (r *UnstructuredResource) writeNamespace(namespace string) (string, error) {
+	if r.allNamespaces {
+		return "", ErrInvalidObject
+	}
+	if !r.def.Namespaced {
+		if namespace != "" || r.namespace != "" {
+			return "", ErrInvalidObject
+		}
+		return "", nil
+	}
+	if r.namespace == "" {
+		return "", ErrInvalidObject
+	}
+	if namespace != "" && namespace != r.namespace {
+		return "", ErrInvalidObject
+	}
+	return r.namespace, nil
+}
+
+func (r *UnstructuredResource) readScope() (resourceScope, error) {
+	if !r.def.Namespaced {
+		if r.namespace != "" || r.allNamespaces {
+			return resourceScope{}, ErrInvalidObject
+		}
+		return resourceScope{Resource: r.def.Resource}, nil
+	}
+	if r.namespace != "" {
+		return resourceScope{Resource: r.def.Resource, Namespace: r.namespace}, nil
+	}
+	return resourceScope{Resource: r.def.Resource, AllNamespaces: true}, nil
 }
 
 func sortUnstructured(objects []Unstructured) {

@@ -3,21 +3,19 @@ package cluster
 import "sync"
 
 type watchHub struct {
-	mu         sync.Mutex
-	nextID     uint64
-	closed     bool
-	all        map[uint64]chan struct{}
-	byResource map[string]map[uint64]chan struct{}
+	mu       sync.Mutex
+	nextID   uint64
+	closed   bool
+	watchers map[string]map[uint64]chan struct{}
 }
 
 func newWatchHub() *watchHub {
 	return &watchHub{
-		all:        make(map[uint64]chan struct{}),
-		byResource: make(map[string]map[uint64]chan struct{}),
+		watchers: make(map[string]map[uint64]chan struct{}),
 	}
 }
 
-func (h *watchHub) subscribe(resource string) (<-chan struct{}, func(), error) {
+func (h *watchHub) subscribe(scope resourceScope) (<-chan struct{}, func(), error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	ch := make(chan struct{}, 1)
@@ -27,43 +25,35 @@ func (h *watchHub) subscribe(resource string) (<-chan struct{}, func(), error) {
 	}
 	h.nextID++
 	id := h.nextID
-	if resource == "" {
-		h.all[id] = ch
-	} else {
-		if h.byResource[resource] == nil {
-			h.byResource[resource] = make(map[uint64]chan struct{})
-		}
-		h.byResource[resource][id] = ch
+	key := watchKey(scope.Resource, scope.Namespace)
+	if h.watchers[key] == nil {
+		h.watchers[key] = make(map[uint64]chan struct{})
 	}
+	h.watchers[key][id] = ch
 	cancel := func() {
 		h.mu.Lock()
 		defer h.mu.Unlock()
-		if resource == "" {
-			if registered, ok := h.all[id]; ok {
-				delete(h.all, id)
-				close(registered)
-			}
-			return
-		}
-		if registered, ok := h.byResource[resource][id]; ok {
-			delete(h.byResource[resource], id)
+		if registered, ok := h.watchers[key][id]; ok {
+			delete(h.watchers[key], id)
 			close(registered)
 		}
-		if len(h.byResource[resource]) == 0 {
-			delete(h.byResource, resource)
+		if len(h.watchers[key]) == 0 {
+			delete(h.watchers, key)
 		}
 	}
 	return ch, cancel, nil
 }
 
-func (h *watchHub) notify(resource string) {
+func (h *watchHub) notify(ref objectRef) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, ch := range h.all {
+	for _, ch := range h.watchers[watchKey(ref.Resource, "")] {
 		notifyChannel(ch)
 	}
-	for _, ch := range h.byResource[resource] {
-		notifyChannel(ch)
+	if ref.Namespace != "" {
+		for _, ch := range h.watchers[watchKey(ref.Resource, ref.Namespace)] {
+			notifyChannel(ch)
+		}
 	}
 }
 
@@ -74,16 +64,12 @@ func (h *watchHub) close() {
 		return
 	}
 	h.closed = true
-	for id, ch := range h.all {
-		delete(h.all, id)
-		close(ch)
-	}
-	for resource, watchers := range h.byResource {
+	for key, watchers := range h.watchers {
 		for id, ch := range watchers {
 			delete(watchers, id)
 			close(ch)
 		}
-		delete(h.byResource, resource)
+		delete(h.watchers, key)
 	}
 }
 
@@ -92,4 +78,11 @@ func notifyChannel(ch chan struct{}) {
 	case ch <- struct{}{}:
 	default:
 	}
+}
+
+func watchKey(resource, namespace string) string {
+	if namespace == "" {
+		return resource
+	}
+	return resource + "\x00" + namespace
 }

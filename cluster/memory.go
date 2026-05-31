@@ -48,14 +48,14 @@ func (s *memoryStore) get(ctx context.Context, ref objectRef) (*Unstructured, er
 	if resource == nil {
 		return nil, ErrNotFound
 	}
-	obj, ok := resource[ref.Name]
+	obj, ok := resource[objectStorageKey(ref)]
 	if !ok {
 		return nil, ErrNotFound
 	}
 	return cloneUnstructuredPtr(&obj), nil
 }
 
-func (s *memoryStore) list(ctx context.Context, resource string) ([]Unstructured, uint64, error) {
+func (s *memoryStore) list(ctx context.Context, scope resourceScope) ([]Unstructured, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
@@ -65,15 +65,19 @@ func (s *memoryStore) list(ctx context.Context, resource string) ([]Unstructured
 		return nil, 0, ErrClosed
 	}
 	out := make([]Unstructured, 0)
-	if resource != "" {
-		for _, obj := range s.objects[resource] {
-			out = append(out, cloneUnstructured(obj))
+	if scope.Resource != "" {
+		for _, obj := range s.objects[scope.Resource] {
+			if objectMatchesScope(obj, scope) {
+				out = append(out, cloneUnstructured(obj))
+			}
 		}
 		return out, s.rv, nil
 	}
 	for _, byName := range s.objects {
 		for _, obj := range byName {
-			out = append(out, cloneUnstructured(obj))
+			if objectMatchesScope(obj, scope) {
+				out = append(out, cloneUnstructured(obj))
+			}
 		}
 	}
 	return out, s.rv, nil
@@ -89,7 +93,7 @@ func (s *memoryStore) commit(ctx context.Context, req commitRequest) (*Unstructu
 	if err != nil {
 		return nil, resourceEvent{}, err
 	}
-	s.hub.notify(req.Ref.Resource)
+	s.hub.notify(req.Ref)
 	return obj, event, nil
 }
 
@@ -98,7 +102,7 @@ func (s *memoryStore) commitLocked(req commitRequest) (*Unstructured, resourceEv
 		return nil, resourceEvent{}, ErrClosed
 	}
 	resource := s.objects[req.Ref.Resource]
-	current, exists := resource[req.Ref.Name]
+	current, exists := resource[objectStorageKey(req.Ref)]
 	switch req.Op {
 	case commitCreate:
 		if exists {
@@ -123,9 +127,9 @@ func (s *memoryStore) commitLocked(req commitRequest) (*Unstructured, resourceEv
 			resource = make(map[string]Unstructured)
 			s.objects[req.Ref.Resource] = resource
 		}
-		resource[req.Ref.Name] = eventObj
+		resource[objectStorageKey(req.Ref)] = eventObj
 	} else {
-		delete(resource, req.Ref.Name)
+		delete(resource, objectStorageKey(req.Ref))
 		if len(resource) == 0 {
 			delete(s.objects, req.Ref.Resource)
 		}
@@ -135,7 +139,7 @@ func (s *memoryStore) commitLocked(req commitRequest) (*Unstructured, resourceEv
 	return cloneUnstructuredPtr(&eventObj), event, nil
 }
 
-func (s *memoryStore) eventsAfter(ctx context.Context, after uint64, resource string, limit int) ([]resourceEvent, uint64, error) {
+func (s *memoryStore) eventsAfter(ctx context.Context, after uint64, scope resourceScope, limit int) ([]resourceEvent, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
@@ -152,7 +156,7 @@ func (s *memoryStore) eventsAfter(ctx context.Context, after uint64, resource st
 		if parseStoredRV(event.ResourceVersion) <= after {
 			continue
 		}
-		if resource != "" && event.Ref.Resource != resource {
+		if !eventMatchesScope(event, scope) {
 			continue
 		}
 		out = append(out, cloneEvent(event))
@@ -176,11 +180,11 @@ func (s *memoryStore) cleanupEvents(ctx context.Context) error {
 	return nil
 }
 
-func (s *memoryStore) subscribe(ctx context.Context, resource string) (<-chan struct{}, func(), error) {
+func (s *memoryStore) subscribe(ctx context.Context, scope resourceScope) (<-chan struct{}, func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	return s.hub.subscribe(resource)
+	return s.hub.subscribe(scope)
 }
 
 func (s *memoryStore) acquireNode(ctx context.Context, name string, ttl time.Duration) (string, error) {

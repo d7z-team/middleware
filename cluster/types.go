@@ -73,6 +73,7 @@ type Object[S, T any] struct {
 }
 
 type Metadata struct {
+	Namespace       string      `json:"namespace,omitempty"`
 	Name            string      `json:"name"`
 	UID             string      `json:"uid"`
 	ResourceVersion string      `json:"resourceVersion"`
@@ -147,8 +148,15 @@ type UnstructuredList struct {
 }
 
 type objectRef struct {
-	Resource string `json:"resource"`
-	Name     string `json:"name"`
+	Resource  string `json:"resource"`
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+}
+
+type resourceScope struct {
+	Resource      string
+	Namespace     string
+	AllNamespaces bool
 }
 
 type Subresource string
@@ -244,6 +252,7 @@ type ResourceInfo struct {
 	Resource    string
 	APIVersion  string
 	Kind        string
+	Namespaced  bool
 	Spec        []FieldInfo
 	Status      []FieldInfo
 	Annotations []AnnotationRule
@@ -275,11 +284,11 @@ type nodeLeaseRecord struct {
 
 type resourceStore interface {
 	get(context.Context, objectRef) (*Unstructured, error)
-	list(context.Context, string) ([]Unstructured, uint64, error)
+	list(context.Context, resourceScope) ([]Unstructured, uint64, error)
 	commit(context.Context, commitRequest) (*Unstructured, resourceEvent, error)
-	eventsAfter(context.Context, uint64, string, int) ([]resourceEvent, uint64, error)
+	eventsAfter(context.Context, uint64, resourceScope, int) ([]resourceEvent, uint64, error)
 	cleanupEvents(context.Context) error
-	subscribe(context.Context, string) (<-chan struct{}, func(), error)
+	subscribe(context.Context, resourceScope) (<-chan struct{}, func(), error)
 	acquireNode(context.Context, string, time.Duration) (string, error)
 	renewNode(context.Context, string, string, time.Duration) error
 	releaseNode(context.Context, string, string) error

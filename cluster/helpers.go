@@ -27,12 +27,24 @@ func validateObjectName(name string) error {
 	return nil
 }
 
+func validateNamespace(namespace string) error {
+	if invalidPathToken(namespace) {
+		return fmt.Errorf("%w: invalid namespace", ErrInvalidObject)
+	}
+	return nil
+}
+
 func invalidPathToken(value string) bool {
 	value = strings.TrimSpace(value)
 	return value == "" || value == "." || value == ".." || strings.ContainsAny(value, `/\`)
 }
 
 func validateMetadata(meta Metadata) error {
+	if meta.Namespace != "" {
+		if err := validateNamespace(meta.Namespace); err != nil {
+			return err
+		}
+	}
 	if err := validateMetadataKeys(meta.Labels); err != nil {
 		return err
 	}
@@ -160,7 +172,37 @@ func parseRVKey(key string) uint64 {
 }
 
 func objectCursor(obj Unstructured) string {
-	return obj.APIVersion + "/" + obj.Kind + "/" + obj.Metadata.Name
+	return obj.APIVersion + "/" + obj.Kind + "/" + obj.Metadata.Namespace + "/" + obj.Metadata.Name
+}
+
+func objectStorageKey(ref objectRef) string {
+	if ref.Namespace == "" {
+		return ref.Name
+	}
+	return ref.Namespace + "\x00" + ref.Name
+}
+
+func objectMatchesScope(obj Unstructured, scope resourceScope) bool {
+	if scope.Namespace != "" {
+		return obj.Metadata.Namespace == scope.Namespace
+	}
+	if scope.AllNamespaces {
+		return obj.Metadata.Namespace != ""
+	}
+	return obj.Metadata.Namespace == ""
+}
+
+func eventMatchesScope(event resourceEvent, scope resourceScope) bool {
+	if scope.Resource != "" && event.Ref.Resource != scope.Resource {
+		return false
+	}
+	if scope.Namespace != "" {
+		return event.Ref.Namespace == scope.Namespace
+	}
+	if scope.AllNamespaces {
+		return event.Ref.Namespace != ""
+	}
+	return event.Ref.Namespace == ""
 }
 
 func randomToken(prefix string) (string, error) {
@@ -291,6 +333,9 @@ func changedPaths(oldObj, newObj *Unstructured, subresource Subresource) []strin
 	}
 	if !reflect.DeepEqual(oldObj.Metadata.Finalizers, newObj.Metadata.Finalizers) {
 		changed = append(changed, "metadata.finalizers")
+	}
+	if oldObj.Metadata.Namespace != newObj.Metadata.Namespace {
+		changed = append(changed, "metadata.namespace")
 	}
 	if (oldObj.Metadata.DeletedAt == nil) != (newObj.Metadata.DeletedAt == nil) ||
 		oldObj.Metadata.DeletedAt != nil && !oldObj.Metadata.DeletedAt.Equal(*newObj.Metadata.DeletedAt) {

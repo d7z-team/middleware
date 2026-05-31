@@ -12,6 +12,7 @@ type ResourceDef[S, T any] struct {
 	Resource   string
 	APIVersion string
 	Kind       string
+	Namespaced bool
 
 	Annotations []AnnotationRule
 	Default     func(*Object[S, T]) error
@@ -31,6 +32,7 @@ type resourceDefinition struct {
 	APIVersion string
 	Kind       string
 	Builtin    bool
+	Namespaced bool
 
 	annotationRules map[string]AnnotationRule
 	specRules       []fieldRule
@@ -69,6 +71,7 @@ func buildDefinition[S, T any](def ResourceDef[S, T]) (*resourceDefinition, erro
 		Resource:        def.Resource,
 		APIVersion:      def.APIVersion,
 		Kind:            def.Kind,
+		Namespaced:      def.Namespaced,
 		annotationRules: make(map[string]AnnotationRule, len(def.Annotations)),
 	}
 	for _, rule := range def.Annotations {
@@ -313,6 +316,8 @@ func convertValidationObjects[S, T any](
 
 func fieldRawValue(obj *Unstructured, path string) (json.RawMessage, bool) {
 	switch path {
+	case "metadata.namespace":
+		return mustMarshalRaw(obj.Metadata.Namespace), true
 	case "metadata.name":
 		return mustMarshalRaw(obj.Metadata.Name), true
 	case "metadata.uid":

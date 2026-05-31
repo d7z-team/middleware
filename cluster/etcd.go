@@ -45,11 +45,11 @@ func (s *etcdStore) get(ctx context.Context, ref objectRef) (*Unstructured, erro
 	return cloneUnstructuredPtr(&obj), nil
 }
 
-func (s *etcdStore) list(ctx context.Context, resource string) ([]Unstructured, uint64, error) {
+func (s *etcdStore) list(ctx context.Context, scope resourceScope) ([]Unstructured, uint64, error) {
 	if err := s.ensureOpen(ctx); err != nil {
 		return nil, 0, err
 	}
-	prefix := s.objectPrefix(resource)
+	prefix := s.objectPrefix(scope)
 	resp, err := s.client.Get(ctx, prefix, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
 	if err != nil {
 		return nil, 0, err
@@ -60,7 +60,9 @@ func (s *etcdStore) list(ctx context.Context, resource string) ([]Unstructured, 
 		if err := json.Unmarshal(kv.Value, &obj); err != nil {
 			return nil, 0, err
 		}
-		objects = append(objects, cloneUnstructured(obj))
+		if objectMatchesScope(obj, scope) {
+			objects = append(objects, cloneUnstructured(obj))
+		}
 	}
 	rv, err := s.currentRV(ctx)
 	if err != nil {
@@ -131,8 +133,14 @@ func (s *etcdStore) commit(ctx context.Context, req commitRequest) (*Unstructure
 			clientv3.OpPut(s.metaKey("rv"), formatRV(nextRV)),
 			clientv3.OpPut(s.eventAllKey(nextRV), string(eventRaw)),
 			clientv3.OpPut(s.eventResourceKey(req.Ref.Resource, nextRV), string(eventRaw)),
-			clientv3.OpPut(s.notifyKey(""), formatRV(nextRV)),
-			clientv3.OpPut(s.notifyKey(req.Ref.Resource), formatRV(nextRV)),
+			clientv3.OpPut(s.notifyKey(resourceScope{}), formatRV(nextRV)),
+			clientv3.OpPut(s.notifyKey(resourceScope{Resource: req.Ref.Resource, AllNamespaces: true}), formatRV(nextRV)),
+		}
+		if req.Ref.Namespace != "" {
+			ops = append(ops,
+				clientv3.OpPut(s.eventNamespaceKey(req.Ref, nextRV), string(eventRaw)),
+				clientv3.OpPut(s.notifyKey(resourceScope{Resource: req.Ref.Resource, Namespace: req.Ref.Namespace}), formatRV(nextRV)),
+			)
 		}
 		if req.Op == commitDelete {
 			ops = append(ops, clientv3.OpDelete(s.objectKey(req.Ref)))
@@ -160,7 +168,7 @@ func (s *etcdStore) commit(ctx context.Context, req commitRequest) (*Unstructure
 	return nil, resourceEvent{}, ErrConflict
 }
 
-func (s *etcdStore) eventsAfter(ctx context.Context, after uint64, resource string, limit int) ([]resourceEvent, uint64, error) {
+func (s *etcdStore) eventsAfter(ctx context.Context, after uint64, scope resourceScope, limit int) ([]resourceEvent, uint64, error) {
 	if err := s.ensureOpen(ctx); err != nil {
 		return nil, 0, err
 	}
@@ -175,11 +183,15 @@ func (s *etcdStore) eventsAfter(ctx context.Context, after uint64, resource stri
 	if after < compacted {
 		return nil, current, ErrResourceVersionTooOld
 	}
-	prefix := s.eventPrefix(resource)
+	prefix := s.eventPrefix(scope)
+	rangeEnd := clientv3.GetPrefixRangeEnd(prefix)
+	if scope.Resource != "" && scope.Namespace == "" {
+		rangeEnd = prefix + ":"
+	}
 	resp, err := s.client.Get(
 		ctx,
 		prefix+rvKey(after+1),
-		clientv3.WithRange(clientv3.GetPrefixRangeEnd(prefix)),
+		clientv3.WithRange(rangeEnd),
 		clientv3.WithLimit(int64(limit)),
 		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
 	)
@@ -215,11 +227,11 @@ func (s *etcdStore) cleanupEvents(ctx context.Context) error {
 	return s.deleteEventsBefore(ctx, before)
 }
 
-func (s *etcdStore) subscribe(ctx context.Context, resource string) (<-chan struct{}, func(), error) {
+func (s *etcdStore) subscribe(ctx context.Context, scope resourceScope) (<-chan struct{}, func(), error) {
 	if err := s.ensureOpen(ctx); err != nil {
 		return nil, nil, err
 	}
-	key := s.notifyKey(resource)
+	key := s.notifyKey(scope)
 	resp, err := s.client.Get(ctx, key)
 	if err != nil {
 		return nil, nil, err
@@ -396,7 +408,7 @@ func (s *etcdStore) metaRVCompare(raw string, version int64) clientv3.Cmp {
 }
 
 func (s *etcdStore) deleteEventsBefore(ctx context.Context, before uint64) error {
-	prefix := s.eventPrefix("")
+	prefix := s.eventPrefix(resourceScope{})
 	end := prefix + rvKey(before+1)
 	for {
 		resp, err := s.client.Get(
@@ -412,7 +424,7 @@ func (s *etcdStore) deleteEventsBefore(ctx context.Context, before uint64) error
 		if len(resp.Kvs) == 0 {
 			return nil
 		}
-		ops := make([]clientv3.Op, 0, len(resp.Kvs)*2)
+		ops := make([]clientv3.Op, 0, len(resp.Kvs)*3)
 		for _, kv := range resp.Kvs {
 			var event resourceEvent
 			if err := json.Unmarshal(kv.Value, &event); err != nil {
@@ -423,6 +435,9 @@ func (s *etcdStore) deleteEventsBefore(ctx context.Context, before uint64) error
 				clientv3.OpDelete(s.eventAllKey(rv)),
 				clientv3.OpDelete(s.eventResourceKey(event.Ref.Resource, rv)),
 			)
+			if event.Ref.Namespace != "" {
+				ops = append(ops, clientv3.OpDelete(s.eventNamespaceKey(event.Ref, rv)))
+			}
 		}
 		if _, err := s.client.Txn(ctx).Then(ops...).Commit(); err != nil {
 			return err
@@ -468,36 +483,52 @@ func (s *etcdStore) metaKey(name string) string {
 }
 
 func (s *etcdStore) objectKey(ref objectRef) string {
+	if ref.Namespace != "" {
+		return s.prefix + "objects/" + ref.Resource + "/namespaces/" + ref.Namespace + "/" + ref.Name
+	}
 	return s.prefix + "objects/" + ref.Resource + "/" + ref.Name
 }
 
-func (s *etcdStore) objectPrefix(resource string) string {
-	if resource == "" {
+func (s *etcdStore) objectPrefix(scope resourceScope) string {
+	if scope.Resource == "" {
 		return s.prefix + "objects/"
 	}
-	return s.prefix + "objects/" + resource + "/"
+	if scope.Namespace != "" {
+		return s.prefix + "objects/" + scope.Resource + "/namespaces/" + scope.Namespace + "/"
+	}
+	return s.prefix + "objects/" + scope.Resource + "/"
 }
 
-func (s *etcdStore) eventPrefix(resource string) string {
-	if resource == "" {
+func (s *etcdStore) eventPrefix(scope resourceScope) string {
+	if scope.Resource == "" {
 		return s.prefix + "events/all/"
 	}
-	return s.prefix + "events/resources/" + resource + "/"
+	if scope.Namespace != "" {
+		return s.prefix + "events/resources/" + scope.Resource + "/namespaces/" + scope.Namespace + "/"
+	}
+	return s.prefix + "events/resources/" + scope.Resource + "/"
 }
 
 func (s *etcdStore) eventAllKey(rv uint64) string {
-	return s.eventPrefix("") + rvKey(rv)
+	return s.eventPrefix(resourceScope{}) + rvKey(rv)
 }
 
 func (s *etcdStore) eventResourceKey(resource string, rv uint64) string {
-	return s.eventPrefix(resource) + rvKey(rv)
+	return s.eventPrefix(resourceScope{Resource: resource, AllNamespaces: true}) + rvKey(rv)
 }
 
-func (s *etcdStore) notifyKey(resource string) string {
-	if resource == "" {
+func (s *etcdStore) eventNamespaceKey(ref objectRef, rv uint64) string {
+	return s.eventPrefix(resourceScope{Resource: ref.Resource, Namespace: ref.Namespace}) + rvKey(rv)
+}
+
+func (s *etcdStore) notifyKey(scope resourceScope) string {
+	if scope.Resource == "" {
 		return s.prefix + "notify/all"
 	}
-	return s.prefix + "notify/resources/" + resource
+	if scope.Namespace != "" {
+		return s.prefix + "notify/resources/" + scope.Resource + "/namespaces/" + scope.Namespace
+	}
+	return s.prefix + "notify/resources/" + scope.Resource
 }
 
 func (s *etcdStore) nodeLeaseKey(name string) string {

@@ -598,6 +598,7 @@ func resourceInfo(def *resourceDefinition) ResourceInfo {
 		Resource:    def.Resource,
 		APIVersion:  def.APIVersion,
 		Kind:        def.Kind,
+		Namespaced:  def.Namespaced,
 		Spec:        fieldInfos(def.specRules),
 		Status:      fieldInfos(def.statusRules),
 		Annotations: annotationInfos(def.annotationRules),

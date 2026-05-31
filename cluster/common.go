@@ -30,6 +30,19 @@
 //	_ = events
 //	statusEvents, _ := widgets.WatchStatus(ctx, WatchOptions{Since: list.ResourceVersion})
 //	_ = statusEvents
+//
+//	namespacedWidgets, _ := Define(c, ResourceDef[WidgetSpec, WidgetStatus]{
+//		Resource:   "teamwidgets",
+//		APIVersion: "example.test/v1",
+//		Kind:       "TeamWidget",
+//		Namespaced: true,
+//	})
+//	teamWidgets, _ := namespacedWidgets.Namespace("team-a")
+//	_, _ = teamWidgets.Create(ctx, "alpha", WidgetSpec{Size: "small"}, CreateOptions{})
+//	allWidgets, _ := namespacedWidgets.AllNamespaces()
+//	_, _ = allWidgets.List(ctx, ListOptions{
+//		Selector: Where(Field("metadata.namespace").Eq("team-a")),
+//	})
 package cluster
 
 import (
@@ -77,8 +90,10 @@ import (
 //		Resource:   "jobs",
 //		APIVersion: "example.test/v1",
 //		Kind:       "Job",
+//		Namespaced: true,
 //	})
-//	_, _ = jobs.Create(ctx, "daily", JobSpec{Owner: "billing"}, CreateOptions{})
+//	billingJobs, _ := jobs.Namespace("billing")
+//	_, _ = billingJobs.Create(ctx, "daily", JobSpec{Owner: "billing"}, CreateOptions{})
 func NewClusterFromURL(raw string) (*Cluster, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil {

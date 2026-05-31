@@ -88,11 +88,77 @@ if err != nil {
 | `Resource` | 资源复数名，例如 `widgets` |
 | `APIVersion` | 对象的 `apiVersion` |
 | `Kind` | 对象的 `kind` |
+| `Namespaced` | `true` 表示资源按 namespace 隔离；默认 `false` 表示 cluster-scoped |
 | `Annotations` | metadata annotation 规则 |
 | `Default` | 创建或更新 spec 时填默认值 |
 | `Validate` | 创建、更新 spec、更新 metadata、更新 status 时做校验 |
 
 资源名不能是空值、`.`、`..`，也不能包含 `/` 或 `\`。
+
+## 命名空间
+
+默认资源是 cluster-scoped。需要命名空间隔离时，在定义资源时设置 `Namespaced: true`：
+
+```go
+widgets, err := cluster.Define(c, cluster.ResourceDef[WidgetSpec, WidgetStatus]{
+	Resource:   "widgets",
+	APIVersion: "example.test/v1",
+	Kind:       "Widget",
+	Namespaced: true,
+})
+if err != nil {
+	return err
+}
+```
+
+命名空间资源必须先绑定 namespace 才能写入、读取或删除单个对象：
+
+```go
+teamWidgets, err := widgets.Namespace("team-a")
+if err != nil {
+	return err
+}
+
+created, err := teamWidgets.Create(ctx, "alpha", WidgetSpec{
+	Size:  "small",
+	Owner: "team-a",
+}, cluster.CreateOptions{})
+if err != nil {
+	return err
+}
+_ = created.Metadata.Namespace // "team-a"
+
+got, err := teamWidgets.Get(ctx, "alpha")
+if err != nil {
+	return err
+}
+_ = got
+```
+
+同一个资源名在不同 namespace 下可以使用相同对象名；对象身份由
+`resource + namespace + name` 组成。`Metadata.Namespace` 由 namespace 句柄写入，
+创建后不可修改；`Patch`、`PatchMetadata`、`Update` 都不能改变 namespace。
+
+未绑定 namespace 的命名空间资源可以 `List` 和 `Watch` 全部 namespace。
+也可以显式使用 `AllNamespaces()`，该句柄只允许 `List` 和 `Watch`：
+
+```go
+allWidgets, err := widgets.AllNamespaces()
+if err != nil {
+	return err
+}
+
+list, err := allWidgets.List(ctx, cluster.ListOptions{
+	Selector: cluster.Where(cluster.Field("metadata.namespace").Eq("team-a")),
+})
+if err != nil {
+	return err
+}
+_ = list
+```
+
+cluster-scoped 资源不能调用 `Namespace` 或 `AllNamespaces`。namespace 名称不能是空值、
+`.`、`..`，也不能包含 `/` 或 `\`。
 
 ## 字段规则
 
@@ -226,6 +292,7 @@ if err != nil {
 | 字段 | 说明 |
 | --- | --- |
 | `Metadata.UID` | 创建时生成，不可修改 |
+| `Metadata.Namespace` | namespaced 资源的 namespace，cluster-scoped 资源为空，创建后不可修改 |
 | `Metadata.ResourceVersion` | 每次成功写入后递增 |
 | `Metadata.Generation` | `spec` 变化时递增 |
 | `Metadata.CreatedAt` | 创建时间 |
@@ -337,12 +404,14 @@ for list.Continue != "" {
 | `cluster.Label("app").Exists()` | label 存在 |
 | `cluster.Annotation("tenant").Eq("t1")` | 匹配 annotation |
 | `cluster.Field("metadata.name").Eq("alpha")` | 匹配 metadata 字段 |
+| `cluster.Field("metadata.namespace").Eq("team-a")` | 匹配 namespace |
 | `cluster.Field("spec.size").Eq("large")` | 匹配 spec 字段 |
 | `cluster.Field("status.phase").Eq("Ready")` | 匹配 status 字段 |
 
 字段 selector 支持：
 
 - `metadata.name`
+- `metadata.namespace`
 - `metadata.uid`
 - `apiVersion`
 - `kind`
@@ -440,6 +509,10 @@ statusEvents, err = widgets.Watch(ctx, cluster.WatchOptions{
 `metadata.finalizers`、`metadata.deletedAt` 等 metadata 变化事件。
 `WatchStatus` 只返回 `status.<field>` 变化事件。`SendInitialEvents` 会先返回当前对象，
 初始事件不受 `Scope` 过滤。
+
+命名空间资源的 watch 范围跟句柄一致：`widgets.Namespace("team-a").Watch`
+只返回 `team-a` 的事件；`widgets.Watch` 和 `widgets.AllNamespaces().Watch` 返回全部
+namespace 的事件。事件对象里会带上 `Object.Metadata.Namespace`。
 
 读取当前已有对象作为初始事件：
 
@@ -659,6 +732,7 @@ if err != nil {
 for _, resource := range resources {
 	_ = resource.Resource
 	_ = resource.Builtin
+	_ = resource.Namespaced
 }
 
 info, err := c.Resource("widgets")
@@ -675,10 +749,15 @@ _ = info.Annotations
 
 ## Unstructured
 
-动态资源可以通过 `Unstructured` handle 操作。资源仍然需要先 `Define`。
+动态资源可以通过 `Unstructured` 句柄操作。资源仍然需要先 `Define`。
 
 ```go
 raw, err := c.Unstructured("widgets")
+if err != nil {
+	return err
+}
+
+raw, err = raw.Namespace("team-a")
 if err != nil {
 	return err
 }
