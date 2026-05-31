@@ -54,6 +54,9 @@ import (
 //   - prefix: backend key prefix for badger and etcd
 //   - node_lease_ttl: node lease TTL, default 30s
 //   - node_renew_interval: node lease renew interval, default 10s
+//   - master_lease_ttl: master lease TTL, default follows node_lease_ttl
+//   - master_renew_interval: master lease renew interval, default follows node_renew_interval
+//   - master_history_limit: number of recent master transitions to retain, default 2000
 //   - event_retention_count: number of recent watch events to retain, default 2000
 //   - watch_buffer_size: per-watch channel buffer size
 //
@@ -126,6 +129,27 @@ func clusterOptionsFromURL(parsed *url.URL) (Options, error) {
 			return Options{}, fmt.Errorf("%w: invalid node_renew_interval", ErrInvalidConfig)
 		}
 		options.NodeRenewInterval = parsedValue
+	}
+	if value := query.Get("master_lease_ttl"); value != "" {
+		parsedValue, err := time.ParseDuration(value)
+		if err != nil || parsedValue <= 0 {
+			return Options{}, fmt.Errorf("%w: invalid master_lease_ttl", ErrInvalidConfig)
+		}
+		options.MasterLeaseTTL = parsedValue
+	}
+	if value := query.Get("master_renew_interval"); value != "" {
+		parsedValue, err := time.ParseDuration(value)
+		if err != nil || parsedValue <= 0 {
+			return Options{}, fmt.Errorf("%w: invalid master_renew_interval", ErrInvalidConfig)
+		}
+		options.MasterRenewInterval = parsedValue
+	}
+	if value := query.Get("master_history_limit"); value != "" {
+		parsedValue, err := strconv.Atoi(value)
+		if err != nil || parsedValue <= 0 {
+			return Options{}, fmt.Errorf("%w: invalid master_history_limit", ErrInvalidConfig)
+		}
+		options.MasterHistoryLimit = parsedValue
 	}
 	if value := query.Get("event_retention_count"); value != "" {
 		parsedValue, err := strconv.Atoi(value)

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -43,6 +45,79 @@ func TestEtcdNodeLeaseLost(t *testing.T) {
 	}
 }
 
+func TestEtcdMasterElectionSwitchesNode(t *testing.T) {
+	factory := newEtcdURLFactory(t)
+	query := url.Values{
+		"master_lease_ttl":      {"2s"},
+		"master_renew_interval": {"100ms"},
+		"event_retention_count": {"20"},
+		"watch_buffer_size":     {"8"},
+		"prefix":                {"master-switch"},
+	}
+	query.Set("node", "master-a")
+	rawA := factory.raw(t, query)
+	query.Set("node", "master-b")
+	rawB := factory.raw(t, query)
+
+	first, err := NewClusterFromURL(rawA)
+	require.NoError(t, err)
+	firstClosed := false
+	t.Cleanup(func() {
+		if !firstClosed {
+			require.NoError(t, first.Close())
+		}
+	})
+	second, err := NewClusterFromURL(rawB)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, second.Close()) })
+
+	ctx := testContext(t, 5*time.Second)
+	firstMaster, err := first.Master(ctx)
+	require.NoError(t, err)
+	require.True(t, firstMaster.Valid)
+	require.Equal(t, "master-a", firstMaster.Node)
+	isMaster, err := second.IsMaster(ctx)
+	require.NoError(t, err)
+	require.False(t, isMaster)
+
+	watchCtx := testContext(t, 5*time.Second)
+	events, err := second.WatchMaster(watchCtx, WatchOptions{})
+	require.NoError(t, err)
+
+	require.NoError(t, first.Close())
+	firstClosed = true
+
+	var switched MasterWatchEvent
+	deadline := time.After(4 * time.Second)
+	for {
+		select {
+		case event, ok := <-events:
+			require.True(t, ok)
+			if event.Master != nil && event.Master.Valid && event.Master.Node == "master-b" {
+				switched = event
+				goto switched
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for master handoff")
+		}
+	}
+
+switched:
+	require.NotNil(t, switched.Transition)
+	require.Equal(t, masterTransitionAcquired, switched.Transition.Reason)
+	require.Equal(t, "master-b", switched.Transition.To)
+	require.Greater(t, switched.Master.Term, firstMaster.Term)
+
+	history, err := second.MasterHistory(ctx, 10)
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(history, func(transition MasterTransition) bool {
+		return transition.Reason == masterTransitionReleased && transition.From == "master-a"
+	}))
+	require.True(t, slices.ContainsFunc(history, func(transition MasterTransition) bool {
+		return transition.Reason == masterTransitionAcquired && transition.To == "master-b"
+	}))
+}
+
 func newEtcdURLFactory(t *testing.T) clusterURLFactory {
 	t.Helper()
 	client, err := clientv3.New(clientv3.Config{
@@ -72,7 +147,14 @@ func newEtcdURLFactory(t *testing.T) clusterURLFactory {
 		raw: func(t *testing.T, query url.Values) string {
 			t.Helper()
 			counter++
-			query.Set("prefix", fmt.Sprintf("%s/%d", basePrefix, counter))
+			prefix := query.Get("prefix")
+			if prefix == "" {
+				query.Set("prefix", fmt.Sprintf("%s/%d", basePrefix, counter))
+			} else if !strings.HasPrefix(prefix, basePrefix+"/") {
+				query.Set("prefix", basePrefix+"/"+strings.Trim(prefix, "/"))
+			} else {
+				query.Set("prefix", prefix)
+			}
 			if query.Get("node") == "" {
 				query.Set("node", fmt.Sprintf("etcd-%d", counter))
 			}

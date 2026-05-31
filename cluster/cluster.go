@@ -20,6 +20,7 @@ type Cluster struct {
 
 	mu               sync.RWMutex
 	closed           bool
+	closing          bool
 	leaseLost        bool
 	definitions      map[string]*resourceDefinition
 	definitionsByGVK map[string]*resourceDefinition
@@ -27,7 +28,10 @@ type Cluster struct {
 	nodeLeaseUntil   time.Time
 	leaseCancel      context.CancelFunc
 	leaseDone        chan struct{}
+	masterCancel     context.CancelFunc
+	masterDone       chan struct{}
 	nodes            *Resource[NodeSpec, NodeStatus]
+	masters          *Resource[MasterSpec, MasterStatus]
 }
 
 func OpenMemory(options Options) (*Cluster, error) {
@@ -91,6 +95,15 @@ func newCluster(options Options, store resourceStore) (*Cluster, error) {
 		_ = c.Close()
 		return nil, err
 	}
+	if _, err := c.ensureMaster(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	if err := c.maintainMaster(ctx); err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	c.startMasterElection()
 	return c, nil
 }
 
@@ -121,6 +134,24 @@ func normalizeOptions(options Options) (Options, error) {
 	}
 	if options.NodeRenewInterval <= 0 || options.NodeRenewInterval >= options.NodeLeaseTTL {
 		return Options{}, ErrInvalidConfig
+	}
+	if options.MasterLeaseTTL < 0 || options.MasterRenewInterval < 0 || options.MasterHistoryLimit < 0 {
+		return Options{}, ErrInvalidConfig
+	}
+	if options.MasterLeaseTTL == 0 {
+		options.MasterLeaseTTL = options.NodeLeaseTTL
+	}
+	if options.MasterRenewInterval == 0 {
+		options.MasterRenewInterval = options.NodeRenewInterval
+		if options.MasterRenewInterval >= options.MasterLeaseTTL {
+			options.MasterRenewInterval = options.MasterLeaseTTL / 3
+		}
+	}
+	if options.MasterRenewInterval <= 0 || options.MasterRenewInterval >= options.MasterLeaseTTL {
+		return Options{}, ErrInvalidConfig
+	}
+	if options.MasterHistoryLimit == 0 {
+		options.MasterHistoryLimit = defaultMasterHistoryLimit
 	}
 	return options, nil
 }
@@ -190,7 +221,7 @@ func (c *Cluster) PatchCurrentNodeStatus(ctx context.Context, patch []byte, opts
 func (c *Cluster) Resources() ([]ResourceInfo, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.closed {
+	if c.closed || c.closing {
 		return nil, ErrClosed
 	}
 	if c.leaseLost {
@@ -235,10 +266,26 @@ func (c *Cluster) Compact(ctx context.Context, beforeRV string) error {
 
 func (c *Cluster) Close() error {
 	c.mu.Lock()
-	if c.closed {
+	if c.closed || c.closing {
 		c.mu.Unlock()
 		return nil
 	}
+	c.closing = true
+	masterCancel := c.masterCancel
+	masterDone := c.masterDone
+	c.mu.Unlock()
+
+	if masterCancel != nil {
+		masterCancel()
+		if masterDone != nil {
+			<-masterDone
+		}
+	}
+	releaseMasterCtx, releaseMasterCancel := context.WithTimeout(context.Background(), c.options.MasterLeaseTTL)
+	defer releaseMasterCancel()
+	err := c.stepDownMaster(releaseMasterCtx, masterTransitionReleased, false)
+
+	c.mu.Lock()
 	c.closed = true
 	leaseLost := c.leaseLost
 	cancel := c.leaseCancel
@@ -255,7 +302,6 @@ func (c *Cluster) Close() error {
 	}
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), ttl)
 	defer releaseCancel()
-	var err error
 	if !leaseLost && token != "" {
 		err = errors.Join(err, c.store.releaseNode(releaseCtx, nodeName, token))
 	}
@@ -272,7 +318,7 @@ func (c *Cluster) registerDefinition(def *resourceDefinition) error {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.closed {
+	if c.closed || c.closing {
 		return ErrClosed
 	}
 	if c.leaseLost {
@@ -296,7 +342,7 @@ func (c *Cluster) definitionForResource(resource string) (*resourceDefinition, e
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.closed {
+	if c.closed || c.closing {
 		return nil, ErrClosed
 	}
 	if c.leaseLost {
@@ -315,7 +361,7 @@ func (c *Cluster) ensureActive(ctx context.Context) error {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.closed {
+	if c.closed || c.closing {
 		return ErrClosed
 	}
 	if c.leaseLost {
@@ -339,6 +385,21 @@ func (c *Cluster) registerBuiltins() error {
 	}
 	c.nodes = &Resource[NodeSpec, NodeStatus]{
 		raw: &UnstructuredResource{cluster: c, def: nodesDef},
+	}
+	mastersDef, err := buildDefinition(ResourceDef[MasterSpec, MasterStatus]{
+		Resource:   ResourceMasters,
+		APIVersion: "cluster.d7z.net/v1",
+		Kind:       "Master",
+	})
+	if err != nil {
+		return err
+	}
+	mastersDef.Builtin = true
+	if err := c.registerDefinition(mastersDef); err != nil {
+		return err
+	}
+	c.masters = &Resource[MasterSpec, MasterStatus]{
+		raw: &UnstructuredResource{cluster: c, def: mastersDef},
 	}
 	return nil
 }
@@ -381,10 +442,24 @@ func (c *Cluster) startNodeRenewal() {
 
 func (c *Cluster) markNodeLeaseLost() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.closed {
-		c.leaseLost = true
+	if c.closed || c.closing || c.leaseLost {
+		c.mu.Unlock()
+		return
 	}
+	c.leaseLost = true
+	cancel := c.masterCancel
+	done := c.masterDone
+	c.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+		if done != nil {
+			<-done
+		}
+	}
+	ctx, cancelCtx := context.WithTimeout(context.Background(), c.options.MasterLeaseTTL)
+	defer cancelCtx()
+	_ = c.stepDownMaster(ctx, masterTransitionLost, false)
 }
 
 func (c *Cluster) ensureCurrentNode(ctx context.Context) (*Object[NodeSpec, NodeStatus], error) {

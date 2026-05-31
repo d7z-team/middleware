@@ -15,8 +15,10 @@ const (
 	maxMutationRetries         = 8
 	defaultNodeLeaseTTL        = 30 * time.Second
 	defaultNodeRenewInterval   = 10 * time.Second
+	defaultMasterHistoryLimit  = 2000
 
-	ResourceNodes = "nodes"
+	ResourceNodes   = "nodes"
+	ResourceMasters = "masters"
 )
 
 var (
@@ -31,6 +33,7 @@ var (
 	ErrUnsupported           = errors.New("cluster: unsupported operation")
 	ErrNodeAlreadyExists     = errors.New("cluster: node already exists")
 	ErrNodeLeaseLost         = errors.New("cluster: node lease lost")
+	ErrNotMaster             = errors.New("cluster: not master")
 )
 
 type Options struct {
@@ -42,6 +45,12 @@ type Options struct {
 	NodeLeaseTTL time.Duration
 	// NodeRenewInterval controls how often the node lease is renewed.
 	NodeRenewInterval time.Duration
+	// MasterLeaseTTL controls how long a master term stays valid without renewal. Zero uses NodeLeaseTTL.
+	MasterLeaseTTL time.Duration
+	// MasterRenewInterval controls how often the current master term is renewed. Zero uses NodeRenewInterval.
+	MasterRenewInterval time.Duration
+	// MasterHistoryLimit keeps only the newest N master transition records. Zero uses the default.
+	MasterHistoryLimit int
 	// EventRetentionCount keeps only the newest N events. Zero uses the default.
 	EventRetentionCount int
 	// WatchBufferSize controls each Watch result channel buffer.
@@ -81,6 +90,37 @@ type NodeStatus struct {
 	Metadata   Annotations `json:"metadata,omitempty"`
 	LeaseUntil time.Time   `json:"leaseUntil,omitempty"`
 	UpdatedAt  time.Time   `json:"updatedAt,omitempty"`
+}
+
+type MasterSpec struct{}
+
+type MasterStatus struct {
+	Node       string             `json:"node,omitempty"`
+	Term       uint64             `json:"term,omitempty"`
+	LeaseUntil time.Time          `json:"leaseUntil,omitempty"`
+	AcquiredAt time.Time          `json:"acquiredAt,omitempty"`
+	RenewedAt  time.Time          `json:"renewedAt,omitempty"`
+	History    []MasterTransition `json:"history,omitempty"`
+}
+
+type MasterTransition struct {
+	Term               uint64    `json:"term"`
+	From               string    `json:"from,omitempty"`
+	To                 string    `json:"to,omitempty"`
+	Reason             string    `json:"reason"`
+	At                 time.Time `json:"at"`
+	ObservedBy         string    `json:"observedBy"`
+	PreviousLeaseUntil time.Time `json:"previousLeaseUntil,omitempty"`
+}
+
+type MasterInfo struct {
+	Node            string    `json:"node,omitempty"`
+	Term            uint64    `json:"term,omitempty"`
+	LeaseUntil      time.Time `json:"leaseUntil,omitempty"`
+	AcquiredAt      time.Time `json:"acquiredAt,omitempty"`
+	RenewedAt       time.Time `json:"renewedAt,omitempty"`
+	ResourceVersion string    `json:"resourceVersion,omitempty"`
+	Valid           bool      `json:"valid"`
 }
 
 type ObjectList[S, T any] struct {
@@ -187,6 +227,14 @@ type UnstructuredWatchEvent struct {
 	Annotations     Annotations    `json:"annotations,omitempty"`
 	Changed         []string       `json:"changed,omitempty"`
 	Error           error          `json:"-"`
+}
+
+type MasterWatchEvent struct {
+	Type            WatchEventType    `json:"type"`
+	ResourceVersion string            `json:"resourceVersion"`
+	Master          *MasterInfo       `json:"master,omitempty"`
+	Transition      *MasterTransition `json:"transition,omitempty"`
+	Error           error             `json:"-"`
 }
 
 type ResourceInfo struct {

@@ -27,8 +27,15 @@ defer c.Close()
 | `prefix` | 存储前缀 |
 | `node_lease_ttl` | node lease TTL，默认 `30s` |
 | `node_renew_interval` | node lease 续约间隔，默认 `10s`，必须小于 TTL |
+| `master_lease_ttl` | master lease TTL，默认跟随 `node_lease_ttl` |
+| `master_renew_interval` | master lease 续约间隔，默认跟随 `node_renew_interval`，必须小于 master TTL |
+| `master_history_limit` | 保留的 master 切换记录数量，默认 `2000`，传入时必须大于 `0` |
 | `event_retention_count` | 保留的 watch 事件数量，默认 `2000`，传入时必须大于 `0` |
 | `watch_buffer_size` | 每个 watch channel 的缓冲大小，默认 `256` |
+
+`etcd` 后端的资源写入、node lease 和 master lease 都落在 etcd 中，多个实例共享同一
+`prefix` 时通过 etcd 的 CAS 和 watch 协调，最终一致性由 etcd 自身的 Raft 保证。
+`memory` 和 `badger` 用于单实例，本地进程内的 watch 通过内存锁和事件缓冲实现。
 
 ## 定义资源
 
@@ -556,6 +563,93 @@ if err != nil {
 _ = nodeList
 ```
 
+## Master
+
+每个 backend/prefix 下只有一个内置 master 对象：`masters/default`。cluster 启动后会
+自动参与选举，并持续续约 master lease。当前 master 正常 `Close` 或调用 `StepDown`
+时会释放 master；master lease 过期后，其他实例会尝试接管。
+
+查询当前 master：
+
+```go
+master, err := c.Master(ctx)
+if err != nil {
+	return err
+}
+if master.Valid {
+	_ = master.Node
+	_ = master.Term
+	_ = master.LeaseUntil
+}
+
+isMaster, err := c.IsMaster(ctx)
+if err != nil {
+	return err
+}
+_ = isMaster
+```
+
+监听 master 变化：
+
+```go
+events, err := c.WatchMaster(ctx, cluster.WatchOptions{
+	Since: master.ResourceVersion,
+})
+if err != nil {
+	return err
+}
+
+for event := range events {
+	switch event.Type {
+	case cluster.WatchModified:
+		_ = event.Master
+		_ = event.Transition
+	case cluster.WatchError:
+		return event.Error
+	}
+}
+```
+
+`WatchMaster` 只返回 master 节点或 term 变化，不会把普通续约事件暴露给调用方。
+`Transition` 记录本次切换原因：
+
+| 原因 | 说明 |
+| --- | --- |
+| `acquired` | 初次获得 master |
+| `expired` | 接管已过期的 master lease |
+| `released` | 当前 master 主动释放 |
+| `lost` | 当前实例丢失 node lease |
+
+读取最近切换记录：
+
+```go
+history, err := c.MasterHistory(ctx, 20)
+if err != nil {
+	return err
+}
+for _, transition := range history {
+	_ = transition.From
+	_ = transition.To
+	_ = transition.Term
+	_ = transition.At
+}
+```
+
+当前实例主动让出 master：
+
+```go
+if err := c.StepDown(ctx); err != nil {
+	if errors.Is(err, cluster.ErrNotMaster) {
+		return nil
+	}
+	return err
+}
+```
+
+`MasterHistory(ctx, 0)` 返回当前保留的全部记录。保留数量由 `master_history_limit`
+控制，默认 `2000`。内置资源 `masters` 可以通过 `Resources` 查询，也可以通过
+`c.Masters()` 读取或 watch。
+
 ## 资源信息
 
 查询已注册资源和 schema：
@@ -579,7 +673,8 @@ _ = info.Status
 _ = info.Annotations
 ```
 
-内置 `nodes` 也会出现在 `Resources` 返回值中。资源定义只支持查询，不支持 watch。
+内置 `nodes` 和 `masters` 也会出现在 `Resources` 返回值中。资源定义只支持查询，
+不支持 watch。
 
 ## Unstructured
 
@@ -638,4 +733,5 @@ default:
 | `ErrResourceVersionTooOld` | watch 起始版本早于已保留事件 |
 | `ErrNodeAlreadyExists` | 同一 backend/prefix 下 node 名称已被占用 |
 | `ErrNodeLeaseLost` | 当前实例丢失 node lease |
+| `ErrNotMaster` | 当前实例不是有效 master |
 | `ErrClosed` | cluster 已关闭 |

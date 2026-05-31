@@ -75,6 +75,14 @@ func TestClusterFromURLValidation(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&node_lease_ttl=1s&node_renew_interval=1s")
 	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&master_lease_ttl=bad")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&master_renew_interval=bad")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&master_lease_ttl=1s&master_renew_interval=1s")
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	_, err = NewClusterFromURL("memory://?node=n1&master_history_limit=0")
+	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&event_retention_count=-1")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	_, err = NewClusterFromURL("memory://?node=n1&event_retention_count=0")
@@ -115,6 +123,37 @@ func TestClusterResourceDiscoveryClosed(t *testing.T) {
 	require.ErrorIs(t, err, ErrClosed)
 	_, err = c.Resource(ResourceNodes)
 	require.ErrorIs(t, err, ErrClosed)
+}
+
+func TestClusterMasterHistoryLimit(t *testing.T) {
+	c, err := NewClusterFromURL("memory://?node=history-limit&master_history_limit=1&master_lease_ttl=500ms&master_renew_interval=50ms&node_lease_ttl=2s&node_renew_interval=500ms")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+	ctx := testContext(t, 5*time.Second)
+
+	first, err := c.Master(ctx)
+	require.NoError(t, err)
+	require.True(t, first.Valid)
+	require.NoError(t, c.StepDown(ctx))
+
+	deadline := time.After(2 * time.Second)
+	for {
+		master, err := c.Master(ctx)
+		require.NoError(t, err)
+		if master.Valid && master.Term > first.Term+1 {
+			history, err := c.MasterHistory(ctx, 10)
+			require.NoError(t, err)
+			require.Len(t, history, 1)
+			require.Equal(t, masterTransitionAcquired, history[0].Reason)
+			require.Equal(t, "history-limit", history[0].To)
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for master reacquire")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
 }
 
 func TestClusterDefaultEventRetention(t *testing.T) {
@@ -445,6 +484,59 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.ErrorIs(t, err, ErrInvalidObject)
 	})
 
+	t.Run("master_api_history_and_watch", func(t *testing.T) {
+		c := newURLCluster(t, factory, nil)
+		ctx := testContext(t, 5*time.Second)
+
+		master, err := c.Master(ctx)
+		require.NoError(t, err)
+		require.True(t, master.Valid)
+		require.Equal(t, c.options.NodeName, master.Node)
+		require.Equal(t, uint64(1), master.Term)
+
+		isMaster, err := c.IsMaster(ctx)
+		require.NoError(t, err)
+		require.True(t, isMaster)
+
+		history, err := c.MasterHistory(ctx, 10)
+		require.NoError(t, err)
+		require.Len(t, history, 1)
+		require.Equal(t, masterTransitionAcquired, history[0].Reason)
+		require.Equal(t, c.options.NodeName, history[0].To)
+
+		watchCtx := testContext(t, 4*time.Second)
+		events, err := c.WatchMaster(watchCtx, WatchOptions{Since: master.ResourceVersion})
+		require.NoError(t, err)
+
+		require.NoError(t, c.StepDown(ctx))
+		event := nextMasterWatchEvent(t, events)
+		require.Equal(t, WatchModified, event.Type)
+		require.NotNil(t, event.Master)
+		require.False(t, event.Master.Valid)
+		require.Equal(t, master.Term+1, event.Master.Term)
+		require.NotNil(t, event.Transition)
+		require.Equal(t, masterTransitionReleased, event.Transition.Reason)
+		require.Equal(t, c.options.NodeName, event.Transition.From)
+
+		isMaster, err = c.IsMaster(ctx)
+		require.NoError(t, err)
+		require.False(t, isMaster)
+		require.ErrorIs(t, c.StepDown(ctx), ErrNotMaster)
+
+		history, err = c.MasterHistory(ctx, 1)
+		require.NoError(t, err)
+		require.Len(t, history, 1)
+		require.Equal(t, masterTransitionReleased, history[0].Reason)
+
+		replayCtx := testContext(t, 4*time.Second)
+		replayEvents, err := c.WatchMaster(replayCtx, WatchOptions{Since: master.ResourceVersion})
+		require.NoError(t, err)
+		event = nextMasterWatchEvent(t, replayEvents)
+		require.Equal(t, WatchModified, event.Type)
+		require.NotNil(t, event.Transition)
+		require.Equal(t, masterTransitionReleased, event.Transition.Reason)
+	})
+
 	t.Run("node_api_and_resource_schema", func(t *testing.T) {
 		c := newURLCluster(t, factory, nil)
 		widgets := defineWidgets(t, c, "schemawidgets")
@@ -500,6 +592,9 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 			return info.Resource == ResourceNodes && info.Builtin
 		}))
 		require.True(t, slices.ContainsFunc(resources, func(info ResourceInfo) bool {
+			return info.Resource == ResourceMasters && info.Builtin
+		}))
+		require.True(t, slices.ContainsFunc(resources, func(info ResourceInfo) bool {
 			return info.Resource == "schemawidgets" && !info.Builtin
 		}))
 
@@ -517,6 +612,12 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 			Resource:   ResourceNodes,
 			APIVersion: "example.test/v1",
 			Kind:       "Node",
+		})
+		require.ErrorIs(t, err, ErrInvalidResource)
+		_, err = Define(c, ResourceDef[MasterSpec, MasterStatus]{
+			Resource:   ResourceMasters,
+			APIVersion: "example.test/v1",
+			Kind:       "Master",
 		})
 		require.ErrorIs(t, err, ErrInvalidResource)
 
@@ -714,5 +815,17 @@ func nextWatchEvent[S, T any](t *testing.T, events <-chan WatchEvent[S, T]) Watc
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for watch event")
 		return WatchEvent[S, T]{}
+	}
+}
+
+func nextMasterWatchEvent(t *testing.T, events <-chan MasterWatchEvent) MasterWatchEvent {
+	t.Helper()
+	select {
+	case event, ok := <-events:
+		require.True(t, ok)
+		return event
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for master watch event")
+		return MasterWatchEvent{}
 	}
 }
