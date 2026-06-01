@@ -195,6 +195,94 @@ func TestEtcdEventCleanupRunsOnlyOnMaster(t *testing.T) {
 	}, ErrResourceVersionTooOld)
 }
 
+func TestEtcdAdmissionCreateFlow(t *testing.T) {
+	c := newURLCluster(t, newEtcdURLFactory(t), nil)
+	ctx := testContext(t, 8*time.Second)
+	widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+		Resource:   "etcdadmissionwidgets",
+		APIVersion: "example.test/v1",
+		Kind:       "EtcdAdmissionWidget",
+		Admission: []AdmissionRule{
+			{Name: "create-check", Operations: []AdmissionOperation{AdmissionCreate}},
+		},
+	})
+	require.NoError(t, err)
+
+	type createResult struct {
+		obj *Object[widgetSpec, widgetStatus]
+		err error
+	}
+	resultCh := make(chan createResult, 1)
+	go func() {
+		obj, err := widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+		resultCh <- createResult{obj: obj, err: err}
+	}()
+
+	watchCtx := testContext(t, 8*time.Second)
+	events, err := c.AdmissionRequests().Watch(watchCtx, WatchOptions{SendInitialEvents: true})
+	require.NoError(t, err)
+
+	var request WatchEvent[AdmissionRequestSpec, AdmissionRequestStatus]
+	for {
+		request = nextWatchEvent(t, events)
+		if request.Type == WatchAdded && request.Object != nil && request.Object.Spec.Name == "alpha" {
+			break
+		}
+	}
+
+	approved, err := c.ApproveAdmission(ctx, request.Object.Metadata.Name, AdmissionDecisionOptions{
+		Rule:    "create-check",
+		Decider: "tester",
+		Message: "ok",
+	})
+	require.NoError(t, err)
+	require.Equal(t, AdmissionCommittedPhase, approved.Status.Phase)
+
+	result := <-resultCh
+	require.NoError(t, result.err)
+	require.Equal(t, "alpha", result.obj.Metadata.Name)
+	require.Equal(t, "team-a", result.obj.Spec.Owner)
+}
+
+func TestEtcdAdmissionExpires(t *testing.T) {
+	c := newURLCluster(t, newEtcdURLFactory(t), url.Values{
+		"admission_timeout":      {"80ms"},
+		"event_cleanup_interval": {"20ms"},
+	})
+	ctx := testContext(t, 8*time.Second)
+	widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+		Resource:   "etcdexpirewidgets",
+		APIVersion: "example.test/v1",
+		Kind:       "EtcdExpireWidget",
+		Admission: []AdmissionRule{
+			{Name: "create-check", Operations: []AdmissionOperation{AdmissionCreate}},
+		},
+	})
+	require.NoError(t, err)
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+		resultCh <- err
+	}()
+
+	var errResult error
+	require.Eventually(t, func() bool {
+		select {
+		case errResult = <-resultCh:
+			return true
+		default:
+			return false
+		}
+	}, 3*time.Second, 20*time.Millisecond)
+	require.ErrorIs(t, errResult, ErrAdmissionExpired)
+
+	list, err := c.AdmissionRequests().List(ctx, ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, list.Items, 1)
+	require.Equal(t, AdmissionExpiredPhase, list.Items[0].Status.Phase)
+}
+
 func newEtcdURLFactory(t *testing.T) clusterURLFactory {
 	t.Helper()
 	client, err := clientv3.New(clientv3.Config{

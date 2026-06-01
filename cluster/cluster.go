@@ -18,25 +18,26 @@ type Cluster struct {
 	options   Options
 	closeHook func() error
 
-	mu               sync.RWMutex
-	closed           bool
-	closing          bool
-	leaseLost        bool
-	definitions      map[string]*resourceDefinition
-	definitionsByGVK map[string]*resourceDefinition
-	nodeToken        string
-	nodeLeaseUntil   time.Time
-	leaseCancel      context.CancelFunc
-	leaseDone        chan struct{}
-	masterCancel     context.CancelFunc
-	masterDone       chan struct{}
-	cleanupCancel    context.CancelFunc
-	cleanupDone      chan struct{}
-	cleanupWake      chan struct{}
-	cleanupErr       error
-	cleanupErrAt     time.Time
-	nodes            *Resource[NodeSpec, NodeStatus]
-	masters          *Resource[MasterSpec, MasterStatus]
+	mu                sync.RWMutex
+	closed            bool
+	closing           bool
+	leaseLost         bool
+	definitions       map[string]*resourceDefinition
+	definitionsByGVK  map[string]*resourceDefinition
+	nodeToken         string
+	nodeLeaseUntil    time.Time
+	leaseCancel       context.CancelFunc
+	leaseDone         chan struct{}
+	masterCancel      context.CancelFunc
+	masterDone        chan struct{}
+	cleanupCancel     context.CancelFunc
+	cleanupDone       chan struct{}
+	cleanupWake       chan struct{}
+	cleanupErr        error
+	cleanupErrAt      time.Time
+	nodes             *Resource[NodeSpec, NodeStatus]
+	masters           *Resource[MasterSpec, MasterStatus]
+	admissionRequests *Resource[AdmissionRequestSpec, AdmissionRequestStatus]
 }
 
 func OpenMemory(options Options) (*Cluster, error) {
@@ -165,6 +166,18 @@ func normalizeOptions(options Options) (Options, error) {
 	if options.MasterHistoryLimit == 0 {
 		options.MasterHistoryLimit = defaultMasterHistoryLimit
 	}
+	if options.AdmissionTimeout < 0 || options.AdmissionRetentionCount < 0 || options.AdmissionTerminalRetention < 0 {
+		return Options{}, ErrInvalidConfig
+	}
+	if options.AdmissionTimeout == 0 {
+		options.AdmissionTimeout = defaultAdmissionTimeout
+	}
+	if options.AdmissionRetentionCount == 0 {
+		options.AdmissionRetentionCount = defaultAdmissionRetention
+	}
+	if options.AdmissionTerminalRetention == 0 {
+		options.AdmissionTerminalRetention = defaultAdmissionTerminalRetention
+	}
 	if options.EventCleanupInterval == 0 {
 		options.EventCleanupInterval = options.MasterRenewInterval
 		if options.EventCleanupInterval < minBackgroundInterval {
@@ -179,6 +192,10 @@ func normalizeOptions(options Options) (Options, error) {
 
 func (c *Cluster) Nodes() *Resource[NodeSpec, NodeStatus] {
 	return c.nodes
+}
+
+func (c *Cluster) AdmissionRequests() *AdmissionRequestResource {
+	return &AdmissionRequestResource{raw: c.admissionRequests}
 }
 
 func (c *Cluster) CurrentNode(ctx context.Context) (*Object[NodeSpec, NodeStatus], error) {
@@ -342,11 +359,17 @@ func (c *Cluster) registerDefinition(def *resourceDefinition) error {
 	if c.leaseLost {
 		return ErrNodeLeaseLost
 	}
-	if _, exists := c.definitions[def.Resource]; exists {
+	if existing, exists := c.definitions[def.Resource]; exists {
+		if definitionEquivalent(existing, def) {
+			return nil
+		}
 		return fmt.Errorf("%w: duplicate resource %q", ErrInvalidResource, def.Resource)
 	}
 	gvk := def.APIVersion + "\x00" + def.Kind
-	if _, exists := c.definitionsByGVK[gvk]; exists {
+	if existing, exists := c.definitionsByGVK[gvk]; exists {
+		if definitionEquivalent(existing, def) {
+			return nil
+		}
 		return fmt.Errorf("%w: duplicate schema %s/%s", ErrInvalidResource, def.APIVersion, def.Kind)
 	}
 	c.definitions[def.Resource] = def
@@ -389,7 +412,7 @@ func (c *Cluster) ensureActive(ctx context.Context) error {
 }
 
 func (c *Cluster) registerBuiltins() error {
-	nodesDef, err := buildDefinition(ResourceDef[NodeSpec, NodeStatus]{
+	nodesDef, err := buildTypedDefinition(TypedResourceDef[NodeSpec, NodeStatus]{
 		Resource:   ResourceNodes,
 		APIVersion: "cluster.d7z.net/v1",
 		Kind:       "Node",
@@ -404,7 +427,7 @@ func (c *Cluster) registerBuiltins() error {
 	c.nodes = &Resource[NodeSpec, NodeStatus]{
 		raw: &UnstructuredResource{cluster: c, def: nodesDef},
 	}
-	mastersDef, err := buildDefinition(ResourceDef[MasterSpec, MasterStatus]{
+	mastersDef, err := buildTypedDefinition(TypedResourceDef[MasterSpec, MasterStatus]{
 		Resource:   ResourceMasters,
 		APIVersion: "cluster.d7z.net/v1",
 		Kind:       "Master",
@@ -418,6 +441,21 @@ func (c *Cluster) registerBuiltins() error {
 	}
 	c.masters = &Resource[MasterSpec, MasterStatus]{
 		raw: &UnstructuredResource{cluster: c, def: mastersDef},
+	}
+	admissionDef, err := buildTypedDefinition(TypedResourceDef[AdmissionRequestSpec, AdmissionRequestStatus]{
+		Resource:   ResourceAdmissionRequests,
+		APIVersion: "cluster.d7z.net/v1",
+		Kind:       "AdmissionRequest",
+	})
+	if err != nil {
+		return err
+	}
+	admissionDef.Builtin = true
+	if err := c.registerDefinition(admissionDef); err != nil {
+		return err
+	}
+	c.admissionRequests = &Resource[AdmissionRequestSpec, AdmissionRequestStatus]{
+		raw: &UnstructuredResource{cluster: c, def: admissionDef},
 	}
 	return nil
 }
@@ -595,42 +633,13 @@ func operationTimeout(interval, ttl time.Duration) time.Duration {
 
 func resourceInfo(def *resourceDefinition) ResourceInfo {
 	return ResourceInfo{
-		Resource:    def.Resource,
-		APIVersion:  def.APIVersion,
-		Kind:        def.Kind,
-		Namespaced:  def.Namespaced,
-		Spec:        fieldInfos(def.specRules),
-		Status:      fieldInfos(def.statusRules),
-		Annotations: annotationInfos(def.annotationRules),
-		Builtin:     def.Builtin,
+		Resource:   def.Resource,
+		APIVersion: def.APIVersion,
+		Kind:       def.Kind,
+		Namespaced: def.Namespaced,
+		Schema:     cloneRaw(def.Schema),
+		Indexes:    append([]IndexInfo(nil), def.Indexes...),
+		Admission:  cloneAdmissionRules(def.Admission),
+		Builtin:    def.Builtin,
 	}
-}
-
-func fieldInfos(rules []fieldRule) []FieldInfo {
-	out := make([]FieldInfo, 0, len(rules))
-	for _, rule := range rules {
-		out = append(out, FieldInfo{
-			Path:      rule.Path,
-			Required:  rule.Required,
-			Immutable: rule.Immutable,
-			Indexed:   rule.Indexed,
-			IndexName: rule.IndexName,
-			Enum:      append([]string(nil), rule.Enum...),
-		})
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Path < out[j].Path
-	})
-	return out
-}
-
-func annotationInfos(rules map[string]AnnotationRule) []AnnotationRule {
-	out := make([]AnnotationRule, 0, len(rules))
-	for _, rule := range rules {
-		out = append(out, rule)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].Key < out[j].Key
-	})
-	return out
 }

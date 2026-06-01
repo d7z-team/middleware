@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 )
@@ -83,6 +84,39 @@ func matchesSelector(obj Unstructured, selector Selector) bool {
 		}
 	}
 	return true
+}
+
+func validateSelector(def *resourceDefinition, selector Selector) error {
+	for _, requirement := range selector.requirements {
+		switch requirement.target {
+		case selectLabel, selectAnnotation:
+			if strings.TrimSpace(requirement.key) == "" {
+				return fmt.Errorf("%w: invalid selector key", ErrInvalidObject)
+			}
+		case selectField:
+			if !allowsFieldSelector(def, requirement.key) {
+				return fmt.Errorf("%w: field selector %s is not indexed", ErrInvalidObject, requirement.key)
+			}
+		default:
+			return ErrInvalidObject
+		}
+	}
+	return nil
+}
+
+func allowsFieldSelector(def *resourceDefinition, path string) bool {
+	switch path {
+	case "metadata.name":
+		return true
+	case "metadata.namespace":
+		return def != nil && def.Namespaced
+	}
+	for _, index := range def.Indexes {
+		if index.Path == path {
+			return true
+		}
+	}
+	return false
 }
 
 func selectorValue(obj Unstructured, requirement Requirement) (string, bool) {

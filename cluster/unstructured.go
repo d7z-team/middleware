@@ -17,6 +17,13 @@ type UnstructuredResource struct {
 	allNamespaces bool
 }
 
+func (r *UnstructuredResource) ensureWritable() error {
+	if r.def != nil && r.def.Resource == ResourceAdmissionRequests {
+		return ErrUnsupported
+	}
+	return nil
+}
+
 func (r *UnstructuredResource) Namespace(namespace string) (*UnstructuredResource, error) {
 	if !r.def.Namespaced {
 		return nil, ErrInvalidObject
@@ -46,6 +53,9 @@ func (r *UnstructuredResource) Create(
 	opts CreateOptions,
 ) (*Unstructured, error) {
 	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.ensureWritable(); err != nil {
 		return nil, err
 	}
 	if obj == nil {
@@ -82,6 +92,9 @@ func (r *UnstructuredResource) Create(
 	if err := r.def.defaultObject(&created); err != nil {
 		return nil, err
 	}
+	if err := r.def.pruneObject(&created); err != nil {
+		return nil, err
+	}
 	if created.APIVersion != r.def.APIVersion || created.Kind != r.def.Kind || created.Metadata.Name != name || created.Metadata.Namespace != namespace {
 		return nil, fmt.Errorf("%w: default changed object identity", ErrInvalidObject)
 	}
@@ -97,7 +110,7 @@ func (r *UnstructuredResource) Create(
 	created.Metadata.UpdatedAt = now
 	created.Metadata.DeletedAt = nil
 	ensureMetadataMaps(&created.Metadata)
-	if err := validateMetadata(created.Metadata); err != nil {
+	if err := r.def.validateMetadata(created.Metadata); err != nil {
 		return nil, err
 	}
 	if err := validateRawObjectJSON(&created); err != nil {
@@ -105,6 +118,13 @@ func (r *UnstructuredResource) Create(
 	}
 	if err := r.def.validateObject(nil, &created, SubresourceSpec); err != nil {
 		return nil, err
+	}
+	if out, handled, err := r.maybeAdmit(ctx, AdmissionCreate, SubresourceSpec, objectRef{
+		Resource:  r.def.Resource,
+		Namespace: created.Metadata.Namespace,
+		Name:      created.Metadata.Name,
+	}, nil, &created, 0, opts.EventAnnotations); handled {
+		return out, err
 	}
 	return r.commit(ctx, commitRequest{
 		Op:               commitCreate,
@@ -129,6 +149,9 @@ func (r *UnstructuredResource) Get(ctx context.Context, name string) (*Unstructu
 
 func (r *UnstructuredResource) List(ctx context.Context, opts ListOptions) (*UnstructuredList, error) {
 	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
+	if err := validateSelector(r.def, opts.Selector); err != nil {
 		return nil, err
 	}
 	scope, err := r.readScope()
@@ -178,6 +201,9 @@ func (r *UnstructuredResource) Update(
 	if err := r.cluster.ensureActive(ctx); err != nil {
 		return nil, err
 	}
+	if err := r.ensureWritable(); err != nil {
+		return nil, err
+	}
 	if obj == nil {
 		return nil, ErrInvalidObject
 	}
@@ -209,6 +235,9 @@ func (r *UnstructuredResource) Update(
 	if err != nil {
 		return nil, err
 	}
+	if out, handled, err := r.maybeAdmit(ctx, AdmissionUpdate, SubresourceSpec, ref, oldObj, &updated, expectedRV, opts.EventAnnotations); handled {
+		return out, err
+	}
 	return r.commit(ctx, commitRequest{
 		Op:               commitUpdate,
 		Ref:              ref,
@@ -229,6 +258,9 @@ func (r *UnstructuredResource) Patch(
 	if err := r.cluster.ensureActive(ctx); err != nil {
 		return nil, err
 	}
+	if err := r.ensureWritable(); err != nil {
+		return nil, err
+	}
 	if len(bytes.TrimSpace(patch)) == 0 {
 		return nil, ErrInvalidObject
 	}
@@ -236,7 +268,7 @@ func (r *UnstructuredResource) Patch(
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSpecPatch(patch); err != nil {
+	if err := validateSpecPatch(patch, r.def.metadataWritable); err != nil {
 		return nil, err
 	}
 	expected, err := parseOptionalRV(opts.ResourceVersion)
@@ -263,6 +295,9 @@ func (r *UnstructuredResource) Patch(
 		updated, err := r.prepareSpecUpdate(*oldObj, patched)
 		if err != nil {
 			return nil, err
+		}
+		if out, handled, err := r.maybeAdmit(ctx, AdmissionUpdate, SubresourceSpec, ref, oldObj, &updated, parseStoredRV(oldObj.Metadata.ResourceVersion), opts.EventAnnotations); handled {
+			return out, err
 		}
 		out, err := r.commit(ctx, commitRequest{
 			Op:               commitUpdate,
@@ -293,6 +328,9 @@ func (r *UnstructuredResource) PatchMetadata(
 	if err := r.cluster.ensureActive(ctx); err != nil {
 		return nil, err
 	}
+	if err := r.ensureWritable(); err != nil {
+		return nil, err
+	}
 	if len(bytes.TrimSpace(patch)) == 0 {
 		return nil, ErrInvalidObject
 	}
@@ -300,7 +338,7 @@ func (r *UnstructuredResource) PatchMetadata(
 	if err != nil {
 		return nil, err
 	}
-	if err := validateMetadataPatch(patch); err != nil {
+	if err := r.def.validateMetadataPatch(patch); err != nil {
 		return nil, err
 	}
 	expected, err := parseOptionalRV(opts.ResourceVersion)
@@ -324,6 +362,9 @@ func (r *UnstructuredResource) PatchMetadata(
 		updated, err := r.prepareMetadataUpdate(*oldObj, patch)
 		if err != nil {
 			return nil, err
+		}
+		if out, handled, err := r.maybeAdmit(ctx, AdmissionUpdate, SubresourceMetadata, ref, oldObj, &updated, oldRV, opts.EventAnnotations); handled {
+			return out, err
 		}
 		out, err := r.commit(ctx, commitRequest{
 			Op:               commitUpdate,
@@ -354,6 +395,9 @@ func (r *UnstructuredResource) UpdateStatus(
 	if err := r.cluster.ensureActive(ctx); err != nil {
 		return nil, err
 	}
+	if err := r.ensureWritable(); err != nil {
+		return nil, err
+	}
 	ref, err := r.ref(name)
 	if err != nil {
 		return nil, err
@@ -375,6 +419,9 @@ func (r *UnstructuredResource) PatchStatus(
 	opts PatchOptions,
 ) (*Unstructured, error) {
 	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.ensureWritable(); err != nil {
 		return nil, err
 	}
 	if len(bytes.TrimSpace(patch)) == 0 {
@@ -400,6 +447,9 @@ func (r *UnstructuredResource) PatchStatus(
 
 func (r *UnstructuredResource) Delete(ctx context.Context, name string, opts DeleteOptions) (*Unstructured, error) {
 	if err := r.cluster.ensureActive(ctx); err != nil {
+		return nil, err
+	}
+	if err := r.ensureWritable(); err != nil {
 		return nil, err
 	}
 	ref, err := r.ref(name)
@@ -437,6 +487,9 @@ func (r *UnstructuredResource) Delete(ctx context.Context, name string, opts Del
 			op = commitUpdate
 			eventType = WatchModified
 		}
+		if out, handled, err := r.maybeAdmit(ctx, AdmissionDelete, SubresourceSpec, ref, oldObj, &updated, oldRV, opts.EventAnnotations); handled {
+			return out, err
+		}
 		out, err := r.commit(ctx, commitRequest{
 			Op:               op,
 			Ref:              ref,
@@ -465,6 +518,9 @@ func (r *UnstructuredResource) Watch(
 		return nil, err
 	}
 	if err := validateWatchScope(opts.Scope); err != nil {
+		return nil, err
+	}
+	if err := validateSelector(r.def, opts.Selector); err != nil {
 		return nil, err
 	}
 	if opts.Name != "" {
@@ -543,11 +599,17 @@ func (r *UnstructuredResource) mutateStatus(
 		updated.Kind = oldObj.Kind
 		updated.Metadata = cloneMetadata(oldObj.Metadata)
 		updated.Metadata.UpdatedAt = time.Now().UTC()
+		if err := r.def.pruneObject(&updated); err != nil {
+			return nil, err
+		}
 		if err := validateRawJSONField("status", updated.Status); err != nil {
 			return nil, err
 		}
 		if err := r.def.validateObject(oldObj, &updated, SubresourceStatus); err != nil {
 			return nil, err
+		}
+		if out, handled, err := r.maybeAdmit(ctx, AdmissionUpdate, SubresourceStatus, ref, oldObj, &updated, oldRV, eventAnnotations); handled {
+			return out, err
 		}
 		out, err := r.commit(ctx, commitRequest{
 			Op:               commitUpdate,
@@ -588,8 +650,7 @@ func (r *UnstructuredResource) prepareMetadataUpdate(oldObj Unstructured, patch 
 	updated.Metadata.Finalizers = append([]string(nil), metadata.Finalizers...)
 	updated.Metadata.UpdatedAt = time.Now().UTC()
 	ensureMetadataMaps(&updated.Metadata)
-	applyAnnotationDefaults(r.def, &updated)
-	if err := validateMetadata(updated.Metadata); err != nil {
+	if err := r.def.validateMetadata(updated.Metadata); err != nil {
 		return Unstructured{}, err
 	}
 	if err := r.def.validateObject(&oldObj, &updated, SubresourceMetadata); err != nil {
@@ -633,14 +694,17 @@ func (r *UnstructuredResource) prepareSpecUpdate(oldObj, input Unstructured) (Un
 		ensureMetadataMaps(&updated.Metadata)
 	}
 	restoreManagedFields()
-	if err := validateMetadata(updated.Metadata); err != nil {
+	if err := r.def.validateMetadata(updated.Metadata); err != nil {
 		return Unstructured{}, err
 	}
 	if err := r.def.defaultObject(&updated); err != nil {
 		return Unstructured{}, err
 	}
+	if err := r.def.pruneObject(&updated); err != nil {
+		return Unstructured{}, err
+	}
 	restoreManagedFields()
-	if err := validateMetadata(updated.Metadata); err != nil {
+	if err := r.def.validateMetadata(updated.Metadata); err != nil {
 		return Unstructured{}, err
 	}
 	if err := validateRawObjectJSON(&updated); err != nil {

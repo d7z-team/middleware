@@ -2,20 +2,25 @@ package cluster
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 )
 
 type memoryStore struct {
-	prefix    string
-	mu        sync.RWMutex
-	objects   map[string]map[string]Unstructured
-	events    []resourceEvent
-	rv        uint64
-	compacted uint64
-	retention int
-	hub       *watchHub
-	closed    bool
+	prefix                     string
+	mu                         sync.RWMutex
+	objects                    map[string]map[string]Unstructured
+	admissionLocks             map[string]string
+	events                     []resourceEvent
+	rv                         uint64
+	compacted                  uint64
+	retention                  int
+	admissionRetention         int
+	admissionTerminalRetention time.Duration
+	hub                        *watchHub
+	closed                     bool
 }
 
 var memoryNodeLeases = struct {
@@ -27,11 +32,14 @@ var memoryNodeLeases = struct {
 
 func newMemoryStore(options Options) *memoryStore {
 	return &memoryStore{
-		prefix:    normalizeStorePrefix(options.Prefix),
-		objects:   make(map[string]map[string]Unstructured),
-		events:    make([]resourceEvent, 0),
-		retention: options.EventRetentionCount,
-		hub:       newWatchHub(),
+		prefix:                     normalizeStorePrefix(options.Prefix),
+		objects:                    make(map[string]map[string]Unstructured),
+		admissionLocks:             make(map[string]string),
+		events:                     make([]resourceEvent, 0),
+		retention:                  options.EventRetentionCount,
+		admissionRetention:         options.AdmissionRetentionCount,
+		admissionTerminalRetention: options.AdmissionTerminalRetention,
+		hub:                        newWatchHub(),
 	}
 }
 
@@ -97,9 +105,262 @@ func (s *memoryStore) commit(ctx context.Context, req commitRequest) (*Unstructu
 	return obj, event, nil
 }
 
+func (s *memoryStore) admissionPending(ctx context.Context, ref objectRef) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return "", ErrClosed
+	}
+	return s.admissionLocks[s.admissionLockKey(ref)], nil
+}
+
+func (s *memoryStore) beginAdmission(ctx context.Context, req beginAdmissionRequest) (*Unstructured, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	lockKey := s.admissionLockKey(req.Target)
+	if existing := s.admissionLocks[lockKey]; existing != "" {
+		return nil, ErrAdmissionPending
+	}
+	now := time.Now().UTC()
+	uid, err := randomToken("uid")
+	if err != nil {
+		return nil, err
+	}
+	req.Request.Metadata.UID = uid
+	req.Request.Metadata.ResourceVersion = ""
+	req.Request.Metadata.Generation = 1
+	req.Request.Metadata.CreatedAt = now
+	req.Request.Metadata.UpdatedAt = now
+	obj, _, err := s.commitLocked(commitRequest{
+		Op:                commitCreate,
+		Ref:               objectRef{Resource: ResourceAdmissionRequests, Name: req.Request.Metadata.Name},
+		SkipAdmissionLock: true,
+		Object:            req.Request,
+		EventType:         WatchAdded,
+		Changed:           []string{"spec", "status"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.admissionLocks[lockKey] = req.Request.Metadata.Name
+	s.hub.notify(objectRef{Resource: ResourceAdmissionRequests, Name: req.Request.Metadata.Name})
+	return obj, nil
+}
+
+func (s *memoryStore) approveAdmission(ctx context.Context, req approveAdmissionRequest) (*Unstructured, *Unstructured, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, ErrClosed
+	}
+	requestRef := objectRef{Resource: ResourceAdmissionRequests, Name: req.Name}
+	current, ok := s.getObjectLocked(requestRef)
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	spec, status, err := decodeAdmissionRequest(current)
+	if err != nil {
+		return nil, nil, err
+	}
+	if status.Phase != AdmissionPendingPhase {
+		return nil, cloneUnstructuredPtr(&current), nil
+	}
+	if req.RequireRule != "" && !slices.Contains(spec.Rules, req.RequireRule) {
+		return nil, nil, ErrInvalidObject
+	}
+	if req.Decision.Rule == "" {
+		req.Decision.Rule = req.RequireRule
+	}
+	if req.Decision.Rule == "" {
+		return nil, nil, ErrInvalidObject
+	}
+	for _, decision := range status.Approved {
+		if decision.Rule == req.Decision.Rule {
+			return nil, cloneUnstructuredPtr(&current), nil
+		}
+	}
+	now := time.Now().UTC()
+	status.Approved = append(status.Approved, AdmissionRuleDecision{
+		Rule:    req.Decision.Rule,
+		Message: req.Decision.Message,
+		Decider: req.Decision.Decider,
+		At:      now,
+	})
+	targetRef := objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}
+	lockKey := lockKeyFromRef(targetRef)
+	if len(status.Approved) < len(spec.Rules) {
+		status.Phase = AdmissionPendingPhase
+		updatedReq, err := encodeAdmissionRequest(current.Metadata, spec, status)
+		if err != nil {
+			return nil, nil, err
+		}
+		out, _, err := s.commitLocked(commitRequest{
+			Op:                commitUpdate,
+			Ref:               requestRef,
+			ExpectedRV:        parseStoredRV(current.Metadata.ResourceVersion),
+			SkipAdmissionLock: true,
+			Object:            updatedReq,
+			EventType:         WatchModified,
+			Changed:           []string{"status.approved"},
+		})
+		if err == nil {
+			s.hub.notify(requestRef)
+		}
+		return nil, out, err
+	}
+	targetCommit, targetObj, err := admissionTargetCommit(spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	targetCommit.SkipAdmissionLock = true
+	targetOut, targetEvent, err := s.commitLocked(targetCommit)
+	if err != nil {
+		return nil, nil, err
+	}
+	status.Phase = AdmissionCommittedPhase
+	status.Message = req.Decision.Message
+	status.DecidedBy = req.Decision.Decider
+	status.DecidedAt = now
+	status.TargetResourceVersion = targetOut.Metadata.ResourceVersion
+	status.TargetObject = targetObj
+	updatedReq, err := encodeAdmissionRequest(current.Metadata, spec, status)
+	if err != nil {
+		return nil, nil, err
+	}
+	requestOut, requestEvent, err := s.commitLocked(commitRequest{
+		Op:                commitUpdate,
+		Ref:               requestRef,
+		ExpectedRV:        parseStoredRV(current.Metadata.ResourceVersion),
+		SkipAdmissionLock: true,
+		Object:            updatedReq,
+		EventType:         WatchModified,
+		Changed:           []string{"status"},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	delete(s.admissionLocks, lockKey)
+	s.hub.notify(targetRef)
+	s.hub.notify(requestRef)
+	_ = targetEvent
+	_ = requestEvent
+	return targetOut, requestOut, nil
+}
+
+func (s *memoryStore) rejectAdmission(ctx context.Context, req rejectAdmissionRequest) (*Unstructured, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	requestRef := objectRef{Resource: ResourceAdmissionRequests, Name: req.Name}
+	current, ok := s.getObjectLocked(requestRef)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	spec, status, err := decodeAdmissionRequest(current)
+	if err != nil {
+		return nil, err
+	}
+	if status.Phase != AdmissionPendingPhase {
+		return cloneUnstructuredPtr(&current), nil
+	}
+	now := time.Now().UTC()
+	status.Phase = AdmissionRejectedPhase
+	status.RejectedRule = req.Decision.Rule
+	status.Message = req.Decision.Message
+	status.DecidedBy = req.Decision.Decider
+	status.DecidedAt = now
+	updatedReq, err := encodeAdmissionRequest(current.Metadata, spec, status)
+	if err != nil {
+		return nil, err
+	}
+	out, _, err := s.commitLocked(commitRequest{
+		Op:                commitUpdate,
+		Ref:               requestRef,
+		ExpectedRV:        parseStoredRV(current.Metadata.ResourceVersion),
+		SkipAdmissionLock: true,
+		Object:            updatedReq,
+		EventType:         WatchModified,
+		Changed:           []string{"status"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	delete(s.admissionLocks, lockKeyFromRef(objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}))
+	s.hub.notify(requestRef)
+	return out, nil
+}
+
+func (s *memoryStore) expireAdmission(ctx context.Context, name string, phase AdmissionPhase, message string) (*Unstructured, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	requestRef := objectRef{Resource: ResourceAdmissionRequests, Name: name}
+	current, ok := s.getObjectLocked(requestRef)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	spec, status, err := decodeAdmissionRequest(current)
+	if err != nil {
+		return nil, err
+	}
+	if status.Phase != AdmissionPendingPhase {
+		return cloneUnstructuredPtr(&current), nil
+	}
+	now := time.Now().UTC()
+	status.Phase = phase
+	status.Message = message
+	status.DecidedAt = now
+	updatedReq, err := encodeAdmissionRequest(current.Metadata, spec, status)
+	if err != nil {
+		return nil, err
+	}
+	out, _, err := s.commitLocked(commitRequest{
+		Op:                commitUpdate,
+		Ref:               requestRef,
+		ExpectedRV:        parseStoredRV(current.Metadata.ResourceVersion),
+		SkipAdmissionLock: true,
+		Object:            updatedReq,
+		EventType:         WatchModified,
+		Changed:           []string{"status"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	delete(s.admissionLocks, lockKeyFromRef(objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}))
+	s.hub.notify(requestRef)
+	return out, nil
+}
+
 func (s *memoryStore) commitLocked(req commitRequest) (*Unstructured, resourceEvent, error) {
 	if s.closed {
 		return nil, resourceEvent{}, ErrClosed
+	}
+	if !req.SkipAdmissionLock && req.Ref.Resource != ResourceAdmissionRequests {
+		if name := s.admissionLocks[s.admissionLockKey(req.Ref)]; name != "" {
+			return nil, resourceEvent{}, ErrAdmissionPending
+		}
 	}
 	resource := s.objects[req.Ref.Resource]
 	current, exists := resource[objectStorageKey(req.Ref)]
@@ -139,6 +400,15 @@ func (s *memoryStore) commitLocked(req commitRequest) (*Unstructured, resourceEv
 	return cloneUnstructuredPtr(&eventObj), event, nil
 }
 
+func (s *memoryStore) getObjectLocked(ref objectRef) (Unstructured, bool) {
+	resource := s.objects[ref.Resource]
+	if resource == nil {
+		return Unstructured{}, false
+	}
+	obj, ok := resource[objectStorageKey(ref)]
+	return obj, ok
+}
+
 func (s *memoryStore) eventsAfter(ctx context.Context, after uint64, scope resourceScope, limit int) ([]resourceEvent, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
@@ -175,6 +445,9 @@ func (s *memoryStore) cleanupEvents(ctx context.Context) error {
 	defer s.mu.Unlock()
 	if s.closed {
 		return ErrClosed
+	}
+	if err := s.expireAndCleanupAdmissionsLocked(time.Now().UTC()); err != nil {
+		return err
 	}
 	s.enforceRetentionLocked()
 	return nil
@@ -254,6 +527,10 @@ func (s *memoryStore) nodeLeaseKey(name string) string {
 	return s.prefix + "leases/nodes/" + name
 }
 
+func (s *memoryStore) admissionLockKey(ref objectRef) string {
+	return lockKeyFromRef(ref)
+}
+
 func (s *memoryStore) enforceRetentionLocked() {
 	if s.rv <= uint64(s.retention) {
 		return
@@ -267,4 +544,61 @@ func (s *memoryStore) enforceRetentionLocked() {
 		}
 	}
 	s.events = kept
+}
+
+func (s *memoryStore) expireAndCleanupAdmissionsLocked(now time.Time) error {
+	resource := s.objects[ResourceAdmissionRequests]
+	if len(resource) == 0 {
+		return nil
+	}
+	terminal := make([]Unstructured, 0, len(resource))
+	for _, obj := range resource {
+		spec, status, err := decodeAdmissionRequest(obj)
+		if err != nil {
+			return err
+		}
+		if status.Phase == AdmissionPendingPhase && !spec.ExpiresAt.IsZero() && !spec.ExpiresAt.After(now) {
+			status.Phase = AdmissionExpiredPhase
+			status.Message = "admission timeout"
+			status.DecidedAt = now
+			updated, err := encodeAdmissionRequest(obj.Metadata, spec, status)
+			if err != nil {
+				return err
+			}
+			updated.Metadata.UpdatedAt = now
+			if _, _, err := s.commitLocked(commitRequest{
+				Op:                commitUpdate,
+				Ref:               objectRef{Resource: ResourceAdmissionRequests, Name: obj.Metadata.Name},
+				ExpectedRV:        parseStoredRV(obj.Metadata.ResourceVersion),
+				SkipAdmissionLock: true,
+				Object:            updated,
+				EventType:         WatchModified,
+				Changed:           []string{"status"},
+			}); err != nil {
+				return err
+			}
+			delete(s.admissionLocks, lockKeyFromRef(objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}))
+			s.hub.notify(objectRef{Resource: ResourceAdmissionRequests, Name: obj.Metadata.Name})
+			obj = *updated
+		}
+		if status.Phase != AdmissionPendingPhase {
+			terminal = append(terminal, obj)
+		}
+	}
+	if len(terminal) <= s.admissionRetention {
+		return nil
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		return terminal[i].Metadata.UpdatedAt.After(terminal[j].Metadata.UpdatedAt)
+	})
+	for _, obj := range terminal[s.admissionRetention:] {
+		if now.Sub(obj.Metadata.UpdatedAt) < s.admissionTerminalRetention {
+			continue
+		}
+		delete(resource, objectStorageKey(objectRef{Resource: ResourceAdmissionRequests, Name: obj.Metadata.Name}))
+	}
+	if len(resource) == 0 {
+		delete(s.objects, ResourceAdmissionRequests)
+	}
+	return nil
 }

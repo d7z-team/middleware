@@ -39,7 +39,7 @@ func invalidPathToken(value string) bool {
 	return value == "" || value == "." || value == ".." || strings.ContainsAny(value, `/\`)
 }
 
-func validateMetadata(meta Metadata) error {
+func validateMetadataWithSchema(meta Metadata, _ map[string]any) error {
 	if meta.Namespace != "" {
 		if err := validateNamespace(meta.Namespace); err != nil {
 			return err
@@ -60,7 +60,7 @@ func validateMetadataKeys(values map[string]string) error {
 	return nil
 }
 
-func validateSpecPatch(patch []byte) error {
+func validateSpecPatch(patch []byte, writable map[string]struct{}) error {
 	var root map[string]json.RawMessage
 	if err := json.Unmarshal(patch, &root); err != nil {
 		return err
@@ -69,18 +69,14 @@ func validateSpecPatch(patch []byte) error {
 		return fmt.Errorf("%w: status must be patched through status subresource", ErrInvalidObject)
 	}
 	if raw, ok := root["metadata"]; ok {
-		var meta map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &meta); err != nil {
-			return err
-		}
-		if err := validateMetadataPatchKeys(meta); err != nil {
+		if err := validateMetadataPatchWithSchema(raw, writable); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateMetadataPatch(patch []byte) error {
+func validateMetadataPatchWithSchema(patch []byte, writable map[string]struct{}) error {
 	var meta map[string]json.RawMessage
 	if err := json.Unmarshal(patch, &meta); err != nil {
 		return err
@@ -88,14 +84,8 @@ func validateMetadataPatch(patch []byte) error {
 	if len(meta) == 0 {
 		return ErrInvalidObject
 	}
-	return validateMetadataPatchKeys(meta)
-}
-
-func validateMetadataPatchKeys(meta map[string]json.RawMessage) error {
 	for key := range meta {
-		switch key {
-		case "labels", "annotations", "finalizers":
-		default:
+		if _, ok := writable[key]; !ok {
 			return fmt.Errorf("%w: metadata.%s is managed", ErrInvalidObject, key)
 		}
 	}
@@ -260,6 +250,284 @@ func cloneAnnotations(annotations Annotations) Annotations {
 		copied[key] = value
 	}
 	return copied
+}
+
+func fieldRawValue(obj *Unstructured, path string) (json.RawMessage, bool) {
+	switch path {
+	case "metadata.namespace":
+		return mustMarshalRaw(obj.Metadata.Namespace), true
+	case "metadata.name":
+		return mustMarshalRaw(obj.Metadata.Name), true
+	}
+	if strings.HasPrefix(path, "metadata.") {
+		raw, err := json.Marshal(obj.Metadata)
+		if err != nil {
+			return nil, false
+		}
+		fields, ok := rawObjectFields(raw)
+		if !ok {
+			return nil, false
+		}
+		current, ok := fields[strings.TrimPrefix(path, "metadata.")]
+		if ok {
+			return current, true
+		}
+		var value any
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, false
+		}
+		currentValue := value
+		for _, segment := range strings.Split(strings.TrimPrefix(path, "metadata."), ".") {
+			object, ok := currentValue.(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			currentValue, ok = object[segment]
+			if !ok {
+				return nil, false
+			}
+		}
+		out, err := json.Marshal(currentValue)
+		if err != nil {
+			return nil, false
+		}
+		return out, true
+	}
+
+	prefix, field, ok := strings.Cut(path, ".")
+	if !ok || field == "" {
+		return nil, false
+	}
+	var raw json.RawMessage
+	switch prefix {
+	case "spec":
+		raw = obj.Spec
+	case "status":
+		raw = obj.Status
+	default:
+		return nil, false
+	}
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, false
+	}
+	current := value
+	for _, segment := range strings.Split(field, ".") {
+		object, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		current, ok = object[segment]
+		if !ok {
+			return nil, false
+		}
+	}
+	out, err := json.Marshal(current)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+func mustMarshalRaw(value any) json.RawMessage {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+func isEmptyJSONValue(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false
+	}
+	switch v := value.(type) {
+	case nil:
+		return true
+	case string:
+		return v == ""
+	default:
+		return false
+	}
+}
+
+func rawScalarString(raw json.RawMessage) (string, bool) {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	switch v := value.(type) {
+	case string:
+		return v, true
+	case bool:
+		if v {
+			return "true", true
+		}
+		return "false", true
+	case float64:
+		return fmt.Sprint(v), true
+	default:
+		return "", false
+	}
+}
+
+func applyDefaultRules(obj *Unstructured, rules []defaultRule) error {
+	for _, rule := range rules {
+		if err := applyDefaultRule(obj, rule); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyDefaultRule(obj *Unstructured, rule defaultRule) error {
+	root, remainder, ok := strings.Cut(rule.Path, ".")
+	if !ok || remainder == "" {
+		return nil
+	}
+	var current json.RawMessage
+	switch root {
+	case "spec":
+		current = obj.Spec
+	case "status":
+		current = obj.Status
+	default:
+		return nil
+	}
+	value := map[string]any{}
+	if len(current) > 0 && string(current) != "null" {
+		if err := json.Unmarshal(current, &value); err != nil {
+			return err
+		}
+	}
+	if applyDefaultMap(value, strings.Split(remainder, "."), rule.Value) {
+		updated, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		switch root {
+		case "spec":
+			obj.Spec = updated
+		case "status":
+			obj.Status = updated
+		}
+	}
+	return nil
+}
+
+func pruneRawWithSchema(raw json.RawMessage, schema map[string]any) (json.RawMessage, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || string(raw) == "null" || schema == nil {
+		return cloneRaw(raw), nil
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, err
+	}
+	pruned, err := pruneValueWithSchema(value, schema)
+	if err != nil {
+		return nil, err
+	}
+	if pruned == nil {
+		return nil, nil
+	}
+	out, err := json.Marshal(pruned)
+	if err != nil {
+		return nil, err
+	}
+	if string(out) == "null" {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func pruneValueWithSchema(value any, schema map[string]any) (any, error) {
+	if boolValue(schema["x-cluster-preserve-unknown-fields"]) {
+		return value, nil
+	}
+	switch schema["type"] {
+	case "object":
+		object, ok := value.(map[string]any)
+		if !ok {
+			return value, nil
+		}
+		result := make(map[string]any, len(object))
+		properties, _ := schema["properties"].(map[string]any)
+		for key, childRaw := range properties {
+			childSchema, ok := childRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			childValue, exists := object[key]
+			if !exists {
+				continue
+			}
+			pruned, err := pruneValueWithSchema(childValue, childSchema)
+			if err != nil {
+				return nil, err
+			}
+			result[key] = pruned
+		}
+		if additional, ok := schema["additionalProperties"].(map[string]any); ok {
+			for key, childValue := range object {
+				if _, exists := properties[key]; exists {
+					continue
+				}
+				pruned, err := pruneValueWithSchema(childValue, additional)
+				if err != nil {
+					return nil, err
+				}
+				result[key] = pruned
+			}
+		}
+		return result, nil
+	case "array":
+		itemsSchema, _ := schema["items"].(map[string]any)
+		items, ok := value.([]any)
+		if !ok || itemsSchema == nil {
+			return value, nil
+		}
+		result := make([]any, 0, len(items))
+		for _, item := range items {
+			pruned, err := pruneValueWithSchema(item, itemsSchema)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, pruned)
+		}
+		return result, nil
+	default:
+		return value, nil
+	}
+}
+
+func applyDefaultMap(root map[string]any, segments []string, raw json.RawMessage) bool {
+	if len(segments) == 0 {
+		return false
+	}
+	if len(segments) == 1 {
+		if _, exists := root[segments[0]]; exists {
+			return false
+		}
+		var value any
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return false
+		}
+		root[segments[0]] = value
+		return true
+	}
+	next, ok := root[segments[0]].(map[string]any)
+	if !ok {
+		next = map[string]any{}
+		root[segments[0]] = next
+	}
+	return applyDefaultMap(next, segments[1:], raw)
 }
 
 func cloneRaw(raw json.RawMessage) json.RawMessage {
@@ -429,4 +697,74 @@ func normalizeStorePrefix(prefix string) string {
 		return ""
 	}
 	return prefix + "/"
+}
+
+func lockKeyFromRef(ref objectRef) string {
+	return ref.Resource + "\x00" + ref.Namespace + "\x00" + ref.Name
+}
+
+func decodeAdmissionRequest(obj Unstructured) (AdmissionRequestSpec, AdmissionRequestStatus, error) {
+	typed, err := unstructuredToTyped[AdmissionRequestSpec, AdmissionRequestStatus](&obj)
+	if err != nil {
+		return AdmissionRequestSpec{}, AdmissionRequestStatus{}, err
+	}
+	return typed.Spec, typed.Status, nil
+}
+
+func encodeAdmissionRequest(meta Metadata, spec AdmissionRequestSpec, status AdmissionRequestStatus) (*Unstructured, error) {
+	return typedToUnstructured(&Object[AdmissionRequestSpec, AdmissionRequestStatus]{
+		APIVersion: "cluster.d7z.net/v1",
+		Kind:       "AdmissionRequest",
+		Metadata:   meta,
+		Spec:       spec,
+		Status:     status,
+	})
+}
+
+func admissionTargetCommit(spec AdmissionRequestSpec) (commitRequest, *Unstructured, error) {
+	if spec.Object == nil {
+		return commitRequest{}, nil, ErrInvalidObject
+	}
+	target := cloneUnstructured(*spec.Object)
+	ref := objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}
+	expectedRV, err := parseOptionalRV(spec.Precondition.ResourceVersion)
+	if err != nil {
+		return commitRequest{}, nil, err
+	}
+	req := commitRequest{
+		Ref:              ref,
+		Object:           &target,
+		EventAnnotations: cloneAnnotations(spec.EventAnnotations),
+	}
+	switch spec.Operation {
+	case AdmissionCreate:
+		req.Op = commitCreate
+		req.EventType = WatchAdded
+		req.Changed = changedPaths(nil, &target, SubresourceSpec)
+	case AdmissionUpdate:
+		if spec.OldObject == nil {
+			return commitRequest{}, nil, ErrInvalidObject
+		}
+		req.Op = commitUpdate
+		req.ExpectedRV = expectedRV
+		req.EventType = WatchModified
+		req.Changed = changedPaths(spec.OldObject, &target, spec.Subresource)
+	case AdmissionDelete:
+		if spec.OldObject == nil {
+			return commitRequest{}, nil, ErrInvalidObject
+		}
+		req.ExpectedRV = expectedRV
+		if len(spec.OldObject.Metadata.Finalizers) > 0 && spec.OldObject.Metadata.DeletedAt == nil {
+			req.Op = commitUpdate
+			req.EventType = WatchModified
+			req.Changed = changedPaths(spec.OldObject, &target, SubresourceSpec)
+		} else {
+			req.Op = commitDelete
+			req.EventType = WatchDeleted
+			req.Changed = changedPaths(spec.OldObject, &target, SubresourceSpec)
+		}
+	default:
+		return commitRequest{}, nil, ErrInvalidObject
+	}
+	return req, &target, nil
 }

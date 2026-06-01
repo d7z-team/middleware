@@ -8,18 +8,22 @@ import (
 )
 
 const (
-	defaultWatchBufferSize     = 256
-	defaultEventRetentionCount = 2000
-	defaultEventBatchSize      = 512
-	defaultListLimit           = 100
-	maxMutationRetries         = 8
-	minBackgroundInterval      = 10 * time.Millisecond
-	defaultNodeLeaseTTL        = 30 * time.Second
-	defaultNodeRenewInterval   = 10 * time.Second
-	defaultMasterHistoryLimit  = 2000
+	defaultWatchBufferSize            = 256
+	defaultEventRetentionCount        = 2000
+	defaultEventBatchSize             = 512
+	defaultListLimit                  = 100
+	maxMutationRetries                = 8
+	minBackgroundInterval             = 10 * time.Millisecond
+	defaultNodeLeaseTTL               = 30 * time.Second
+	defaultNodeRenewInterval          = 10 * time.Second
+	defaultMasterHistoryLimit         = 2000
+	defaultAdmissionTimeout           = 30 * time.Second
+	defaultAdmissionRetention         = 2000
+	defaultAdmissionTerminalRetention = 10 * time.Minute
 
-	ResourceNodes   = "nodes"
-	ResourceMasters = "masters"
+	ResourceNodes             = "nodes"
+	ResourceMasters           = "masters"
+	ResourceAdmissionRequests = "admissionrequests"
 )
 
 var (
@@ -35,6 +39,10 @@ var (
 	ErrNodeAlreadyExists     = errors.New("cluster: node already exists")
 	ErrNodeLeaseLost         = errors.New("cluster: node lease lost")
 	ErrNotMaster             = errors.New("cluster: not master")
+	ErrAdmissionPending      = errors.New("cluster: admission pending")
+	ErrAdmissionRejected     = errors.New("cluster: admission rejected")
+	ErrAdmissionExpired      = errors.New("cluster: admission expired")
+	ErrAdmissionCanceled     = errors.New("cluster: admission canceled")
 )
 
 type Options struct {
@@ -56,6 +64,12 @@ type Options struct {
 	EventRetentionCount int
 	// EventCleanupInterval controls how often the master cleans old watch events. Zero uses MasterRenewInterval. Values below 10ms are rejected.
 	EventCleanupInterval time.Duration
+	// AdmissionTimeout controls synchronous write wait time when a resource requires admission. Zero uses 30s.
+	AdmissionTimeout time.Duration
+	// AdmissionRetentionCount keeps only the newest N terminal admission requests. Zero uses the default.
+	AdmissionRetentionCount int
+	// AdmissionTerminalRetention keeps terminal admission requests for at least this long. Zero uses the default.
+	AdmissionTerminalRetention time.Duration
 	// WatchBufferSize controls each Watch result channel buffer.
 	WatchBufferSize int
 }
@@ -249,23 +263,96 @@ type MasterWatchEvent struct {
 }
 
 type ResourceInfo struct {
-	Resource    string
-	APIVersion  string
-	Kind        string
-	Namespaced  bool
-	Spec        []FieldInfo
-	Status      []FieldInfo
-	Annotations []AnnotationRule
-	Builtin     bool
+	Resource   string
+	APIVersion string
+	Kind       string
+	Namespaced bool
+	Schema     json.RawMessage
+	Indexes    []IndexInfo
+	Admission  []AdmissionRule
+	Builtin    bool
 }
 
-type FieldInfo struct {
-	Path      string
-	Required  bool
-	Immutable bool
-	Indexed   bool
-	IndexName string
-	Enum      []string
+type IndexInfo struct {
+	Path string
+}
+
+type AdmissionOperation string
+
+const (
+	AdmissionCreate AdmissionOperation = "CREATE"
+	AdmissionUpdate AdmissionOperation = "UPDATE"
+	AdmissionDelete AdmissionOperation = "DELETE"
+)
+
+type AdmissionRule struct {
+	Name         string
+	Operations   []AdmissionOperation
+	Subresources []Subresource
+	Timeout      time.Duration
+}
+
+type AdmissionRequestSpec struct {
+	Rules       []string           `json:"rules,omitempty"`
+	Operation   AdmissionOperation `json:"operation,omitempty"`
+	Resource    string             `json:"resource,omitempty"`
+	APIVersion  string             `json:"apiVersion,omitempty"`
+	Kind        string             `json:"kind,omitempty"`
+	Namespaced  bool               `json:"namespaced,omitempty"`
+	Namespace   string             `json:"namespace,omitempty"`
+	Name        string             `json:"name,omitempty"`
+	Subresource Subresource        `json:"subresource,omitempty"`
+
+	Precondition      AdmissionPrecondition `json:"precondition,omitempty"`
+	SchemaFingerprint string                `json:"schemaFingerprint,omitempty"`
+	OldObject         *Unstructured         `json:"oldObject,omitempty"`
+	Object            *Unstructured         `json:"object,omitempty"`
+	EventAnnotations  Annotations           `json:"eventAnnotations,omitempty"`
+
+	CreatedByNode string    `json:"createdByNode,omitempty"`
+	ExpiresAt     time.Time `json:"expiresAt,omitempty"`
+}
+
+type AdmissionPrecondition struct {
+	MustExist       bool   `json:"mustExist,omitempty"`
+	MustNotExist    bool   `json:"mustNotExist,omitempty"`
+	ResourceVersion string `json:"resourceVersion,omitempty"`
+}
+
+type AdmissionPhase string
+
+const (
+	AdmissionPendingPhase   AdmissionPhase = "Pending"
+	AdmissionRejectedPhase  AdmissionPhase = "Rejected"
+	AdmissionExpiredPhase   AdmissionPhase = "Expired"
+	AdmissionCanceledPhase  AdmissionPhase = "Canceled"
+	AdmissionCommittedPhase AdmissionPhase = "Committed"
+)
+
+type AdmissionRuleDecision struct {
+	Rule    string    `json:"rule,omitempty"`
+	Message string    `json:"message,omitempty"`
+	Decider string    `json:"decider,omitempty"`
+	At      time.Time `json:"at,omitempty"`
+}
+
+type AdmissionRequestStatus struct {
+	Phase                 AdmissionPhase          `json:"phase,omitempty"`
+	Approved              []AdmissionRuleDecision `json:"approved,omitempty"`
+	RejectedRule          string                  `json:"rejectedRule,omitempty"`
+	Message               string                  `json:"message,omitempty"`
+	DecidedBy             string                  `json:"decidedBy,omitempty"`
+	DecidedAt             time.Time               `json:"decidedAt,omitempty"`
+	LastError             string                  `json:"lastError,omitempty"`
+	LastErrorAt           time.Time               `json:"lastErrorAt,omitempty"`
+	TargetResourceVersion string                  `json:"targetResourceVersion,omitempty"`
+	TargetObject          *Unstructured           `json:"targetObject,omitempty"`
+}
+
+type AdmissionDecisionOptions struct {
+	Rule    string
+	Message string
+	Decider string
 }
 
 type resourceEvent struct {
@@ -286,6 +373,11 @@ type resourceStore interface {
 	get(context.Context, objectRef) (*Unstructured, error)
 	list(context.Context, resourceScope) ([]Unstructured, uint64, error)
 	commit(context.Context, commitRequest) (*Unstructured, resourceEvent, error)
+	admissionPending(context.Context, objectRef) (string, error)
+	beginAdmission(context.Context, beginAdmissionRequest) (*Unstructured, error)
+	approveAdmission(context.Context, approveAdmissionRequest) (*Unstructured, *Unstructured, error)
+	rejectAdmission(context.Context, rejectAdmissionRequest) (*Unstructured, error)
+	expireAdmission(context.Context, string, AdmissionPhase, string) (*Unstructured, error)
 	eventsAfter(context.Context, uint64, resourceScope, int) ([]resourceEvent, uint64, error)
 	cleanupEvents(context.Context) error
 	subscribe(context.Context, resourceScope) (<-chan struct{}, func(), error)
@@ -304,11 +396,29 @@ const (
 )
 
 type commitRequest struct {
-	Op               commitOp
-	Ref              objectRef
-	ExpectedRV       uint64
-	Object           *Unstructured
-	EventType        WatchEventType
-	EventAnnotations Annotations
-	Changed          []string
+	Op                commitOp
+	Ref               objectRef
+	ExpectedRV        uint64
+	SkipAdmissionLock bool
+	Object            *Unstructured
+	EventType         WatchEventType
+	EventAnnotations  Annotations
+	Changed           []string
+}
+
+type beginAdmissionRequest struct {
+	Request *Unstructured
+	Target  objectRef
+}
+
+type approveAdmissionRequest struct {
+	Name           string
+	Decision       AdmissionDecisionOptions
+	RequireRule    string
+	RequirePending bool
+}
+
+type rejectAdmissionRequest struct {
+	Name     string
+	Decision AdmissionDecisionOptions
 }

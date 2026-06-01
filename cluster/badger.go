@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -13,12 +15,14 @@ import (
 )
 
 type badgerStore struct {
-	db        *badger.DB
-	prefix    string
-	retention int
-	hub       *watchHub
-	mu        sync.RWMutex
-	closed    bool
+	db                         *badger.DB
+	prefix                     string
+	retention                  int
+	admissionRetention         int
+	admissionTerminalRetention time.Duration
+	hub                        *watchHub
+	mu                         sync.RWMutex
+	closed                     bool
 }
 
 func newBadgerStore(path string, options Options) (*badgerStore, error) {
@@ -32,10 +36,12 @@ func newBadgerStore(path string, options Options) (*badgerStore, error) {
 		return nil, err
 	}
 	return &badgerStore{
-		db:        db,
-		prefix:    normalizeStorePrefix(options.Prefix),
-		retention: options.EventRetentionCount,
-		hub:       newWatchHub(),
+		db:                         db,
+		prefix:                     normalizeStorePrefix(options.Prefix),
+		retention:                  options.EventRetentionCount,
+		admissionRetention:         options.AdmissionRetentionCount,
+		admissionTerminalRetention: options.AdmissionTerminalRetention,
+		hub:                        newWatchHub(),
 	}, nil
 }
 
@@ -121,6 +127,13 @@ func (s *badgerStore) commit(ctx context.Context, req commitRequest) (*Unstructu
 	var out Unstructured
 	var event resourceEvent
 	err := s.db.Update(func(txn *badger.Txn) error {
+		if !req.SkipAdmissionLock && req.Ref.Resource != ResourceAdmissionRequests {
+			if _, exists, err := s.getAdmissionLockTxn(txn, req.Ref); err != nil {
+				return err
+			} else if exists {
+				return ErrAdmissionPending
+			}
+		}
 		current, exists, err := s.getObjectTxn(txn, req.Ref)
 		if err != nil {
 			return err
@@ -185,6 +198,297 @@ func (s *badgerStore) commit(ctx context.Context, req commitRequest) (*Unstructu
 	return cloneUnstructuredPtr(&out), event, nil
 }
 
+func (s *badgerStore) admissionPending(ctx context.Context, ref objectRef) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return "", ErrClosed
+	}
+	var out string
+	err := s.db.View(func(txn *badger.Txn) error {
+		value, exists, err := s.getAdmissionLockTxn(txn, ref)
+		if err != nil || !exists {
+			return err
+		}
+		out = value
+		return nil
+	})
+	return out, err
+}
+
+func (s *badgerStore) beginAdmission(ctx context.Context, req beginAdmissionRequest) (*Unstructured, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	now := time.Now().UTC()
+	token, err := randomToken("uid")
+	if err != nil {
+		return nil, err
+	}
+	req.Request.Metadata.UID = token
+	req.Request.Metadata.ResourceVersion = ""
+	req.Request.Metadata.Generation = 1
+	req.Request.Metadata.CreatedAt = now
+	req.Request.Metadata.UpdatedAt = now
+	var out Unstructured
+	err = s.db.Update(func(txn *badger.Txn) error {
+		if _, exists, err := s.getAdmissionLockTxn(txn, req.Target); err != nil {
+			return err
+		} else if exists {
+			return ErrAdmissionPending
+		}
+		objectRef := objectRef{Resource: ResourceAdmissionRequests, Name: req.Request.Metadata.Name}
+		if _, exists, err := s.getObjectTxn(txn, objectRef); err != nil {
+			return err
+		} else if exists {
+			return ErrAlreadyExists
+		}
+		currentRV, err := s.currentRV(txn)
+		if err != nil {
+			return err
+		}
+		nextRV := currentRV + 1
+		out = cloneUnstructured(*req.Request)
+		out.Metadata.ResourceVersion = formatRV(nextRV)
+		raw, err := json.Marshal(out)
+		if err != nil {
+			return err
+		}
+		event := newStoreEvent(commitRequest{
+			Op:                commitCreate,
+			Ref:               objectRef,
+			SkipAdmissionLock: true,
+			Object:            &out,
+			EventType:         WatchAdded,
+			Changed:           []string{"spec", "status"},
+		}, nextRV, &out)
+		if err := txn.Set([]byte(s.objectKey(objectRef)), raw); err != nil {
+			return err
+		}
+		if err := txn.Set([]byte(s.admissionLockKey(req.Target)), []byte(req.Request.Metadata.Name)); err != nil {
+			return err
+		}
+		if err := s.writeEventTxn(txn, event); err != nil {
+			return err
+		}
+		return s.setRV(txn, nextRV)
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.hub.notify(objectRef{Resource: ResourceAdmissionRequests, Name: req.Request.Metadata.Name})
+	return cloneUnstructuredPtr(&out), nil
+}
+
+func (s *badgerStore) approveAdmission(ctx context.Context, req approveAdmissionRequest) (*Unstructured, *Unstructured, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, nil, ErrClosed
+	}
+	var targetOut *Unstructured
+	var requestOut *Unstructured
+	var targetNotify *objectRef
+	requestRef := objectRef{Resource: ResourceAdmissionRequests, Name: req.Name}
+	err := s.db.Update(func(txn *badger.Txn) error {
+		current, exists, err := s.getObjectTxn(txn, requestRef)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		spec, status, err := decodeAdmissionRequest(current)
+		if err != nil {
+			return err
+		}
+		if status.Phase != AdmissionPendingPhase {
+			requestOut = cloneUnstructuredPtr(&current)
+			return nil
+		}
+		if req.RequireRule != "" && !slices.Contains(spec.Rules, req.RequireRule) {
+			return ErrInvalidObject
+		}
+		if req.Decision.Rule == "" {
+			req.Decision.Rule = req.RequireRule
+		}
+		if req.Decision.Rule == "" {
+			return ErrInvalidObject
+		}
+		for _, decision := range status.Approved {
+			if decision.Rule == req.Decision.Rule {
+				requestOut = cloneUnstructuredPtr(&current)
+				return nil
+			}
+		}
+		now := time.Now().UTC()
+		status.Approved = append(status.Approved, AdmissionRuleDecision{
+			Rule:    req.Decision.Rule,
+			Message: req.Decision.Message,
+			Decider: req.Decision.Decider,
+			At:      now,
+		})
+		if len(status.Approved) < len(spec.Rules) {
+			updated, err := encodeAdmissionRequest(current.Metadata, spec, status)
+			if err != nil {
+				return err
+			}
+			requestOut, err = s.updateAdmissionRequestTxn(txn, requestRef, current.Metadata.ResourceVersion, updated, []string{"status.approved"})
+			return err
+		}
+		targetCommit, targetObj, err := admissionTargetCommit(spec)
+		if err != nil {
+			return err
+		}
+		targetCommit.SkipAdmissionLock = true
+		targetOut, _, err = s.commitAdmissionTargetTxn(txn, targetCommit)
+		if err != nil {
+			return err
+		}
+		status.Phase = AdmissionCommittedPhase
+		status.Message = req.Decision.Message
+		status.DecidedBy = req.Decision.Decider
+		status.DecidedAt = now
+		status.TargetResourceVersion = targetOut.Metadata.ResourceVersion
+		status.TargetObject = targetObj
+		updated, err := encodeAdmissionRequest(current.Metadata, spec, status)
+		if err != nil {
+			return err
+		}
+		requestOut, err = s.updateAdmissionRequestTxn(txn, requestRef, current.Metadata.ResourceVersion, updated, []string{"status"})
+		if err != nil {
+			return err
+		}
+		if err := txn.Delete([]byte(s.admissionLockKey(objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		targetNotify = &objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if targetNotify != nil {
+		s.hub.notify(*targetNotify)
+	}
+	s.hub.notify(requestRef)
+	return targetOut, requestOut, nil
+}
+
+func (s *badgerStore) rejectAdmission(ctx context.Context, req rejectAdmissionRequest) (*Unstructured, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	requestRef := objectRef{Resource: ResourceAdmissionRequests, Name: req.Name}
+	var out *Unstructured
+	err := s.db.Update(func(txn *badger.Txn) error {
+		current, exists, err := s.getObjectTxn(txn, requestRef)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		spec, status, err := decodeAdmissionRequest(current)
+		if err != nil {
+			return err
+		}
+		if status.Phase != AdmissionPendingPhase {
+			out = cloneUnstructuredPtr(&current)
+			return nil
+		}
+		now := time.Now().UTC()
+		status.Phase = AdmissionRejectedPhase
+		status.RejectedRule = req.Decision.Rule
+		status.Message = req.Decision.Message
+		status.DecidedBy = req.Decision.Decider
+		status.DecidedAt = now
+		updated, err := encodeAdmissionRequest(current.Metadata, spec, status)
+		if err != nil {
+			return err
+		}
+		out, err = s.updateAdmissionRequestTxn(txn, requestRef, current.Metadata.ResourceVersion, updated, []string{"status"})
+		if err != nil {
+			return err
+		}
+		if err := txn.Delete([]byte(s.admissionLockKey(objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.hub.notify(requestRef)
+	return out, nil
+}
+
+func (s *badgerStore) expireAdmission(ctx context.Context, name string, phase AdmissionPhase, message string) (*Unstructured, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, ErrClosed
+	}
+	requestRef := objectRef{Resource: ResourceAdmissionRequests, Name: name}
+	var out *Unstructured
+	err := s.db.Update(func(txn *badger.Txn) error {
+		current, exists, err := s.getObjectTxn(txn, requestRef)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		spec, status, err := decodeAdmissionRequest(current)
+		if err != nil {
+			return err
+		}
+		if status.Phase != AdmissionPendingPhase {
+			out = cloneUnstructuredPtr(&current)
+			return nil
+		}
+		status.Phase = phase
+		status.Message = message
+		status.DecidedAt = time.Now().UTC()
+		updated, err := encodeAdmissionRequest(current.Metadata, spec, status)
+		if err != nil {
+			return err
+		}
+		out, err = s.updateAdmissionRequestTxn(txn, requestRef, current.Metadata.ResourceVersion, updated, []string{"status"})
+		if err != nil {
+			return err
+		}
+		if err := txn.Delete([]byte(s.admissionLockKey(objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.hub.notify(requestRef)
+	return out, nil
+}
+
 func (s *badgerStore) eventsAfter(ctx context.Context, after uint64, scope resourceScope, limit int) ([]resourceEvent, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
@@ -243,6 +547,9 @@ func (s *badgerStore) cleanupEvents(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := s.cleanupAdmissions(ctx); err != nil {
+		return err
+	}
 	before, err := s.cleanupEventsCutoff(ctx)
 	if err != nil || before == 0 {
 		return err
@@ -253,6 +560,30 @@ func (s *badgerStore) cleanupEvents(ctx context.Context) error {
 			return err
 		}
 	}
+}
+
+func (s *badgerStore) cleanupAdmissions(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrClosed
+	}
+	var notify []objectRef
+	err := s.db.Update(func(txn *badger.Txn) error {
+		var err error
+		notify, err = s.cleanupAdmissionsTxn(ctx, txn, time.Now().UTC())
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	for _, ref := range notify {
+		s.hub.notify(ref)
+	}
+	return nil
 }
 
 func (s *badgerStore) subscribe(ctx context.Context, scope resourceScope) (<-chan struct{}, func(), error) {
@@ -374,6 +705,22 @@ func (s *badgerStore) getObjectTxn(txn *badger.Txn, ref objectRef) (Unstructured
 	return obj, true, nil
 }
 
+func (s *badgerStore) getAdmissionLockTxn(txn *badger.Txn, ref objectRef) (string, bool, error) {
+	item, err := txn.Get([]byte(s.admissionLockKey(ref)))
+	if err != nil {
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	var value string
+	err = item.Value(func(raw []byte) error {
+		value = string(raw)
+		return nil
+	})
+	return value, err == nil, err
+}
+
 func (s *badgerStore) getNodeLeaseTxn(txn *badger.Txn, name string) (nodeLeaseRecord, bool, error) {
 	item, err := txn.Get([]byte(s.nodeLeaseKey(name)))
 	if err != nil {
@@ -464,6 +811,182 @@ func (s *badgerStore) deleteEventsBeforeBatch(ctx context.Context, before uint64
 	return deleted, err
 }
 
+func (s *badgerStore) writeEventTxn(txn *badger.Txn, event resourceEvent) error {
+	rv := parseStoredRV(event.ResourceVersion)
+	eventRaw, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	if err := txn.Set([]byte(s.eventAllKey(rv)), eventRaw); err != nil {
+		return err
+	}
+	if err := txn.Set([]byte(s.eventResourceKey(event.Ref.Resource, rv)), eventRaw); err != nil {
+		return err
+	}
+	if event.Ref.Namespace != "" {
+		if err := txn.Set([]byte(s.eventNamespaceKey(event.Ref, rv)), eventRaw); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *badgerStore) updateAdmissionRequestTxn(txn *badger.Txn, ref objectRef, currentRV string, updated *Unstructured, changed []string) (*Unstructured, error) {
+	current, exists, err := s.getObjectTxn(txn, ref)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+	if current.Metadata.ResourceVersion != currentRV {
+		return nil, ErrConflict
+	}
+	rv, err := s.currentRV(txn)
+	if err != nil {
+		return nil, err
+	}
+	nextRV := rv + 1
+	out := cloneUnstructured(*updated)
+	out.Metadata.ResourceVersion = formatRV(nextRV)
+	out.Metadata.UpdatedAt = time.Now().UTC()
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return nil, err
+	}
+	if err := txn.Set([]byte(s.objectKey(ref)), raw); err != nil {
+		return nil, err
+	}
+	event := newStoreEvent(commitRequest{
+		Op:                commitUpdate,
+		Ref:               ref,
+		SkipAdmissionLock: true,
+		Object:            &out,
+		EventType:         WatchModified,
+		Changed:           changed,
+	}, nextRV, &out)
+	if err := s.writeEventTxn(txn, event); err != nil {
+		return nil, err
+	}
+	if err := s.setRV(txn, nextRV); err != nil {
+		return nil, err
+	}
+	return cloneUnstructuredPtr(&out), nil
+}
+
+func (s *badgerStore) cleanupAdmissionsTxn(ctx context.Context, txn *badger.Txn, now time.Time) ([]objectRef, error) {
+	prefix := s.objectPrefix(resourceScope{Resource: ResourceAdmissionRequests})
+	opts := badger.DefaultIteratorOptions
+	opts.Prefix = []byte(prefix)
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	notify := make([]objectRef, 0)
+	terminal := make([]Unstructured, 0)
+	for it.Rewind(); it.ValidForPrefix([]byte(prefix)); it.Next() {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		var obj Unstructured
+		if err := it.Item().Value(func(value []byte) error {
+			return json.Unmarshal(value, &obj)
+		}); err != nil {
+			return nil, err
+		}
+		spec, status, err := decodeAdmissionRequest(obj)
+		if err != nil {
+			return nil, err
+		}
+		if status.Phase == AdmissionPendingPhase && !spec.ExpiresAt.IsZero() && !spec.ExpiresAt.After(now) {
+			status.Phase = AdmissionExpiredPhase
+			status.Message = "admission timeout"
+			status.DecidedAt = now
+			updated, err := encodeAdmissionRequest(obj.Metadata, spec, status)
+			if err != nil {
+				return nil, err
+			}
+			updated.Metadata.UpdatedAt = now
+			objPtr, err := s.updateAdmissionRequestTxn(txn, objectRef{Resource: ResourceAdmissionRequests, Name: obj.Metadata.Name}, obj.Metadata.ResourceVersion, updated, []string{"status"})
+			if err != nil {
+				return nil, err
+			}
+			obj = *objPtr
+			if err := txn.Delete([]byte(s.admissionLockKey(objectRef{Resource: spec.Resource, Namespace: spec.Namespace, Name: spec.Name}))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+				return nil, err
+			}
+			notify = append(notify, objectRef{Resource: ResourceAdmissionRequests, Name: obj.Metadata.Name})
+		}
+		if status.Phase != AdmissionPendingPhase {
+			terminal = append(terminal, obj)
+		}
+	}
+	if len(terminal) <= s.admissionRetention {
+		return notify, nil
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		return terminal[i].Metadata.UpdatedAt.After(terminal[j].Metadata.UpdatedAt)
+	})
+	for _, obj := range terminal[s.admissionRetention:] {
+		if now.Sub(obj.Metadata.UpdatedAt) < s.admissionTerminalRetention {
+			continue
+		}
+		if err := txn.Delete([]byte(s.objectKey(objectRef{Resource: ResourceAdmissionRequests, Name: obj.Metadata.Name}))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, err
+		}
+	}
+	return notify, nil
+}
+
+func (s *badgerStore) commitAdmissionTargetTxn(txn *badger.Txn, req commitRequest) (*Unstructured, resourceEvent, error) {
+	current, exists, err := s.getObjectTxn(txn, req.Ref)
+	if err != nil {
+		return nil, resourceEvent{}, err
+	}
+	switch req.Op {
+	case commitCreate:
+		if exists {
+			return nil, resourceEvent{}, ErrAlreadyExists
+		}
+	case commitUpdate, commitDelete:
+		if !exists {
+			return nil, resourceEvent{}, ErrNotFound
+		}
+		if parseStoredRV(current.Metadata.ResourceVersion) != req.ExpectedRV {
+			return nil, resourceEvent{}, ErrConflict
+		}
+	default:
+		return nil, resourceEvent{}, ErrUnsupported
+	}
+	currentRV, err := s.currentRV(txn)
+	if err != nil {
+		return nil, resourceEvent{}, err
+	}
+	nextRV := currentRV + 1
+	out := cloneUnstructured(*req.Object)
+	out.Metadata.ResourceVersion = formatRV(nextRV)
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return nil, resourceEvent{}, err
+	}
+	if req.Op == commitDelete {
+		if err := txn.Delete([]byte(s.objectKey(req.Ref))); err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, resourceEvent{}, err
+		}
+	} else {
+		if err := txn.Set([]byte(s.objectKey(req.Ref)), raw); err != nil {
+			return nil, resourceEvent{}, err
+		}
+	}
+	event := newStoreEvent(req, nextRV, &out)
+	if err := s.writeEventTxn(txn, event); err != nil {
+		return nil, resourceEvent{}, err
+	}
+	if err := s.setRV(txn, nextRV); err != nil {
+		return nil, resourceEvent{}, err
+	}
+	return cloneUnstructuredPtr(&out), event, nil
+}
+
 func (s *badgerStore) deleteEventsBeforeTxn(ctx context.Context, txn *badger.Txn, before uint64, limit int) (int, error) {
 	previous, err := s.compactedRV(txn)
 	if err != nil {
@@ -518,6 +1041,13 @@ func (s *badgerStore) deleteEventsBeforeTxn(ctx context.Context, txn *badger.Txn
 
 func (s *badgerStore) metaKey(name string) string {
 	return s.prefix + "meta/" + name
+}
+
+func (s *badgerStore) admissionLockKey(ref objectRef) string {
+	if ref.Namespace != "" {
+		return s.prefix + "locks/admission/" + ref.Resource + "/namespaces/" + ref.Namespace + "/" + ref.Name
+	}
+	return s.prefix + "locks/admission/" + ref.Resource + "/" + ref.Name
 }
 
 func (s *badgerStore) objectKey(ref objectRef) string {

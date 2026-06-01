@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -15,7 +16,7 @@ import (
 )
 
 type widgetSpec struct {
-	Size  string `json:"size,omitempty" cluster:"required,enum=small|medium|large,index"`
+	Size  string `json:"size,omitempty" cluster:"required,enum=small|medium|large,index,default=medium"`
 	Owner string `json:"owner,omitempty" cluster:"immutable,index=owner"`
 }
 
@@ -239,6 +240,448 @@ func TestClusterRecordsCleanupError(t *testing.T) {
 	require.True(t, gotAt.IsZero())
 }
 
+func TestClusterDefineResourceSchemaValidation(t *testing.T) {
+	c, err := NewClusterFromURL("memory://?node=schema-validate")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+
+	_, err = DefineResource(c, ResourceDef{
+		Resource:   "empties",
+		APIVersion: "example.test/v1",
+		Kind:       "Empty",
+	})
+	require.ErrorIs(t, err, ErrInvalidResource)
+
+	_, err = DefineResource(c, ResourceDef{
+		Resource:   "invalidroot",
+		APIVersion: "example.test/v1",
+		Kind:       "InvalidRoot",
+		Schema:     json.RawMessage(`{"type":"string"}`),
+	})
+	require.ErrorIs(t, err, ErrInvalidResource)
+
+	_, err = DefineResource(c, ResourceDef{
+		Resource:   "missingspec",
+		APIVersion: "example.test/v1",
+		Kind:       "MissingSpec",
+		Schema: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"apiVersion":{"type":"string"},
+				"kind":{"type":"string"},
+				"metadata":{"type":"object"}
+			}
+		}`),
+	})
+	require.ErrorIs(t, err, ErrInvalidResource)
+
+	_, err = DefineResource(c, ResourceDef{
+		Resource:   "statusimmutable",
+		APIVersion: "example.test/v1",
+		Kind:       "StatusImmutable",
+		Schema: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"apiVersion":{"type":"string"},
+				"kind":{"type":"string"},
+				"metadata":{"type":"object","properties":{"name":{"type":"string"}}},
+				"spec":{"type":"object","properties":{},"additionalProperties":false},
+				"status":{"type":"object","properties":{"phase":{"type":"string","x-cluster-immutable":true}},"additionalProperties":false}
+			}
+		}`),
+	})
+	require.ErrorIs(t, err, ErrInvalidResource)
+
+	_, err = DefineResource(c, ResourceDef{
+		Resource:   "badindexkeys",
+		APIVersion: "example.test/v1",
+		Kind:       "BadIndexKeys",
+		Schema: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"apiVersion":{"type":"string"},
+				"kind":{"type":"string"},
+				"metadata":{"type":"object","properties":{"name":{"type":"string"}}},
+				"spec":{"type":"object","properties":{"size":{"type":"string","x-cluster-index-keys":["tenant"]}},"additionalProperties":false}
+			}
+		}`),
+	})
+	require.ErrorIs(t, err, ErrInvalidResource)
+}
+
+func TestClusterSchemaPrunesUnknownFields(t *testing.T) {
+	c, err := NewClusterFromURL("memory://?node=schema-prune")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+	ctx := testContext(t, 5*time.Second)
+
+	raw, err := DefineResource(c, ResourceDef{
+		Resource:   "rawwidgets",
+		APIVersion: "example.test/v1",
+		Kind:       "RawWidget",
+		Schema: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"apiVersion":{"type":"string"},
+				"kind":{"type":"string"},
+				"metadata":{
+					"type":"object",
+					"properties":{"name":{"type":"string"}},
+					"required":["name"],
+					"additionalProperties":false
+				},
+				"spec":{
+					"type":"object",
+					"properties":{
+						"size":{"type":"string","x-cluster-index":true},
+						"config":{"type":"object","x-cluster-preserve-unknown-fields":true}
+					},
+					"additionalProperties":false
+				},
+				"status":{
+					"type":"object",
+					"properties":{"phase":{"type":"string"}},
+					"additionalProperties":false
+				}
+			}
+		}`),
+	})
+	require.NoError(t, err)
+
+	created, err := raw.Create(ctx, &Unstructured{
+		APIVersion: "example.test/v1",
+		Kind:       "RawWidget",
+		Metadata:   Metadata{Name: "alpha"},
+		Spec: json.RawMessage(`{
+			"size":"small",
+			"unknown":"drop",
+			"config":{"keep":true,"nested":{"value":1}}
+		}`),
+	}, CreateOptions{})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"size":"small","config":{"keep":true,"nested":{"value":1}}}`, string(created.Spec))
+
+	statused, err := raw.PatchStatus(ctx, "alpha", []byte(`{"phase":"Ready","ghost":"drop"}`), PatchOptions{})
+	require.NoError(t, err)
+	require.JSONEq(t, `{"phase":"Ready"}`, string(statused.Status))
+}
+
+func TestClusterAdmissionCreateFlowMemory(t *testing.T) {
+	c, err := NewClusterFromURL("memory://?node=admission-flow")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+	ctx := testContext(t, 5*time.Second)
+
+	widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+		Resource:   "admissionwidgets",
+		APIVersion: "example.test/v1",
+		Kind:       "AdmissionWidget",
+		Admission: []AdmissionRule{
+			{Name: "create-check", Operations: []AdmissionOperation{AdmissionCreate}},
+		},
+	})
+	require.NoError(t, err)
+
+	type createResult struct {
+		obj *Object[widgetSpec, widgetStatus]
+		err error
+	}
+	resultCh := make(chan createResult, 1)
+	go func() {
+		obj, err := widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+		resultCh <- createResult{obj: obj, err: err}
+	}()
+
+	watchCtx := testContext(t, 5*time.Second)
+	events, err := c.AdmissionRequests().Watch(watchCtx, WatchOptions{SendInitialEvents: true})
+	require.NoError(t, err)
+
+	var request WatchEvent[AdmissionRequestSpec, AdmissionRequestStatus]
+	for {
+		request = nextWatchEvent(t, events)
+		if request.Type == WatchAdded && request.Object != nil && request.Object.Spec.Name == "alpha" {
+			break
+		}
+	}
+	require.Equal(t, AdmissionPendingPhase, request.Object.Status.Phase)
+	require.Equal(t, []string{"create-check"}, request.Object.Spec.Rules)
+
+	_, err = widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-b"}, CreateOptions{})
+	require.ErrorIs(t, err, ErrAdmissionPending)
+
+	approved, err := c.ApproveAdmission(ctx, request.Object.Metadata.Name, AdmissionDecisionOptions{
+		Rule:    "create-check",
+		Decider: "tester",
+		Message: "ok",
+	})
+	require.NoError(t, err)
+	require.Equal(t, AdmissionCommittedPhase, approved.Status.Phase)
+	require.NotNil(t, approved.Status.TargetObject)
+
+	result := <-resultCh
+	require.NoError(t, result.err)
+	require.NotNil(t, result.obj)
+	require.Equal(t, "alpha", result.obj.Metadata.Name)
+	require.Equal(t, "medium", result.obj.Spec.Size)
+	require.Equal(t, "team-a", result.obj.Spec.Owner)
+}
+
+func TestClusterAdmissionCanceledAndRequestReadonly(t *testing.T) {
+	c, err := NewClusterFromURL("memory://?node=admission-cancel")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+
+	widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+		Resource:   "cancelwidgets",
+		APIVersion: "example.test/v1",
+		Kind:       "CancelWidget",
+		Admission: []AdmissionRule{
+			{Name: "create-check", Operations: []AdmissionOperation{AdmissionCreate}},
+		},
+	})
+	require.NoError(t, err)
+
+	writeCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := widgets.Create(writeCtx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+		resultCh <- err
+	}()
+
+	ctx := testContext(t, 5*time.Second)
+	var list *ObjectList[AdmissionRequestSpec, AdmissionRequestStatus]
+	require.Eventually(t, func() bool {
+		var err error
+		list, err = c.AdmissionRequests().List(ctx, ListOptions{})
+		return err == nil && len(list.Items) == 1
+	}, 2*time.Second, 20*time.Millisecond)
+	require.Equal(t, AdmissionPendingPhase, list.Items[0].Status.Phase)
+
+	err = <-resultCh
+	require.ErrorIs(t, err, ErrAdmissionCanceled)
+
+	req, err := c.AdmissionRequests().Get(ctx, list.Items[0].Metadata.Name)
+	require.NoError(t, err)
+	require.Equal(t, AdmissionCanceledPhase, req.Status.Phase)
+
+	raw, err := c.Unstructured(ResourceAdmissionRequests)
+	require.NoError(t, err)
+	_, err = raw.Delete(ctx, req.Metadata.Name, DeleteOptions{})
+	require.ErrorIs(t, err, ErrUnsupported)
+}
+
+func TestClusterAdmissionExpiresMemory(t *testing.T) {
+	c, err := NewClusterFromURL("memory://?node=admission-expire&admission_timeout=80ms&event_cleanup_interval=20ms")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, c.Close()) })
+
+	widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+		Resource:   "expirewidgets",
+		APIVersion: "example.test/v1",
+		Kind:       "ExpireWidget",
+		Admission: []AdmissionRule{
+			{Name: "create-check", Operations: []AdmissionOperation{AdmissionCreate}},
+		},
+	})
+	require.NoError(t, err)
+
+	ctx := testContext(t, 5*time.Second)
+	resultCh := make(chan error, 1)
+	go func() {
+		_, err := widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+		resultCh <- err
+	}()
+
+	var errResult error
+	require.Eventually(t, func() bool {
+		select {
+		case errResult = <-resultCh:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second, 20*time.Millisecond)
+	require.ErrorIs(t, errResult, ErrAdmissionExpired)
+
+	list, err := c.AdmissionRequests().List(ctx, ListOptions{})
+	require.NoError(t, err)
+	require.Len(t, list.Items, 1)
+	require.Equal(t, AdmissionExpiredPhase, list.Items[0].Status.Phase)
+}
+
+func TestClusterAdmissionCreateFlowLocalBackends(t *testing.T) {
+	for _, factory := range localURLFactories() {
+		t.Run(factory.name, func(t *testing.T) {
+			c := newURLCluster(t, factory, nil)
+			ctx := testContext(t, 5*time.Second)
+			widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+				Resource:   "admissionbackendwidgets",
+				APIVersion: "example.test/v1",
+				Kind:       "AdmissionBackendWidget",
+				Admission: []AdmissionRule{
+					{Name: "create-check", Operations: []AdmissionOperation{AdmissionCreate}},
+				},
+			})
+			require.NoError(t, err)
+
+			type createResult struct {
+				obj *Object[widgetSpec, widgetStatus]
+				err error
+			}
+			resultCh := make(chan createResult, 1)
+			go func() {
+				obj, err := widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+				resultCh <- createResult{obj: obj, err: err}
+			}()
+
+			watchCtx := testContext(t, 5*time.Second)
+			events, err := c.AdmissionRequests().Watch(watchCtx, WatchOptions{SendInitialEvents: true})
+			require.NoError(t, err)
+
+			var request WatchEvent[AdmissionRequestSpec, AdmissionRequestStatus]
+			for {
+				request = nextWatchEvent(t, events)
+				if request.Type == WatchAdded && request.Object != nil && request.Object.Spec.Name == "alpha" {
+					break
+				}
+			}
+
+			approved, err := c.ApproveAdmission(ctx, request.Object.Metadata.Name, AdmissionDecisionOptions{
+				Rule:    "create-check",
+				Decider: "tester",
+				Message: "ok",
+			})
+			require.NoError(t, err)
+			require.Equal(t, AdmissionCommittedPhase, approved.Status.Phase)
+
+			result := <-resultCh
+			require.NoError(t, result.err)
+			require.Equal(t, "alpha", result.obj.Metadata.Name)
+			require.Equal(t, "team-a", result.obj.Spec.Owner)
+		})
+	}
+}
+
+func TestClusterAdmissionExpiresLocalBackends(t *testing.T) {
+	for _, factory := range localURLFactories() {
+		t.Run(factory.name, func(t *testing.T) {
+			c := newURLCluster(t, factory, url.Values{
+				"admission_timeout":      {"80ms"},
+				"event_cleanup_interval": {"20ms"},
+			})
+			widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+				Resource:   "expirebackendwidgets",
+				APIVersion: "example.test/v1",
+				Kind:       "ExpireBackendWidget",
+				Admission: []AdmissionRule{
+					{Name: "create-check", Operations: []AdmissionOperation{AdmissionCreate}},
+				},
+			})
+			require.NoError(t, err)
+
+			ctx := testContext(t, 5*time.Second)
+			resultCh := make(chan error, 1)
+			go func() {
+				_, err := widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+				resultCh <- err
+			}()
+
+			var errResult error
+			require.Eventually(t, func() bool {
+				select {
+				case errResult = <-resultCh:
+					return true
+				default:
+					return false
+				}
+			}, 2*time.Second, 20*time.Millisecond)
+			require.ErrorIs(t, errResult, ErrAdmissionExpired)
+
+			list, err := c.AdmissionRequests().List(ctx, ListOptions{})
+			require.NoError(t, err)
+			require.Len(t, list.Items, 1)
+			require.Equal(t, AdmissionExpiredPhase, list.Items[0].Status.Phase)
+		})
+	}
+}
+
+func TestClusterMetadataPatchRejectsManagedKeysLocalBackends(t *testing.T) {
+	for _, factory := range localURLFactories() {
+		t.Run(factory.name, func(t *testing.T) {
+			c := newURLCluster(t, factory, nil)
+			widgets := defineWidgets(t, c, "metapatchrejectwidgets")
+			ctx := testContext(t, 5*time.Second)
+
+			_, err := widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+			require.NoError(t, err)
+
+			_, err = widgets.PatchMetadata(ctx, "alpha", []byte(`{"uid":"override"}`), PatchOptions{})
+			require.ErrorIs(t, err, ErrInvalidObject)
+		})
+	}
+}
+
+func TestClusterAdmissionMetadataSubresourceLocalBackends(t *testing.T) {
+	for _, factory := range localURLFactories() {
+		t.Run(factory.name, func(t *testing.T) {
+			c := newURLCluster(t, factory, nil)
+			ctx := testContext(t, 5*time.Second)
+			widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+				Resource:   "metadataadmissionwidgets",
+				APIVersion: "example.test/v1",
+				Kind:       "MetadataAdmissionWidget",
+				Admission: []AdmissionRule{
+					{
+						Name:         "metadata-check",
+						Operations:   []AdmissionOperation{AdmissionUpdate},
+						Subresources: []Subresource{SubresourceMetadata},
+					},
+				},
+			})
+			require.NoError(t, err)
+
+			created, err := widgets.Create(ctx, "alpha", widgetSpec{Owner: "team-a"}, CreateOptions{})
+			require.NoError(t, err)
+
+			type patchResult struct {
+				obj *Object[widgetSpec, widgetStatus]
+				err error
+			}
+			resultCh := make(chan patchResult, 1)
+			go func() {
+				obj, err := widgets.PatchMetadata(ctx, created.Metadata.Name, []byte(`{"labels":{"app":"demo"}}`), PatchOptions{})
+				resultCh <- patchResult{obj: obj, err: err}
+			}()
+
+			watchCtx := testContext(t, 5*time.Second)
+			events, err := c.AdmissionRequests().Watch(watchCtx, WatchOptions{SendInitialEvents: true})
+			require.NoError(t, err)
+
+			var request WatchEvent[AdmissionRequestSpec, AdmissionRequestStatus]
+			for {
+				request = nextWatchEvent(t, events)
+				if request.Type == WatchAdded && request.Object != nil && request.Object.Spec.Name == created.Metadata.Name {
+					break
+				}
+			}
+			require.Equal(t, SubresourceMetadata, request.Object.Spec.Subresource)
+
+			approved, err := c.ApproveAdmission(ctx, request.Object.Metadata.Name, AdmissionDecisionOptions{
+				Rule:    "metadata-check",
+				Decider: "tester",
+				Message: "ok",
+			})
+			require.NoError(t, err)
+			require.Equal(t, AdmissionCommittedPhase, approved.Status.Phase)
+
+			result := <-resultCh
+			require.NoError(t, result.err)
+			require.Equal(t, "demo", result.obj.Metadata.Labels["app"])
+		})
+	}
+}
+
 func TestBadgerEventCleanupDeletesLargeBacklogInBatches(t *testing.T) {
 	ctx := testContext(t, 10*time.Second)
 	rawURL := (&url.URL{
@@ -354,8 +797,6 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.NotEmpty(t, created.Metadata.ResourceVersion)
 		require.EqualValues(t, 1, created.Metadata.Generation)
 		require.NotEmpty(t, created.Metadata.UID)
-		require.Equal(t, "default-controller", created.Metadata.Annotations["controller"])
-
 		got, err := widgets.Get(ctx, "alpha")
 		require.NoError(t, err)
 		require.Equal(t, created.Metadata.UID, got.Metadata.UID)
@@ -403,32 +844,21 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.ErrorIs(t, err, ErrNotFound)
 	})
 
-	t.Run("schema_annotations_and_tags", func(t *testing.T) {
+	t.Run("schema_and_tags", func(t *testing.T) {
 		c := newURLCluster(t, factory, nil)
 		widgets := defineWidgets(t, c, "validatedwidgets")
 		ctx := testContext(t, 5*time.Second)
 
-		_, err := widgets.Create(ctx, "missing-tenant", widgetSpec{}, CreateOptions{})
-		require.ErrorIs(t, err, ErrInvalidObject)
-
-		created, err := widgets.Create(ctx, "defaulted", widgetSpec{Owner: "team-a"}, CreateOptions{
-			Annotations: Annotations{"tenant": "t1"},
-		})
+		created, err := widgets.Create(ctx, "defaulted", widgetSpec{Owner: "team-a"}, CreateOptions{})
 		require.NoError(t, err)
 		require.Equal(t, "medium", created.Spec.Size)
-		require.Equal(t, "default-controller", created.Metadata.Annotations["controller"])
-
-		_, err = widgets.PatchMetadata(ctx, "defaulted", []byte(`{"annotations":{"tenant":"t2"}}`), PatchOptions{})
-		require.ErrorIs(t, err, ErrInvalidObject)
 		_, err = widgets.Patch(ctx, "defaulted", []byte(`{"spec":{"owner":"team-b"}}`), PatchOptions{})
 		require.ErrorIs(t, err, ErrInvalidObject)
 		_, err = widgets.Patch(ctx, "defaulted", []byte(`{"spec":{"size":"xlarge"}}`), PatchOptions{})
 		require.ErrorIs(t, err, ErrInvalidObject)
 		_, err = widgets.UpdateStatus(ctx, "defaulted", widgetStatus{Phase: "Broken"}, UpdateOptions{})
 		require.ErrorIs(t, err, ErrInvalidObject)
-		_, err = widgets.Create(ctx, "../escape", widgetSpec{Size: "small"}, CreateOptions{
-			Annotations: Annotations{"tenant": "t1"},
-		})
+		_, err = widgets.Create(ctx, "../escape", widgetSpec{Size: "small"}, CreateOptions{})
 		require.ErrorIs(t, err, ErrInvalidObject)
 	})
 
@@ -468,8 +898,6 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 				Label("app").In("demo"),
 				Annotation("tenant").Eq("t1"),
 				Annotation("tenant").Exists(),
-				Field("apiVersion").Eq("example.test/v1"),
-				Field("kind").Eq("Widget"),
 				Field("status.phase").Eq("Ready"),
 				Field("status.phase").NotIn("Failed"),
 			),
@@ -478,7 +906,7 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.Len(t, selected.Items, 2)
 
 		notBeta, err := widgets.List(ctx, ListOptions{
-			Selector: Where(Label("app").NotEq("other"), Field("spec.owner").Exists()),
+			Selector: Where(Label("app").NotEq("other"), Field("spec.size").Exists()),
 		})
 		require.NoError(t, err)
 		require.Len(t, notBeta.Items, 2)
@@ -489,6 +917,11 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.NoError(t, err)
 		require.Len(t, named.Items, 1)
 		require.Equal(t, "alpha", named.Items[0].Metadata.Name)
+
+		_, err = widgets.List(ctx, ListOptions{
+			Selector: Where(Field("kind").Eq("Widget")),
+		})
+		require.ErrorIs(t, err, ErrInvalidObject)
 	})
 
 	t.Run("namespaced_resources", func(t *testing.T) {
@@ -835,26 +1268,42 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 			return info.Resource == ResourceMasters && info.Builtin
 		}))
 		require.True(t, slices.ContainsFunc(resources, func(info ResourceInfo) bool {
+			return info.Resource == ResourceAdmissionRequests && info.Builtin
+		}))
+		require.True(t, slices.ContainsFunc(resources, func(info ResourceInfo) bool {
 			return info.Resource == "schemawidgets" && !info.Builtin
 		}))
 
 		info, err := c.Resource("schemawidgets")
 		require.NoError(t, err)
 		require.Equal(t, "Widget", info.Kind)
-		require.True(t, slices.ContainsFunc(info.Spec, func(field FieldInfo) bool {
-			return field.Path == "spec.size" && field.Required && field.Indexed
-		}))
-		require.True(t, slices.ContainsFunc(info.Annotations, func(rule AnnotationRule) bool {
-			return rule.Key == "tenant" && rule.Required && rule.Immutable && rule.Indexed
+		require.NotEmpty(t, info.Schema)
+		require.True(t, slices.ContainsFunc(info.Indexes, func(index IndexInfo) bool {
+			return index.Path == "spec.size"
 		}))
 
-		_, err = Define(c, ResourceDef[widgetSpec, widgetStatus]{
+		duplicate, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+			Resource:   "schemawidgets",
+			APIVersion: "example.test/v1",
+			Kind:       "Widget",
+		})
+		require.NoError(t, err)
+		require.NotNil(t, duplicate)
+
+		_, err = Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
+			Resource:   "schemawidgets",
+			APIVersion: "example.test/v1",
+			Kind:       "OtherWidget",
+		})
+		require.ErrorIs(t, err, ErrInvalidResource)
+
+		_, err = Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
 			Resource:   ResourceNodes,
 			APIVersion: "example.test/v1",
 			Kind:       "Node",
 		})
 		require.ErrorIs(t, err, ErrInvalidResource)
-		_, err = Define(c, ResourceDef[MasterSpec, MasterStatus]{
+		_, err = Define(c, TypedResourceDef[MasterSpec, MasterStatus]{
 			Resource:   ResourceMasters,
 			APIVersion: "example.test/v1",
 			Kind:       "Master",
@@ -924,7 +1373,7 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		require.Equal(t, created.Metadata.UID, got.Metadata.UID)
 		require.JSONEq(t, `{"size":"small","owner":"team-a"}`, string(got.Spec))
 
-		list, err := raw.List(ctx, ListOptions{Selector: Where(Field("metadata.uid").Eq(created.Metadata.UID))})
+		list, err := raw.List(ctx, ListOptions{Selector: Where(Field("metadata.name").Eq(created.Metadata.Name))})
 		require.NoError(t, err)
 		require.Len(t, list.Items, 1)
 
@@ -957,21 +1406,19 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		c := newURLCluster(t, factory, nil)
 		ctx := testContext(t, 5*time.Second)
 
-		statusDefaults, err := Define(c, ResourceDef[widgetSpec, widgetStatus]{
+		type defaultSpec struct {
+			Size string `json:"size,omitempty" cluster:"required,enum=small|medium|large,default=medium"`
+		}
+
+		statusDefaults, err := Define(c, TypedResourceDef[defaultSpec, widgetStatus]{
 			Resource:   "statusdefaults",
 			APIVersion: "example.test/v1",
 			Kind:       "StatusDefault",
-			Default: func(obj *Object[widgetSpec, widgetStatus]) error {
-				if obj.Spec.Size == "" {
-					obj.Spec.Size = "medium"
-				}
-				obj.Status.Phase = "Failed"
-				return nil
-			},
 		})
 		require.NoError(t, err)
-		created, err := statusDefaults.Create(ctx, "alpha", widgetSpec{}, CreateOptions{})
+		created, err := statusDefaults.Create(ctx, "alpha", defaultSpec{}, CreateOptions{})
 		require.NoError(t, err)
+		require.Equal(t, "medium", created.Spec.Size)
 		require.Empty(t, created.Status.Phase)
 		statused, err := statusDefaults.UpdateStatus(ctx, "alpha", widgetStatus{Phase: "Ready"}, UpdateOptions{})
 		require.NoError(t, err)
@@ -979,19 +1426,6 @@ func runClusterURLContract(t *testing.T, factory clusterURLFactory) {
 		patched, err := statusDefaults.Patch(ctx, "alpha", []byte(`{"spec":{"size":"large"}}`), PatchOptions{})
 		require.NoError(t, err)
 		require.Equal(t, "Ready", patched.Status.Phase)
-
-		badDefaults, err := Define(c, ResourceDef[widgetSpec, widgetStatus]{
-			Resource:   "baddefaults",
-			APIVersion: "example.test/v1",
-			Kind:       "BadDefault",
-			Default: func(obj *Object[widgetSpec, widgetStatus]) error {
-				obj.Metadata.Name = "../escape"
-				return nil
-			},
-		})
-		require.NoError(t, err)
-		_, err = badDefaults.Create(ctx, "bad", widgetSpec{Size: "small"}, CreateOptions{})
-		require.ErrorIs(t, err, ErrInvalidObject)
 	})
 }
 
@@ -1026,30 +1460,11 @@ func defineNamespacedWidgets(t *testing.T, c *Cluster, resource string) *Resourc
 
 func defineWidgetResource(t *testing.T, c *Cluster, resource string, namespaced bool) *Resource[widgetSpec, widgetStatus] {
 	t.Helper()
-	widgets, err := Define(c, ResourceDef[widgetSpec, widgetStatus]{
+	widgets, err := Define(c, TypedResourceDef[widgetSpec, widgetStatus]{
 		Resource:   resource,
 		APIVersion: "example.test/v1",
 		Kind:       "Widget",
 		Namespaced: namespaced,
-		Annotations: []AnnotationRule{
-			{Key: "tenant", Required: true, Immutable: true, Indexed: true},
-			{Key: "controller", Indexed: true, Default: "default-controller"},
-		},
-		Default: func(obj *Object[widgetSpec, widgetStatus]) error {
-			if obj.Spec.Size == "" {
-				obj.Spec.Size = "medium"
-			}
-			return nil
-		},
-		Validate: func(oldObj, newObj *Object[widgetSpec, widgetStatus], subresource Subresource) error {
-			if subresource == SubresourceStatus {
-				return nil
-			}
-			if oldObj != nil && newObj.Metadata.Generation < oldObj.Metadata.Generation {
-				return ErrInvalidObject
-			}
-			return nil
-		},
 	})
 	require.NoError(t, err)
 	return widgets
